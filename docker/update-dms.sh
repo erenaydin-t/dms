@@ -23,6 +23,7 @@ echo ""
 echo "▶ [1/4] Building image ${CUSTOM_IMAGE}:${CUSTOM_TAG} from apps.json..."
 DOCKER_BUILDKIT=1 docker build \
     --secret id=apps_json,src=apps.json \
+    --build-arg CACHEBUST="$(date +%s)" \
     --tag "${CUSTOM_IMAGE}:${CUSTOM_TAG}" \
     --file Dockerfile .
 echo "✔ Image built."

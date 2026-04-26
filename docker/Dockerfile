@@ -10,6 +10,9 @@
 # apps.json mounted as a build secret.
 
 ARG FRAPPE_BRANCH=version-16
+# Bump CACHEBUST (e.g. via --build-arg CACHEBUST=$(date +%s)) to force a
+# fresh `bench init` without `--no-cache` rebuilding system layers.
+ARG CACHEBUST=1
 
 # -------------------------------------------------------------------------- #
 #  Builder stage                                                             #
@@ -19,7 +22,9 @@ FROM frappe/build:${FRAPPE_BRANCH} AS builder
 USER frappe
 WORKDIR /home/frappe
 
+ARG CACHEBUST
 RUN --mount=type=secret,id=apps_json,uid=1000,target=/home/frappe/apps.json,required=true \
+    echo "Cache bust: ${CACHEBUST}" && \
     bench init \
         --frappe-branch=${FRAPPE_BRANCH} \
         --apps_path=/home/frappe/apps.json \
