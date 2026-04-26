@@ -39,6 +39,14 @@ class GMPDocument(NestedSet):
         if not self.document_type or not self.department:
             frappe.throw(_("Document Type and Department are required for naming."))
 
+        if not frappe.db.has_column("Department", "custom_abbr"):
+            frappe.throw(
+                _(
+                    "The 'custom_abbr' Custom Field is missing on the Department DocType. "
+                    "Run 'bench --site <site> migrate' to apply the DMS bootstrap, then retry."
+                )
+            )
+
         dept_abbr = frappe.db.get_value("Department", self.department, "custom_abbr")
         if not dept_abbr:
             frappe.throw(

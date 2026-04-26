@@ -21,7 +21,7 @@ WORKDIR /home/frappe
 
 RUN --mount=type=secret,id=apps_json,uid=1000,target=/home/frappe/apps.json,required=true \
     bench init \
-        --frappe-branch ${FRAPPE_BRANCH} \
+        --frappe-branch=${FRAPPE_BRANCH} \
         --apps_path=/home/frappe/apps.json \
         --skip-redis-config-generation \
         --no-procfile \

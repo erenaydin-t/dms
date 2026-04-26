@@ -14,8 +14,12 @@ app_license = "MIT"
 # ------------------------------------------------------------------------- #
 #  Installation hooks                                                       #
 # ------------------------------------------------------------------------- #
-# Bootstraps the QA Manager role referenced by GMP Document permissions.
+# Bootstraps the QA Manager role and the Department.custom_abbr field that
+# GMP Document depends on. after_migrate re-asserts the field on every
+# migrate so a missing column can't silently break autoname().
 before_install = "dms.install.before_install"
+after_install = "dms.install.after_install"
+after_migrate = ["dms.install.after_migrate"]
 
 # ------------------------------------------------------------------------- #
 #  Fixtures                                                                 #
