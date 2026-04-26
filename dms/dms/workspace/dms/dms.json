@@ -1,0 +1,113 @@
+{
+ "charts": [],
+ "content": "[{\"id\":\"hdr-shortcuts\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\"><b>Your Shortcuts</b></span>\",\"col\":12}},{\"id\":\"sc-gmp-list\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"GMP Documents\",\"col\":3}},{\"id\":\"sc-gmp-tree\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Document Tree\",\"col\":3}},{\"id\":\"sc-dept\",\"type\":\"shortcut\",\"data\":{\"shortcut_name\":\"Departments\",\"col\":3}},{\"id\":\"sp-1\",\"type\":\"spacer\",\"data\":{\"col\":12}},{\"id\":\"hdr-masters\",\"type\":\"header\",\"data\":{\"text\":\"<span class=\\\"h4\\\"><b>Masters & Reports</b></span>\",\"col\":12}},{\"id\":\"card-docs\",\"type\":\"card\",\"data\":{\"card_name\":\"Documents\",\"col\":4}},{\"id\":\"card-config\",\"type\":\"card\",\"data\":{\"card_name\":\"Configuration\",\"col\":4}}]",
+ "creation": "2026-04-26 00:00:00.000000",
+ "custom_blocks": [],
+ "docstatus": 0,
+ "doctype": "Workspace",
+ "for_user": "",
+ "hide_custom": 0,
+ "icon": "file-text",
+ "idx": 0,
+ "is_hidden": 0,
+ "label": "DMS",
+ "links": [
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Documents",
+   "link_count": 0,
+   "onboard": 1,
+   "type": "Card Break"
+  },
+  {
+   "dependencies": "",
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "GMP Document",
+   "link_count": 0,
+   "link_to": "GMP Document",
+   "link_type": "DocType",
+   "onboard": 1,
+   "type": "Link"
+  },
+  {
+   "dependencies": "",
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "GMP Document Tree",
+   "link_count": 0,
+   "link_to": "gmp-document-tree",
+   "link_type": "Page",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Configuration",
+   "link_count": 0,
+   "onboard": 0,
+   "type": "Card Break"
+  },
+  {
+   "dependencies": "",
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Department",
+   "link_count": 0,
+   "link_to": "Department",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  },
+  {
+   "dependencies": "",
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "Employee",
+   "link_count": 0,
+   "link_to": "Employee",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
+  }
+ ],
+ "modified": "2026-04-26 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "DMS",
+ "name": "DMS",
+ "number_cards": [],
+ "onboarding": "",
+ "owner": "Administrator",
+ "parent_page": "",
+ "public": 1,
+ "quick_lists": [],
+ "roles": [],
+ "sequence_id": 50.0,
+ "shortcuts": [
+  {
+   "color": "Green",
+   "doc_view": "List",
+   "format": "{} Active",
+   "label": "GMP Documents",
+   "link_to": "GMP Document",
+   "stats_filter": "{\"docstatus\":1,\"is_active\":1}",
+   "type": "DocType"
+  },
+  {
+   "color": "Blue",
+   "label": "Document Tree",
+   "link_to": "gmp-document-tree",
+   "type": "Page"
+  },
+  {
+   "color": "Grey",
+   "doc_view": "List",
+   "label": "Departments",
+   "link_to": "Department",
+   "type": "DocType"
+  }
+ ],
+ "title": "DMS"
+}
