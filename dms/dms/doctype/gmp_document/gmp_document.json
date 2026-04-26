@@ -20,6 +20,12 @@
   "column_break_class_1",
   "is_active",
   "requires_training",
+  "section_workflow",
+  "workflow_status",
+  "prepared_by",
+  "column_break_wf_1",
+  "reviewer",
+  "qa_approver",
   "section_lifecycle",
   "effective_date",
   "expiry_date",
@@ -31,6 +37,16 @@
   "file_integrity_hash",
   "section_change_control",
   "reason_for_change",
+  "section_review_history",
+  "reviewed_by",
+  "reviewed_on",
+  "column_break_rh_1",
+  "approved_by",
+  "approved_on",
+  "section_revision",
+  "last_revision_by",
+  "last_revision_on",
+  "last_revision_request",
   "section_tree",
   "parent_gmp_document",
   "is_group",
@@ -183,6 +199,51 @@
    "description": "SHA-256 digest of the controlled file. Recomputed after every render to match the distributed bytes."
   },
   {
+   "fieldname": "section_workflow",
+   "fieldtype": "Section Break",
+   "label": "Workflow"
+  },
+  {
+   "fieldname": "workflow_status",
+   "fieldtype": "Select",
+   "label": "Workflow Status",
+   "options": "Draft\nUnder Review\nPending QA Approval\nApproved\nRevision Requested",
+   "default": "Draft",
+   "read_only": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "prepared_by",
+   "fieldtype": "Link",
+   "label": "Prepared By",
+   "options": "User",
+   "read_only": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "column_break_wf_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "reviewer",
+   "fieldtype": "Link",
+   "label": "Reviewer",
+   "options": "User",
+   "reqd": 1,
+   "in_standard_filter": 1,
+   "description": "User who must review the document before it goes to QA."
+  },
+  {
+   "fieldname": "qa_approver",
+   "fieldtype": "Link",
+   "label": "QA Approver",
+   "options": "User",
+   "reqd": 1,
+   "in_standard_filter": 1,
+   "description": "User who performs the final QA approval and triggers submit."
+  },
+  {
    "fieldname": "section_change_control",
    "fieldtype": "Section Break",
    "label": "Change Control",
@@ -194,6 +255,69 @@
    "label": "Reason for Change",
    "depends_on": "eval:doc.version_number > 0 || doc.amended_from",
    "mandatory_depends_on": "eval:doc.amended_from"
+  },
+  {
+   "fieldname": "section_review_history",
+   "fieldtype": "Section Break",
+   "label": "Review History",
+   "collapsible": 1,
+   "depends_on": "eval:doc.reviewed_by || doc.approved_by"
+  },
+  {
+   "fieldname": "reviewed_by",
+   "fieldtype": "Link",
+   "label": "Reviewed By",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "reviewed_on",
+   "fieldtype": "Datetime",
+   "label": "Reviewed On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_rh_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "approved_by",
+   "fieldtype": "Link",
+   "label": "Approved By",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "approved_on",
+   "fieldtype": "Datetime",
+   "label": "Approved On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_revision",
+   "fieldtype": "Section Break",
+   "label": "Latest Revision Request",
+   "collapsible": 1,
+   "depends_on": "eval:doc.last_revision_request"
+  },
+  {
+   "fieldname": "last_revision_by",
+   "fieldtype": "Link",
+   "label": "Requested By",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_revision_on",
+   "fieldtype": "Datetime",
+   "label": "Requested On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_revision_request",
+   "fieldtype": "Small Text",
+   "label": "Reason",
+   "read_only": 1
   },
   {
    "fieldname": "section_tree",

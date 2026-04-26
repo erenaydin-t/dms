@@ -10,6 +10,9 @@ frappe.ui.form.on("GMP Document", {
         toggle_reason_for_change(frm);
         add_download_pdf_button(frm);
         render_compliance_dashboard(frm);
+        render_workflow_indicator(frm);
+        add_workflow_buttons(frm);
+        toggle_assignment_fields(frm);
     },
 
     version_number(frm) {
@@ -159,6 +162,141 @@ function parse_filename(content_disposition, default_name) {
     if (!content_disposition) return default_name;
     const match = content_disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)["']?/i);
     return match ? decodeURIComponent(match[1]) : default_name;
+}
+
+
+// -------------------------------------------------------------------- //
+//  Workflow                                                             //
+// -------------------------------------------------------------------- //
+
+const WF_DRAFT = 'Draft';
+const WF_UNDER_REVIEW = 'Under Review';
+const WF_PENDING_QA = 'Pending QA Approval';
+const WF_APPROVED = 'Approved';
+const WF_REVISION = 'Revision Requested';
+
+const WF_COLORS = {
+    [WF_DRAFT]: 'gray',
+    [WF_UNDER_REVIEW]: 'orange',
+    [WF_PENDING_QA]: 'blue',
+    [WF_APPROVED]: 'green',
+    [WF_REVISION]: 'red',
+};
+
+
+function render_workflow_indicator(frm) {
+    if (frm.is_new() || !frm.doc.workflow_status) return;
+    const color = WF_COLORS[frm.doc.workflow_status] || 'gray';
+    frm.dashboard.add_indicator(__(frm.doc.workflow_status), color);
+}
+
+
+function toggle_assignment_fields(frm) {
+    // Reviewer / QA Approver are editable only while the doc is sitting
+    // with the preparer (Draft or Revision Requested). Once it's in the
+    // pipeline the assignments are locked.
+    const status = frm.doc.workflow_status;
+    const editable = !status || status === WF_DRAFT || status === WF_REVISION;
+    frm.toggle_enable('reviewer', editable);
+    frm.toggle_enable('qa_approver', editable);
+}
+
+
+function add_workflow_buttons(frm) {
+    if (frm.is_new()) return;
+    if (frm.doc.docstatus !== 0) return;          // submitted/cancelled docs are locked
+    if (frm.is_dirty()) return;                   // user has unsaved local changes — save first
+
+    const status = frm.doc.workflow_status;
+    const me = frappe.session.user;
+    const is_admin = frappe.user.has_role('System Manager');
+    const is_preparer = me === frm.doc.prepared_by;
+    const is_reviewer = me === frm.doc.reviewer;
+    const is_qa = me === frm.doc.qa_approver;
+
+    const group = __('Workflow');
+
+    if ((status === WF_DRAFT || status === WF_REVISION) && (is_preparer || is_admin)) {
+        frm.add_custom_button(
+            __('Submit for Review'),
+            () => workflow_call(frm, 'submit_for_review'),
+            group
+        ).addClass('btn-primary');
+    }
+
+    if (status === WF_UNDER_REVIEW && (is_reviewer || is_admin)) {
+        frm.add_custom_button(
+            __('Approve as Reviewer'),
+            () => workflow_call(frm, 'reviewer_approve'),
+            group
+        ).addClass('btn-success');
+        frm.add_custom_button(
+            __('Request Revision (Reviewer)'),
+            () => prompt_revision(frm, 'reviewer_request_revision'),
+            group
+        );
+    }
+
+    if (status === WF_PENDING_QA && (is_qa || is_admin)) {
+        frm.add_custom_button(
+            __('Approve as QA'),
+            () => workflow_call(frm, 'qa_approve'),
+            group
+        ).addClass('btn-success');
+        frm.add_custom_button(
+            __('Request Revision (QA)'),
+            () => prompt_revision(frm, 'qa_request_revision'),
+            group
+        );
+    }
+}
+
+
+function workflow_call(frm, method) {
+    frappe.call({
+        method: `dms.dms.doctype.gmp_document.gmp_document.${method}`,
+        args: { docname: frm.doc.name },
+        freeze: true,
+        freeze_message: __('Updating workflow…'),
+    }).then((r) => {
+        if (r && r.message) {
+            frappe.show_alert({
+                message: __('Workflow advanced to: {0}', [r.message]),
+                indicator: 'green',
+            }, 5);
+            frm.reload_doc();
+        }
+    });
+}
+
+
+function prompt_revision(frm, method) {
+    frappe.prompt(
+        [
+            {
+                fieldname: 'reason',
+                fieldtype: 'Small Text',
+                label: __('Reason for Revision Request'),
+                reqd: 1,
+            },
+        ],
+        (values) => {
+            frappe.call({
+                method: `dms.dms.doctype.gmp_document.gmp_document.${method}`,
+                args: { docname: frm.doc.name, reason: values.reason },
+                freeze: true,
+                freeze_message: __('Submitting revision request…'),
+            }).then(() => {
+                frappe.show_alert({
+                    message: __('Revision requested.'),
+                    indicator: 'orange',
+                }, 5);
+                frm.reload_doc();
+            });
+        },
+        __('Request Revision'),
+        __('Submit')
+    );
 }
 
 

@@ -17,7 +17,7 @@ from io import BytesIO
 
 import frappe
 from frappe import _
-from frappe.utils import add_months, add_years, cstr, getdate, today
+from frappe.utils import add_months, add_years, cstr, getdate, now_datetime, today
 from frappe.utils.file_manager import save_file
 from frappe.utils.nestedset import NestedSet
 
@@ -26,6 +26,15 @@ from docxtpl import DocxTemplate
 
 VALIDITY_YEARS_MAP = {"2 Years": 2, "3 Years": 3, "5 Years": 5}
 ALLOWED_EXTENSIONS = (".docx",)
+
+# Workflow states ----------------------------------------------------------- #
+WF_DRAFT = "Draft"
+WF_UNDER_REVIEW = "Under Review"
+WF_PENDING_QA = "Pending QA Approval"
+WF_APPROVED = "Approved"
+WF_REVISION = "Revision Requested"
+
+WF_ALL = (WF_DRAFT, WF_UNDER_REVIEW, WF_PENDING_QA, WF_APPROVED, WF_REVISION)
 
 
 class GMPDocument(NestedSet):
@@ -85,6 +94,11 @@ class GMPDocument(NestedSet):
         self.name = f"{self.document_type}-{dept_abbr}-{next_inc}-v{version}"
 
     def before_insert(self):
+        if not self.prepared_by:
+            self.prepared_by = frappe.session.user
+        if not self.workflow_status:
+            self.workflow_status = WF_DRAFT
+
         if not self.amended_from:
             return
 
@@ -97,6 +111,15 @@ class GMPDocument(NestedSet):
         self.effective_date = None
         self.expiry_date = None
         self.next_revision_date = None
+        # The amended draft starts a fresh review cycle.
+        self.workflow_status = WF_DRAFT
+        self.reviewed_by = None
+        self.reviewed_on = None
+        self.approved_by = None
+        self.approved_on = None
+        self.last_revision_request = None
+        self.last_revision_by = None
+        self.last_revision_on = None
 
     def validate(self):
         if self.amended_from and not (self.reason_for_change and self.reason_for_change.strip()):
@@ -343,6 +366,197 @@ def download_watermarked_pdf(docname):
     frappe.local.response.filename = f"{docname}-{safe_label}.pdf"
     frappe.local.response.filecontent = watermarked
     frappe.local.response.type = "download"
+
+
+# ---------------------------------------------------------------------- #
+#  Workflow transitions                                                  #
+# ---------------------------------------------------------------------- #
+#
+# The state machine:
+#
+#   Draft ── submit_for_review ──► Under Review
+#   Under Review ── reviewer_approve ──► Pending QA Approval
+#   Under Review ── reviewer_request_revision ──► Revision Requested
+#   Pending QA Approval ── qa_approve ──► Approved (docstatus=1)
+#   Pending QA Approval ── qa_request_revision ──► Under Review
+#   Revision Requested ── submit_for_review ──► Under Review
+#
+# Each transition validates that the caller is the assigned actor
+# (preparer / reviewer / qa_approver), creates a ToDo for the next
+# actor, and closes the previous actor's ToDo.
+
+
+@frappe.whitelist()
+def submit_for_review(docname):
+    doc = frappe.get_doc("GMP Document", docname)
+    _ensure_actor(doc.prepared_by, "preparer")
+    if doc.workflow_status not in (WF_DRAFT, WF_REVISION):
+        frappe.throw(_("Document must be Draft or Revision Requested to submit for review."))
+    if not doc.attachment_file:
+        frappe.throw(_("Attach the .docx controlled file before submitting for review."))
+    if not doc.reviewer:
+        frappe.throw(_("Assign a Reviewer before submitting for review."))
+    if not doc.qa_approver:
+        frappe.throw(_("Assign a QA Approver before submitting for review."))
+
+    doc.workflow_status = WF_UNDER_REVIEW
+    doc.add_comment("Workflow", _("Submitted for review by {0}").format(frappe.session.user))
+    doc.flags.ignore_permissions = True
+    doc.save()
+    _close_open_todos(doc, allocated_to=doc.prepared_by)
+    _create_todo(doc, doc.reviewer, _("Review GMP Document {0}").format(doc.name))
+    return doc.workflow_status
+
+
+@frappe.whitelist()
+def reviewer_approve(docname):
+    doc = frappe.get_doc("GMP Document", docname)
+    _ensure_actor(doc.reviewer, "reviewer")
+    if doc.workflow_status != WF_UNDER_REVIEW:
+        frappe.throw(_("Document must be Under Review."))
+    if not doc.qa_approver:
+        frappe.throw(_("Assign a QA Approver before approving."))
+
+    doc.workflow_status = WF_PENDING_QA
+    doc.reviewed_by = frappe.session.user
+    doc.reviewed_on = now_datetime()
+    doc.add_comment("Workflow", _("Reviewer approved — forwarded to QA"))
+    doc.flags.ignore_permissions = True
+    doc.save()
+    _close_open_todos(doc, allocated_to=doc.reviewer)
+    _create_todo(doc, doc.qa_approver, _("QA approval — GMP Document {0}").format(doc.name))
+    return doc.workflow_status
+
+
+@frappe.whitelist()
+def reviewer_request_revision(docname, reason):
+    doc = frappe.get_doc("GMP Document", docname)
+    _ensure_actor(doc.reviewer, "reviewer")
+    if doc.workflow_status != WF_UNDER_REVIEW:
+        frappe.throw(_("Document must be Under Review."))
+    reason = (reason or "").strip()
+    if not reason:
+        frappe.throw(_("Please provide a reason for the revision request."))
+
+    doc.workflow_status = WF_REVISION
+    doc.last_revision_request = reason
+    doc.last_revision_by = frappe.session.user
+    doc.last_revision_on = now_datetime()
+    doc.add_comment("Workflow", _("Reviewer requested revision: {0}").format(reason))
+    doc.flags.ignore_permissions = True
+    doc.save()
+    _close_open_todos(doc, allocated_to=doc.reviewer)
+    _create_todo(doc, doc.prepared_by, _("Address revision request — {0}").format(doc.name))
+    return doc.workflow_status
+
+
+@frappe.whitelist()
+def qa_approve(docname):
+    doc = frappe.get_doc("GMP Document", docname)
+    _ensure_actor(doc.qa_approver, "qa_approver")
+    if doc.workflow_status != WF_PENDING_QA:
+        frappe.throw(_("Document must be Pending QA Approval."))
+
+    doc.workflow_status = WF_APPROVED
+    doc.approved_by = frappe.session.user
+    doc.approved_on = now_datetime()
+    doc.add_comment("Workflow", _("QA approval granted — finalizing"))
+    doc.flags.ignore_permissions = True
+    doc.save()
+    _close_open_todos(doc, allocated_to=doc.qa_approver)
+    # Final Frappe submit (docstatus=1) — this is what triggers the
+    # Word template render and base PDF generation in on_submit.
+    doc.submit()
+    return doc.workflow_status
+
+
+@frappe.whitelist()
+def qa_request_revision(docname, reason):
+    doc = frappe.get_doc("GMP Document", docname)
+    _ensure_actor(doc.qa_approver, "qa_approver")
+    if doc.workflow_status != WF_PENDING_QA:
+        frappe.throw(_("Document must be Pending QA Approval."))
+    reason = (reason or "").strip()
+    if not reason:
+        frappe.throw(_("Please provide a reason for the revision request."))
+
+    # QA bounces back to the reviewer (not all the way to preparer) — they
+    # may re-approve after re-checking, or request revision themselves.
+    doc.workflow_status = WF_UNDER_REVIEW
+    doc.last_revision_request = reason
+    doc.last_revision_by = frappe.session.user
+    doc.last_revision_on = now_datetime()
+    doc.add_comment("Workflow", _("QA requested revision: {0}").format(reason))
+    doc.flags.ignore_permissions = True
+    doc.save()
+    _close_open_todos(doc, allocated_to=doc.qa_approver)
+    _create_todo(doc, doc.reviewer, _("Re-review — QA requested revision on {0}").format(doc.name))
+    return doc.workflow_status
+
+
+@frappe.whitelist()
+def get_my_pending_count(user=None):
+    """Used by the workspace pending-count badge."""
+    user = user or frappe.session.user
+    counts = {
+        "to_review": frappe.db.count("GMP Document", filters={
+            "docstatus": 0, "workflow_status": WF_UNDER_REVIEW, "reviewer": user,
+        }),
+        "to_approve": frappe.db.count("GMP Document", filters={
+            "docstatus": 0, "workflow_status": WF_PENDING_QA, "qa_approver": user,
+        }),
+        "to_revise": frappe.db.count("GMP Document", filters={
+            "docstatus": 0, "workflow_status": WF_REVISION, "prepared_by": user,
+        }),
+    }
+    counts["total"] = counts["to_review"] + counts["to_approve"] + counts["to_revise"]
+    return counts
+
+
+def _ensure_actor(expected_user, role_label):
+    """Raise PermissionError unless the caller is the assigned actor or a System Manager."""
+    if not expected_user:
+        frappe.throw(_("No {0} is assigned to this document.").format(role_label))
+    me = frappe.session.user
+    if me == expected_user:
+        return
+    if "System Manager" in frappe.get_roles(me):
+        return
+    frappe.throw(
+        _("Only the assigned {0} ({1}) can perform this action.").format(role_label, expected_user),
+        frappe.PermissionError,
+    )
+
+
+def _create_todo(doc, allocated_to, description):
+    if not allocated_to:
+        return
+    frappe.get_doc({
+        "doctype": "ToDo",
+        "allocated_to": allocated_to,
+        "reference_type": doc.doctype,
+        "reference_name": doc.name,
+        "description": description,
+        "status": "Open",
+        "priority": "Medium",
+    }).insert(ignore_permissions=True)
+
+
+def _close_open_todos(doc, allocated_to):
+    if not allocated_to:
+        return
+    open_todos = frappe.get_all(
+        "ToDo",
+        filters={
+            "reference_type": doc.doctype,
+            "reference_name": doc.name,
+            "allocated_to": allocated_to,
+            "status": "Open",
+        },
+        pluck="name",
+    )
+    for t in open_todos:
+        frappe.db.set_value("ToDo", t, "status", "Closed")
 
 
 # ---------------------------------------------------------------------- #

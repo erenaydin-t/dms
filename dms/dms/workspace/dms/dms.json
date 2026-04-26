@@ -102,6 +102,14 @@
    "type": "Page"
   },
   {
+   "color": "Yellow",
+   "doc_view": "List",
+   "label": "My Tasks",
+   "link_to": "ToDo",
+   "stats_filter": "{\"reference_type\":\"GMP Document\",\"status\":\"Open\"}",
+   "type": "DocType"
+  },
+  {
    "color": "Grey",
    "doc_view": "List",
    "label": "Departments",
