@@ -185,13 +185,13 @@
    "fieldname": "section_change_control",
    "fieldtype": "Section Break",
    "label": "Change Control",
-   "depends_on": "eval:doc.version_number > 0"
+   "depends_on": "eval:doc.version_number > 0 || doc.amended_from"
   },
   {
    "fieldname": "reason_for_change",
    "fieldtype": "Small Text",
    "label": "Reason for Change",
-   "depends_on": "eval:doc.version_number > 0",
+   "depends_on": "eval:doc.version_number > 0 || doc.amended_from",
    "mandatory_depends_on": "eval:doc.amended_from"
   },
   {
