@@ -345,6 +345,101 @@ def download_watermarked_pdf(docname):
     frappe.local.response.type = "download"
 
 
+# ---------------------------------------------------------------------- #
+#  Tree page data source                                                 #
+# ---------------------------------------------------------------------- #
+
+
+@frappe.whitelist()
+def get_dms_tree_children(parent=None):
+    """Hierarchical data for the GMP Document Tree page.
+
+    Levels:
+        Root       -> Department (with submitted document count)
+        Department -> Document Type (with submitted document count)
+        Doc Type   -> latest submitted version per document family
+    """
+    parent = (parent or "").strip()
+
+    if not parent:
+        rows = frappe.get_all(
+            "GMP Document",
+            filters={"docstatus": 1},
+            fields=["department"],
+            distinct=True,
+        )
+        depts = sorted({r.department for r in rows if r.department})
+        nodes = []
+        for dept in depts:
+            cnt = frappe.db.count(
+                "GMP Document",
+                filters={"docstatus": 1, "department": dept},
+            )
+            nodes.append({
+                "value": f"Dept::{dept}",
+                "title": f"{dept} ({cnt})",
+                "expandable": 1,
+            })
+        return nodes
+
+    if parent.startswith("Dept::"):
+        dept = parent[len("Dept::"):]
+        rows = frappe.get_all(
+            "GMP Document",
+            filters={"docstatus": 1, "department": dept},
+            fields=["document_type"],
+            distinct=True,
+        )
+        types = sorted({r.document_type for r in rows if r.document_type})
+        nodes = []
+        for dtype in types:
+            cnt = frappe.db.count(
+                "GMP Document",
+                filters={"docstatus": 1, "department": dept, "document_type": dtype},
+            )
+            nodes.append({
+                "value": f"Type::{dept}::{dtype}",
+                "title": f"{dtype} ({cnt})",
+                "expandable": 1,
+            })
+        return nodes
+
+    if parent.startswith("Type::"):
+        rest = parent[len("Type::"):]
+        if "::" not in rest:
+            return []
+        dept, dtype = rest.split("::", 1)
+
+        docs = frappe.get_all(
+            "GMP Document",
+            filters={"docstatus": 1, "department": dept, "document_type": dtype},
+            fields=["name", "version_number", "document_name_en", "is_active"],
+        )
+
+        latest = {}
+        for d in docs:
+            base = d.name.rsplit("-v", 1)[0]
+            v = d.version_number or 0
+            if base not in latest or v > (latest[base].version_number or 0):
+                latest[base] = d
+
+        nodes = []
+        for d in sorted(latest.values(), key=lambda x: x.name):
+            title = d.name
+            if d.document_name_en:
+                title += f"  —  {d.document_name_en}"
+            nodes.append({
+                "value": d.name,
+                "title": title,
+                "expandable": 0,
+                "indicator": "ACTIVE" if d.is_active else "OBSOLETE",
+                "indicator_color": "green" if d.is_active else "red",
+            })
+        return nodes
+
+    return []
+
+
 def _resolve_watermark_text(doc):
     if doc.docstatus == 1 and doc.is_active:
         return "CONTROLLED COPY"

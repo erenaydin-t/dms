@@ -1,0 +1,27 @@
+{
+ "category": "Modules",
+ "creation": "2026-04-26 00:00:00.000000",
+ "doctype": "Page",
+ "icon": "fa fa-sitemap",
+ "idx": 0,
+ "modified": "2026-04-26 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "DMS",
+ "name": "gmp-document-tree",
+ "owner": "Administrator",
+ "page_name": "gmp-document-tree",
+ "roles": [
+  {
+   "role": "System Manager"
+  },
+  {
+   "role": "QA Manager"
+  },
+  {
+   "role": "Employee"
+  }
+ ],
+ "standard": "Yes",
+ "system_page": 0,
+ "title": "GMP Document Tree"
+}
