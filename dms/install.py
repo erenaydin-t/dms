@@ -32,9 +32,12 @@ def before_install():
 
 def after_install():
     _ensure_department_abbr_field()
+    _set_dms_as_default_workspace()
 
 
 def after_migrate():
+    # Idempotent re-assertion of the custom field; never touches user
+    # preferences (default_workspace) so existing customizations stick.
     _ensure_department_abbr_field()
 
 
@@ -51,3 +54,15 @@ def _ensure_role(role_name, desk_access=1):
 def _ensure_department_abbr_field():
     """Idempotent: create_custom_field is a no-op when the field already exists."""
     create_custom_field("Department", DEPARTMENT_ABBR_FIELD, ignore_validate=True)
+
+
+def _set_dms_as_default_workspace():
+    """Make /app land on the DMS workspace for every existing real user.
+
+    Only runs in after_install (fresh install). Skipping after_migrate is
+    intentional — once a user picks a different default we don't want to
+    clobber it on every redeploy.
+    """
+    users = frappe.get_all("User", filters={"name": ["!=", "Guest"]}, pluck="name")
+    for u in users:
+        frappe.db.set_value("User", u, "default_workspace", "DMS")
