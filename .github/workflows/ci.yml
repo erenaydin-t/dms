@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate gmp_document.json is valid JSON
+        run: python3 -m json.tool dms/dms/doctype/gmp_document/gmp_document.json > /dev/null
+
+      - name: Validate apps.json is valid JSON
+        run: python3 -m json.tool docker/apps.json > /dev/null
+
+      - name: Compile Python sources
+        run: python3 -m compileall -q dms
+
+      - name: Verify __version__ is set
+        run: |
+          python3 -c "import re; v=re.search(r'__version__\s*=\s*[\"\']([^\"\']+)', open('dms/__init__.py').read()); assert v, 'missing __version__'; print('Version:', v.group(1))"

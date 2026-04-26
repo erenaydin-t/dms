@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract tag version
+        id: meta
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify dms/__init__.py matches tag
+        run: |
+          PKG_VERSION=$(python3 -c "import re,sys; m=re.search(r'__version__\s*=\s*[\"\']([^\"\']+)', open('dms/__init__.py').read()); print(m.group(1) if m else '')")
+          TAG_VERSION="${{ steps.meta.outputs.version }}"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::dms/__init__.py declares __version__='${PKG_VERSION}' but tag is '${{ steps.meta.outputs.tag }}'."
+            echo "::error::Update __version__ to '${TAG_VERSION}' before tagging."
+            exit 1
+          fi
+          echo "✔ Version match: ${PKG_VERSION}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: DMS ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            ### Native bench
+            ```bash
+            bench get-app --branch ${{ steps.meta.outputs.tag }} https://github.com/${{ github.repository }}
+            bench --site <your-site> install-app dms
+            bench --site <your-site> migrate
+            ```
+
+            ### Docker compose (test stack)
+            ```bash
+            git clone --branch ${{ steps.meta.outputs.tag }} https://github.com/${{ github.repository }}
+            cd dms/docker
+            cp .env.example .env
+            ./update-dms.sh
+            ./create-site.sh
+            ```
+
+            See [docker/README.md](https://github.com/${{ github.repository }}/blob/${{ steps.meta.outputs.tag }}/docker/README.md) for full setup details.
+
+            ### Pin this version in `apps.json`
+            ```json
+            {
+              "url": "https://github.com/${{ github.repository }}",
+              "branch": "${{ steps.meta.outputs.tag }}"
+            }
+            ```
