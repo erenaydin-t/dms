@@ -1,4 +1,4 @@
-# Copyright (c) 2026, EspadPharmed - GMP DMS Module
+# Copyright (c) 2026, ErenAydin - GMP DMS Module
 # License: MIT
 """Unit tests for the GMP Document controller.
 

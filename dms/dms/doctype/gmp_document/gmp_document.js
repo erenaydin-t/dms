@@ -1,4 +1,4 @@
-// Copyright (c) 2026, EspadPharmed - GMP DMS Module
+// Copyright (c) 2026, ErenAydin- GMP DMS Module
 // License: MIT
 
 frappe.ui.form.on("GMP Document", {

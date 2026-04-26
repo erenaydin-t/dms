@@ -2,7 +2,7 @@ from . import __version__ as app_version
 
 app_name = "dms"
 app_title = "DMS"
-app_publisher = "EspadPharmed"
+app_publisher = "ErenAydin"
 app_description = (
     "GMP / 21 CFR Part 11 compliant Document Management System for ERPNext v16. "
     "Provides controlled-document lifecycle, file integrity (SHA-256), Word "

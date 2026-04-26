@@ -7,7 +7,7 @@ setup(
     name="dms",
     version="0.1.0",
     description="GMP / 21 CFR Part 11 compliant Document Management System for ERPNext v16",
-    author="EspadPharmed",
+    author="ErenAydin",
     author_email="aydineren1986@gmail.com",
     packages=find_packages(),
     zip_safe=False,
