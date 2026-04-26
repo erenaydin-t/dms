@@ -49,6 +49,14 @@ bench restart
    which soffice && soffice --version
    ```
 
+## Quickstart — End-to-end smoke test
+
+A 5-minute walkthrough that exercises every part of the system: department
+naming, the three-stage workflow, signature uploads, and the asymmetric
+Word/PDF download pipeline.
+
+→ See **[`docs/quickstart.md`](docs/quickstart.md)**.
+
 ## Authoring Word templates
 
 The Word `.docx` you upload to a GMP Document is auto-filled when QA
