@@ -49,6 +49,17 @@ bench restart
    which soffice && soffice --version
    ```
 
+## Authoring Word templates
+
+The Word `.docx` you upload to a GMP Document is auto-filled when QA
+approves. Field values are bookmarkable as `{{ field_name }}` placeholders
+and three signature placeholders (`{{ preparer_signature }}`,
+`{{ reviewer_signature }}`, `{{ qa_signature }}`) inline PNG signatures —
+**but only in the PDF output, never in the Word output.**
+
+→ See **[`docs/word-template-guide.md`](docs/word-template-guide.md)** for
+the full placeholder list, signature setup, and example template layout.
+
 ## Compliance notes (21 CFR Part 11 / GMP)
 
 - **Audit trail** — every save creates an entry in Frappe's standard Version

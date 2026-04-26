@@ -21,11 +21,13 @@ from frappe.utils import add_months, add_years, cstr, getdate, now_datetime, tod
 from frappe.utils.file_manager import save_file
 from frappe.utils.nestedset import NestedSet
 
-from docxtpl import DocxTemplate
+from docx.shared import Mm
+from docxtpl import DocxTemplate, InlineImage
 
 
 VALIDITY_YEARS_MAP = {"2 Years": 2, "3 Years": 3, "5 Years": 5}
 ALLOWED_EXTENSIONS = (".docx",)
+SIGNATURE_WIDTH_MM = 40  # rendered signature width in PDF
 
 # Workflow states ----------------------------------------------------------- #
 WF_DRAFT = "Draft"
@@ -140,8 +142,7 @@ class GMPDocument(NestedSet):
             self.db_set("expiry_date", self.expiry_date, update_modified=False)
             self.db_set("next_revision_date", self.next_revision_date, update_modified=False)
 
-        self._render_word_template()
-        self._generate_base_pdf()
+        self._render_and_generate_pdf()
 
     def on_cancel(self):
         # A cancelled controlled document is, by definition, obsolete.
@@ -199,66 +200,62 @@ class GMPDocument(NestedSet):
         file_doc.save(ignore_permissions=True)
         self.attachment_file = new_url
 
-    def _render_word_template(self):
-        file_doc = self._get_file_doc(self.attachment_file)
-        physical_path = file_doc.get_full_path()
+    def _render_and_generate_pdf(self):
+        """Two-pass render from a single pristine source template:
 
-        if not physical_path.lower().endswith(ALLOWED_EXTENSIONS):
+        1. Clean render — every {{ field }} populated, every signature
+           placeholder rendered as empty string. Becomes the canonical
+           Word file users download (no signatures embedded).
+        2. With-signatures render — same fields, plus inline PNG images at
+           every signature placeholder. Used only as the source for the
+           DOCX→PDF conversion; the intermediate file is then discarded.
+
+        Result: the persisted base PDF carries the signatures, the saved
+        .docx does not. Watermarking still happens on-demand at download
+        time on top of the signed base PDF.
+        """
+        file_doc = self._get_file_doc(self.attachment_file)
+        source_path = file_doc.get_full_path()
+
+        if not source_path.lower().endswith(ALLOWED_EXTENSIONS):
             frappe.throw(_("Submitted attachment must be a .docx file."))
-
-        try:
-            template = DocxTemplate(physical_path)
-            template.render(self._build_template_context())
-            template.save(physical_path)
-        except Exception:
-            frappe.log_error(frappe.get_traceback(), "GMP Document: Word template rendering failed")
-            frappe.throw(_("Failed to render Word template. Check Error Log for details."))
-
-        # docxtpl rewrote the file in-place — refresh the SHA-256 so the
-        # audit trail reflects the bytes that will actually be distributed.
-        self.db_set(
-            "file_integrity_hash",
-            _compute_sha256(physical_path),
-            update_modified=False,
-        )
-
-    def _build_template_context(self):
-        owner_name = ""
-        if self.document_owner:
-            owner_name = (
-                frappe.db.get_value("Employee", self.document_owner, "employee_name")
-                or self.document_owner
-            )
-
-        return {
-            "docname": self.name,
-            "document_name_fa": self.document_name_fa or "",
-            "document_name_en": self.document_name_en or "",
-            "document_type": self.document_type or "",
-            "department": self.department or "",
-            "document_owner": owner_name,
-            "version_number": self.version_number or 0,
-            "effective_date": cstr(self.effective_date) if self.effective_date else "",
-            "expiry_date": cstr(self.expiry_date) if self.expiry_date else "",
-            "next_revision_date": cstr(self.next_revision_date) if self.next_revision_date else "",
-            "gmp_impact": self.gmp_impact or "",
-        }
-
-    def _generate_base_pdf(self):
-        """Convert rendered .docx -> PDF once at submit and persist as a
-        private File child. Watermarking is done on-demand on this base PDF
-        to avoid running LibreOffice on every download."""
-        file_doc = self._get_file_doc(self.attachment_file)
-        docx_path = file_doc.get_full_path()
 
         soffice = shutil.which("soffice") or shutil.which("libreoffice")
         if not soffice:
-            frappe.throw(_("LibreOffice (soffice) is not installed on the server. Cannot generate base PDF."))
+            frappe.throw(_("LibreOffice (soffice) is not installed on the server. Cannot generate PDF."))
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. Clean render — deliverable Word file
+            clean_path = os.path.join(tmpdir, f"{self.name}.docx")
+            try:
+                clean_template = DocxTemplate(source_path)
+                clean_template.render(self._build_template_context())
+                clean_template.save(clean_path)
+            except Exception:
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    "GMP Document: Word template render (clean) failed",
+                )
+                frappe.throw(_("Failed to render Word template. Check Error Log for details."))
+
+            # 2. With-signatures render — source for PDF
+            sig_path = os.path.join(tmpdir, f"{self.name}-with-signatures.docx")
+            try:
+                sig_template = DocxTemplate(source_path)
+                sig_context = self._build_template_context(template_for_images=sig_template)
+                sig_template.render(sig_context)
+                sig_template.save(sig_path)
+            except Exception:
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    "GMP Document: Word template render (with signatures) failed",
+                )
+                frappe.throw(_("Failed to render Word template with signatures. Check Error Log."))
+
+            # 3. DOCX → PDF (with signatures)
             try:
                 subprocess.run(
-                    [soffice, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, docx_path],
+                    [soffice, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, sig_path],
                     capture_output=True,
                     timeout=180,
                     check=True,
@@ -272,18 +269,26 @@ class GMPDocument(NestedSet):
                 )
                 frappe.throw(_("PDF conversion failed. Check Error Log for details."))
 
-            generated = os.path.join(
-                tmpdir, f"{os.path.splitext(os.path.basename(docx_path))[0]}.pdf"
-            )
-            if not os.path.exists(generated):
+            generated_pdf = os.path.join(tmpdir, f"{self.name}-with-signatures.pdf")
+            if not os.path.exists(generated_pdf):
                 frappe.throw(_("PDF was not generated by LibreOffice."))
 
-            with open(generated, "rb") as fh:
+            with open(generated_pdf, "rb") as fh:
                 pdf_bytes = fh.read()
 
-        base_pdf_filename = f"{self.name}.pdf"
+            # 4. Replace the source .docx with the clean render. This is the
+            # version users will download as the controlled Word file.
+            shutil.copyfile(clean_path, source_path)
 
-        # Idempotency: replace any prior base PDF that may exist on this doc.
+        # 5. SHA-256 reflects the deliverable (clean) bytes, not the signed PDF.
+        self.db_set(
+            "file_integrity_hash",
+            _compute_sha256(source_path),
+            update_modified=False,
+        )
+
+        # 6. Persist the signed PDF (replacing any prior copy).
+        base_pdf_filename = f"{self.name}.pdf"
         for old in frappe.get_all(
             "File",
             filters={
@@ -302,6 +307,96 @@ class GMPDocument(NestedSet):
             dn=self.name,
             is_private=1,
         )
+
+    def _build_template_context(self, template_for_images=None):
+        """Context dict consumed by docxtpl. Every editable GMP Document
+        field is exposed as a Jinja variable so users can place any
+        ``{{ field_name }}`` in the .docx template.
+
+        Signature variables (preparer_signature, reviewer_signature,
+        qa_signature) render as empty strings unless ``template_for_images``
+        is supplied — in which case they become InlineImage objects sized
+        to SIGNATURE_WIDTH_MM."""
+
+        def user_full_name(user_id):
+            if not user_id:
+                return ""
+            return frappe.db.get_value("User", user_id, "full_name") or user_id
+
+        def employee_full_name(emp_id):
+            if not emp_id:
+                return ""
+            return frappe.db.get_value("Employee", emp_id, "employee_name") or emp_id
+
+        def department_full_name(dept):
+            if not dept:
+                return ""
+            return frappe.db.get_value("Department", dept, "department_name") or dept
+
+        context = {
+            # ----- identifiers -----
+            "docname": self.name or "",
+            "name": self.name or "",
+            # ----- names -----
+            "document_name_fa": self.document_name_fa or "",
+            "document_name_en": self.document_name_en or "",
+            # ----- classification -----
+            "document_type": self.document_type or "",
+            "department": self.department or "",
+            "department_name": department_full_name(self.department),
+            "document_owner": self.document_owner or "",
+            "document_owner_name": employee_full_name(self.document_owner),
+            "gmp_impact": self.gmp_impact or "",
+            "validity_period": self.validity_period or "",
+            # ----- lifecycle -----
+            "effective_date": cstr(self.effective_date) if self.effective_date else "",
+            "expiry_date": cstr(self.expiry_date) if self.expiry_date else "",
+            "next_revision_date": cstr(self.next_revision_date) if self.next_revision_date else "",
+            # ----- versioning -----
+            "version_number": self.version_number or 0,
+            "is_active": int(bool(self.is_active)),
+            "requires_training": int(bool(self.requires_training)),
+            # ----- change control -----
+            "reason_for_change": self.reason_for_change or "",
+            # ----- workflow assignments -----
+            "prepared_by": self.prepared_by or "",
+            "prepared_by_name": user_full_name(self.prepared_by),
+            "reviewer": self.reviewer or "",
+            "reviewer_name": user_full_name(self.reviewer),
+            "qa_approver": self.qa_approver or "",
+            "qa_approver_name": user_full_name(self.qa_approver),
+            # ----- workflow actuals -----
+            "reviewed_by": self.reviewed_by or "",
+            "reviewed_by_name": user_full_name(self.reviewed_by),
+            "reviewed_on": cstr(self.reviewed_on) if self.reviewed_on else "",
+            "approved_by": self.approved_by or "",
+            "approved_by_name": user_full_name(self.approved_by),
+            "approved_on": cstr(self.approved_on) if self.approved_on else "",
+            "workflow_status": self.workflow_status or "",
+            # ----- signatures (default: empty for clean DOCX) -----
+            "preparer_signature": "",
+            "reviewer_signature": "",
+            "qa_signature": "",
+        }
+
+        if template_for_images is not None:
+            preparer_path = _resolve_signature_path(self.prepared_by)
+            reviewer_path = _resolve_signature_path(self.reviewed_by or self.reviewer)
+            qa_path = _resolve_signature_path(self.approved_by or self.qa_approver)
+            if preparer_path:
+                context["preparer_signature"] = InlineImage(
+                    template_for_images, preparer_path, width=Mm(SIGNATURE_WIDTH_MM)
+                )
+            if reviewer_path:
+                context["reviewer_signature"] = InlineImage(
+                    template_for_images, reviewer_path, width=Mm(SIGNATURE_WIDTH_MM)
+                )
+            if qa_path:
+                context["qa_signature"] = InlineImage(
+                    template_for_images, qa_path, width=Mm(SIGNATURE_WIDTH_MM)
+                )
+
+        return context
 
     @staticmethod
     def _get_file_doc(file_url):
@@ -322,6 +417,39 @@ def _compute_sha256(path):
         for chunk in iter(lambda: fh.read(8192), b""):
             sha.update(chunk)
     return sha.hexdigest()
+
+
+def _resolve_signature_path(user_email):
+    """Return the on-disk path of a user's signature image, or None.
+
+    Resolution chain:
+        User (user_email) -> Employee.user_id -> Employee.custom_signature_image
+        -> File.file_url -> File.get_full_path()
+    """
+    if not user_email:
+        return None
+
+    employee_name = frappe.db.get_value("Employee", {"user_id": user_email}, "name")
+    if not employee_name:
+        return None
+
+    sig_url = frappe.db.get_value("Employee", employee_name, "custom_signature_image")
+    if not sig_url:
+        return None
+
+    file_name = frappe.db.get_value("File", {"file_url": sig_url}, "name")
+    if not file_name:
+        return None
+
+    physical_path = frappe.get_doc("File", file_name).get_full_path()
+    if not os.path.exists(physical_path):
+        return None
+
+    if not physical_path.lower().endswith(".png"):
+        # Spec: only PNG is accepted as a signature.
+        return None
+
+    return physical_path
 
 
 # ---------------------------------------------------------------------- #
@@ -652,6 +780,32 @@ def get_dms_tree_children(parent=None):
         return nodes
 
     return []
+
+
+@frappe.whitelist()
+def download_word_document(docname):
+    """Stream the clean .docx (text fields rendered, no signatures).
+
+    The signed PDF lives at /api/method/...download_watermarked_pdf;
+    this endpoint serves the Word counterpart that GMP audits can store
+    without exposing actor signatures."""
+    doc = frappe.get_doc("GMP Document", docname)
+    doc.check_permission("read")
+
+    if not doc.attachment_file:
+        frappe.throw(_("No Word file is attached to {0}.").format(docname))
+
+    file_doc = doc._get_file_doc(doc.attachment_file)
+    physical_path = file_doc.get_full_path()
+    if not os.path.exists(physical_path):
+        frappe.throw(_("Word file is missing on disk."))
+
+    with open(physical_path, "rb") as fh:
+        content = fh.read()
+
+    frappe.local.response.filename = f"{docname}.docx"
+    frappe.local.response.filecontent = content
+    frappe.local.response.type = "download"
 
 
 def _resolve_watermark_text(doc):

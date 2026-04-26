@@ -52,10 +52,71 @@ function add_download_pdf_button(frm) {
     if (!frappe.user.has_role("QA Manager")) return;
 
     frm.add_custom_button(
-        __("Download PDF"),
+        __("Download PDF (signed)"),
         () => download_watermarked_pdf(frm),
         __("Get PDF")
     );
+
+    if (frm.doc.docstatus === 1) {
+        frm.add_custom_button(
+            __("Download Word (clean)"),
+            () => download_word_document(frm),
+            __("Get PDF")
+        );
+    }
+}
+
+
+async function download_word_document(frm) {
+    if (frm.is_dirty()) {
+        frappe.msgprint({
+            title: __("Unsaved Changes"),
+            message: __("Please save the document before downloading."),
+            indicator: "orange",
+        });
+        return;
+    }
+
+    const endpoint =
+        "/api/method/dms.dms.doctype.gmp_document.gmp_document.download_word_document";
+    const url = `${endpoint}?docname=${encodeURIComponent(frm.doc.name)}`;
+
+    frappe.dom.freeze(__("Preparing Word file…"));
+
+    try {
+        const response = await fetch(url, {
+            method: "GET",
+            credentials: "same-origin",
+            headers: {
+                "X-Frappe-CSRF-Token": frappe.csrf_token || "",
+            },
+        });
+
+        if (!response.ok) {
+            throw new Error(await extract_server_error(response));
+        }
+
+        const blob = await response.blob();
+        const filename = parse_filename(
+            response.headers.get("Content-Disposition"),
+            `${frm.doc.name}.docx`
+        );
+
+        trigger_browser_download(blob, filename);
+
+        frappe.show_alert(
+            { message: __("Word file downloaded."), indicator: "green" },
+            5
+        );
+    } catch (error) {
+        frappe.msgprint({
+            title: __("Download Failed"),
+            message: error.message || __("Could not retrieve the Word file."),
+            indicator: "red",
+        });
+    } finally {
+        frappe.dom.unfreeze();
+    }
 }
 
 

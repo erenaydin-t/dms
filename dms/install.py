@@ -26,19 +26,34 @@ DEPARTMENT_ABBR_FIELD = {
 }
 
 
+EMPLOYEE_SIGNATURE_FIELD = {
+    "fieldname": "custom_signature_image",
+    "label": "Signature (PNG)",
+    "fieldtype": "Attach Image",
+    "insert_after": "image",
+    "description": (
+        "PNG image of the employee's handwritten signature. Will be inlined "
+        "in the PDF version of GMP Documents this user prepared, reviewed, "
+        "or QA-approved. Not embedded in the Word version."
+    ),
+}
+
+
 def before_install():
     _ensure_role("QA Manager", desk_access=1)
 
 
 def after_install():
     _ensure_department_abbr_field()
+    _ensure_employee_signature_field()
     _set_dms_as_default_workspace()
 
 
 def after_migrate():
-    # Idempotent re-assertion of the custom field; never touches user
+    # Idempotent re-assertion of custom fields; never touches user
     # preferences (default_workspace) so existing customizations stick.
     _ensure_department_abbr_field()
+    _ensure_employee_signature_field()
 
 
 def _ensure_role(role_name, desk_access=1):
@@ -54,6 +69,11 @@ def _ensure_role(role_name, desk_access=1):
 def _ensure_department_abbr_field():
     """Idempotent: create_custom_field is a no-op when the field already exists."""
     create_custom_field("Department", DEPARTMENT_ABBR_FIELD, ignore_validate=True)
+
+
+def _ensure_employee_signature_field():
+    """Idempotent: create_custom_field is a no-op when the field already exists."""
+    create_custom_field("Employee", EMPLOYEE_SIGNATURE_FIELD, ignore_validate=True)
 
 
 def _set_dms_as_default_workspace():
