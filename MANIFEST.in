@@ -1,0 +1,14 @@
+include license.txt
+include requirements.txt
+recursive-include dms *.css
+recursive-include dms *.csv
+recursive-include dms *.html
+recursive-include dms *.ico
+recursive-include dms *.js
+recursive-include dms *.json
+recursive-include dms *.md
+recursive-include dms *.png
+recursive-include dms *.py
+recursive-include dms *.svg
+recursive-include dms *.txt
+recursive-exclude dms *.pyc

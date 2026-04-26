@@ -1,0 +1,314 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "",
+ "creation": "2026-04-25 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "section_identification",
+  "document_name_fa",
+  "document_name_en",
+  "column_break_id_1",
+  "document_type",
+  "department",
+  "document_owner",
+  "section_classification",
+  "gmp_impact",
+  "validity_period",
+  "column_break_class_1",
+  "is_active",
+  "requires_training",
+  "section_lifecycle",
+  "effective_date",
+  "expiry_date",
+  "column_break_life_1",
+  "next_revision_date",
+  "version_number",
+  "section_attachment",
+  "attachment_file",
+  "file_integrity_hash",
+  "section_change_control",
+  "reason_for_change",
+  "section_tree",
+  "parent_gmp_document",
+  "is_group",
+  "column_break_tree_1",
+  "lft",
+  "rgt",
+  "old_parent",
+  "amended_from"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_identification",
+   "fieldtype": "Section Break",
+   "label": "Identification"
+  },
+  {
+   "fieldname": "document_name_fa",
+   "fieldtype": "Data",
+   "label": "Document Name (Farsi)",
+   "reqd": 1,
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "document_name_en",
+   "fieldtype": "Data",
+   "label": "Document Name (English)",
+   "reqd": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "column_break_id_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "document_type",
+   "fieldtype": "Select",
+   "label": "Document Type",
+   "options": "\nSOP\nWI\nForm\nProtocol\nPolicy",
+   "reqd": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "department",
+   "fieldtype": "Link",
+   "label": "Department",
+   "options": "Department",
+   "reqd": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "document_owner",
+   "fieldtype": "Link",
+   "label": "Document Owner",
+   "options": "Employee"
+  },
+  {
+   "fieldname": "section_classification",
+   "fieldtype": "Section Break",
+   "label": "Classification"
+  },
+  {
+   "fieldname": "gmp_impact",
+   "fieldtype": "Select",
+   "label": "GMP Impact",
+   "options": "\nCritical\nMajor\nMinor",
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "validity_period",
+   "fieldtype": "Select",
+   "label": "Validity Period",
+   "options": "\n2 Years\n3 Years\n5 Years",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_class_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "is_active",
+   "fieldtype": "Check",
+   "label": "Is Active",
+   "default": "1",
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "requires_training",
+   "fieldtype": "Check",
+   "label": "Requires Training",
+   "default": "0"
+  },
+  {
+   "fieldname": "section_lifecycle",
+   "fieldtype": "Section Break",
+   "label": "Lifecycle"
+  },
+  {
+   "fieldname": "effective_date",
+   "fieldtype": "Date",
+   "label": "Effective Date",
+   "read_only": 1,
+   "description": "Set automatically on first submit; do not edit manually."
+  },
+  {
+   "fieldname": "expiry_date",
+   "fieldtype": "Date",
+   "label": "Expiry Date",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_life_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "next_revision_date",
+   "fieldtype": "Date",
+   "label": "Next Revision Date",
+   "read_only": 1,
+   "description": "Always 1 month prior to expiry."
+  },
+  {
+   "fieldname": "version_number",
+   "fieldtype": "Int",
+   "label": "Version Number",
+   "default": "0",
+   "read_only": 1,
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "section_attachment",
+   "fieldtype": "Section Break",
+   "label": "Controlled File"
+  },
+  {
+   "fieldname": "attachment_file",
+   "fieldtype": "Attach",
+   "label": "Attachment (.docx)",
+   "description": "Only .docx files are accepted. The file will be renamed and hashed automatically."
+  },
+  {
+   "fieldname": "file_integrity_hash",
+   "fieldtype": "Data",
+   "label": "File Integrity Hash (SHA-256)",
+   "read_only": 1,
+   "length": 64,
+   "description": "SHA-256 digest of the controlled file. Recomputed after every render to match the distributed bytes."
+  },
+  {
+   "fieldname": "section_change_control",
+   "fieldtype": "Section Break",
+   "label": "Change Control",
+   "depends_on": "eval:doc.version_number > 0"
+  },
+  {
+   "fieldname": "reason_for_change",
+   "fieldtype": "Small Text",
+   "label": "Reason for Change",
+   "depends_on": "eval:doc.version_number > 0",
+   "mandatory_depends_on": "eval:doc.amended_from"
+  },
+  {
+   "fieldname": "section_tree",
+   "fieldtype": "Section Break",
+   "label": "Hierarchy",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "parent_gmp_document",
+   "fieldtype": "Link",
+   "label": "Parent GMP Document",
+   "options": "GMP Document",
+   "ignore_user_permissions": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "is_group",
+   "fieldtype": "Check",
+   "label": "Is Group"
+  },
+  {
+   "fieldname": "column_break_tree_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "lft",
+   "fieldtype": "Int",
+   "label": "Left",
+   "hidden": 1,
+   "read_only": 1,
+   "no_copy": 1,
+   "search_index": 1,
+   "print_hide": 1
+  },
+  {
+   "fieldname": "rgt",
+   "fieldtype": "Int",
+   "label": "Right",
+   "hidden": 1,
+   "read_only": 1,
+   "no_copy": 1,
+   "search_index": 1,
+   "print_hide": 1
+  },
+  {
+   "fieldname": "old_parent",
+   "fieldtype": "Link",
+   "options": "GMP Document",
+   "label": "Old Parent",
+   "hidden": 1,
+   "read_only": 1,
+   "no_copy": 1,
+   "print_hide": 1
+  },
+  {
+   "fieldname": "amended_from",
+   "fieldtype": "Link",
+   "label": "Amended From",
+   "options": "GMP Document",
+   "no_copy": 1,
+   "print_hide": 1,
+   "read_only": 1
+  }
+ ],
+ "is_submittable": 1,
+ "is_tree": 1,
+ "links": [],
+ "modified": "2026-04-25 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "DMS",
+ "name": "GMP Document",
+ "naming_rule": "By script",
+ "nsm_parent_field": "parent_gmp_document",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "role": "System Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 1,
+   "submit": 1,
+   "cancel": 1,
+   "amend": 1,
+   "print": 1,
+   "email": 1,
+   "report": 1,
+   "export": 1,
+   "share": 1
+  },
+  {
+   "role": "QA Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "submit": 1,
+   "cancel": 1,
+   "amend": 1,
+   "print": 1,
+   "email": 1,
+   "report": 1,
+   "export": 1,
+   "share": 1
+  },
+  {
+   "role": "Employee",
+   "read": 1,
+   "report": 1,
+   "print": 1
+  }
+ ],
+ "search_fields": "document_name_en,document_name_fa,document_type,department",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "document_name_en",
+ "track_changes": 1,
+ "track_seen": 1
+}
