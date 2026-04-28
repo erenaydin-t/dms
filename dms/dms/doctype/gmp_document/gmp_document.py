@@ -131,6 +131,22 @@ class GMPDocument(NestedSet):
         self._calculate_lifecycle_dates()
         self._handle_attachment_changes()
 
+    def before_submit(self):
+        # Hard guard: submit must arrive via qa_approve(), which sets
+        # workflow_status to Approved before calling doc.submit(). Without
+        # this, any user with the DocType-level 'submit' permission
+        # (QA Manager, System Manager) could click Frappe's standard Submit
+        # button and bypass the Reviewer + QA Approver actors entirely.
+        if self.workflow_status != WF_APPROVED:
+            frappe.throw(
+                _(
+                    "This document cannot be submitted directly. It must pass "
+                    "through the Reviewer and QA Approver workflow — use "
+                    "'Submit for Review' under the Workflow menu."
+                ),
+                frappe.PermissionError,
+            )
+
     def on_submit(self):
         if not self.attachment_file:
             frappe.throw(_("A .docx attachment is required before submitting."))
@@ -425,28 +441,67 @@ def _resolve_signature_path(user_email):
     Resolution chain:
         User (user_email) -> Employee.user_id -> Employee.custom_signature_image
         -> File.file_url -> File.get_full_path()
+
+    Each failure branch writes to the Error Log so a missing signature
+    on a rendered PDF is diagnosable without silent data loss.
     """
     if not user_email:
         return None
 
+    log_title = "GMP Document signature lookup"
+
     employee_name = frappe.db.get_value("Employee", {"user_id": user_email}, "name")
     if not employee_name:
+        frappe.log_error(
+            title=log_title,
+            message=(
+                f"No Employee record is linked to user '{user_email}'. "
+                f"Set Employee.user_id to that user to enable a signature on rendered PDFs."
+            ),
+        )
         return None
 
     sig_url = frappe.db.get_value("Employee", employee_name, "custom_signature_image")
     if not sig_url:
+        frappe.log_error(
+            title=log_title,
+            message=(
+                f"Employee {employee_name} (user {user_email}) has no "
+                f"'custom_signature_image' uploaded."
+            ),
+        )
         return None
 
     file_name = frappe.db.get_value("File", {"file_url": sig_url}, "name")
     if not file_name:
+        frappe.log_error(
+            title=log_title,
+            message=(
+                f"No File record matches Employee {employee_name}'s "
+                f"signature URL '{sig_url}'."
+            ),
+        )
         return None
 
     physical_path = frappe.get_doc("File", file_name).get_full_path()
     if not os.path.exists(physical_path):
+        frappe.log_error(
+            title=log_title,
+            message=(
+                f"Employee {employee_name} signature missing on disk: {physical_path}"
+            ),
+        )
         return None
 
     if not physical_path.lower().endswith(".png"):
-        # Spec: only PNG is accepted as a signature.
+        # Spec: only PNG is accepted as a signature (transparency support).
+        frappe.log_error(
+            title=log_title,
+            message=(
+                f"Employee {employee_name} signature must be a PNG file — "
+                f"got '{physical_path}'. Re-upload as .png."
+            ),
+        )
         return None
 
     return physical_path
