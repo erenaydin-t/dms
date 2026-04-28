@@ -318,10 +318,26 @@ class TestGMPDocument(FrappeTestCase):
                     "content": fh.read(),
                 }).insert(ignore_permissions=True)
 
+        # The before_submit guard requires workflow_status == 'Approved',
+        # which only the qa_approve() path sets. Drive through the full
+        # 3-stage workflow as Administrator (System Manager — bypasses
+        # the per-actor identity check in _ensure_actor).
+        from dms.dms.doctype.gmp_document.gmp_document import (
+            qa_approve,
+            reviewer_approve,
+            submit_for_review,
+        )
+
         doc = self._build_doc(document_name_en="GMP-Test-E2E")
         doc.attachment_file = file_doc.file_url
+        doc.reviewer = "Administrator"
+        doc.qa_approver = "Administrator"
         doc.insert(ignore_permissions=True)
-        doc.submit()
+
+        submit_for_review(doc.name)
+        reviewer_approve(doc.name)
+        qa_approve(doc.name)
+        doc.reload()
 
         self.assertEqual(doc.docstatus, 1)
         self.assertIsNotNone(doc.effective_date)

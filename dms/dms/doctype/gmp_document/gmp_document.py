@@ -17,6 +17,7 @@ from io import BytesIO
 
 import frappe
 from frappe import _
+from frappe.model.workflow import apply_workflow
 from frappe.utils import add_months, add_years, cstr, getdate, now_datetime, today
 from frappe.utils.file_manager import save_file
 from frappe.utils.nestedset import NestedSet
@@ -582,10 +583,9 @@ def submit_for_review(docname):
     if not doc.qa_approver:
         frappe.throw(_("Assign a QA Approver before submitting for review."))
 
-    doc.workflow_status = WF_UNDER_REVIEW
-    doc.add_comment("Workflow", _("Submitted for review by {0}").format(frappe.session.user))
     doc.flags.ignore_permissions = True
-    doc.save()
+    apply_workflow(doc, "Submit for Review")
+    doc.add_comment("Workflow", _("Submitted for review by {0}").format(frappe.session.user))
     _close_open_todos(doc, allocated_to=doc.prepared_by)
     _create_todo(doc, doc.reviewer, _("Review GMP Document {0}").format(doc.name))
     return doc.workflow_status
@@ -600,12 +600,16 @@ def reviewer_approve(docname):
     if not doc.qa_approver:
         frappe.throw(_("Assign a QA Approver before approving."))
 
-    doc.workflow_status = WF_PENDING_QA
-    doc.reviewed_by = frappe.session.user
-    doc.reviewed_on = now_datetime()
-    doc.add_comment("Workflow", _("Reviewer approved — forwarded to QA"))
+    # apply_workflow() does doc.load_from_db() and would wipe in-memory
+    # changes. Persist audit fields via db.set_value first so the reload
+    # picks them up; the workflow framework then advances state on top.
+    frappe.db.set_value("GMP Document", docname, {
+        "reviewed_by": frappe.session.user,
+        "reviewed_on": now_datetime(),
+    }, update_modified=False)
     doc.flags.ignore_permissions = True
-    doc.save()
+    apply_workflow(doc, "Approve as Reviewer")
+    doc.add_comment("Workflow", _("Reviewer approved — forwarded to QA"))
     _close_open_todos(doc, allocated_to=doc.reviewer)
     _create_todo(doc, doc.qa_approver, _("QA approval — GMP Document {0}").format(doc.name))
     return doc.workflow_status
@@ -621,13 +625,14 @@ def reviewer_request_revision(docname, reason):
     if not reason:
         frappe.throw(_("Please provide a reason for the revision request."))
 
-    doc.workflow_status = WF_REVISION
-    doc.last_revision_request = reason
-    doc.last_revision_by = frappe.session.user
-    doc.last_revision_on = now_datetime()
-    doc.add_comment("Workflow", _("Reviewer requested revision: {0}").format(reason))
+    frappe.db.set_value("GMP Document", docname, {
+        "last_revision_request": reason,
+        "last_revision_by": frappe.session.user,
+        "last_revision_on": now_datetime(),
+    }, update_modified=False)
     doc.flags.ignore_permissions = True
-    doc.save()
+    apply_workflow(doc, "Request Revision (Reviewer)")
+    doc.add_comment("Workflow", _("Reviewer requested revision: {0}").format(reason))
     _close_open_todos(doc, allocated_to=doc.reviewer)
     _create_todo(doc, doc.prepared_by, _("Address revision request — {0}").format(doc.name))
     return doc.workflow_status
@@ -640,16 +645,17 @@ def qa_approve(docname):
     if doc.workflow_status != WF_PENDING_QA:
         frappe.throw(_("Document must be Pending QA Approval."))
 
-    doc.workflow_status = WF_APPROVED
-    doc.approved_by = frappe.session.user
-    doc.approved_on = now_datetime()
-    doc.add_comment("Workflow", _("QA approval granted — finalizing"))
+    frappe.db.set_value("GMP Document", docname, {
+        "approved_by": frappe.session.user,
+        "approved_on": now_datetime(),
+    }, update_modified=False)
     doc.flags.ignore_permissions = True
-    doc.save()
+    # The "Approved" workflow state has doc_status=1, so apply_workflow
+    # auto-submits — that's what triggers the Word template render and
+    # base PDF generation in on_submit.
+    apply_workflow(doc, "Approve as QA")
+    doc.add_comment("Workflow", _("QA approval granted — document submitted"))
     _close_open_todos(doc, allocated_to=doc.qa_approver)
-    # Final Frappe submit (docstatus=1) — this is what triggers the
-    # Word template render and base PDF generation in on_submit.
-    doc.submit()
     return doc.workflow_status
 
 
@@ -665,13 +671,14 @@ def qa_request_revision(docname, reason):
 
     # QA bounces back to the reviewer (not all the way to preparer) — they
     # may re-approve after re-checking, or request revision themselves.
-    doc.workflow_status = WF_UNDER_REVIEW
-    doc.last_revision_request = reason
-    doc.last_revision_by = frappe.session.user
-    doc.last_revision_on = now_datetime()
-    doc.add_comment("Workflow", _("QA requested revision: {0}").format(reason))
+    frappe.db.set_value("GMP Document", docname, {
+        "last_revision_request": reason,
+        "last_revision_by": frappe.session.user,
+        "last_revision_on": now_datetime(),
+    }, update_modified=False)
     doc.flags.ignore_permissions = True
-    doc.save()
+    apply_workflow(doc, "Request Revision (QA)")
+    doc.add_comment("Workflow", _("QA requested revision: {0}").format(reason))
     _close_open_todos(doc, allocated_to=doc.qa_approver)
     _create_todo(doc, doc.reviewer, _("Re-review — QA requested revision on {0}").format(doc.name))
     return doc.workflow_status
