@@ -47,11 +47,11 @@ GMP_WORKFLOW_NAME = "GMP Document Workflow"
 # automatically submit the document — that's how 'Approved' becomes the
 # trigger for on_submit (PDF render etc.).
 GMP_WORKFLOW_STATES = [
-    {"state": "Draft",                "doc_status": "0", "allow_edit": "QA Manager",     "style": "Warning"},
-    {"state": "Under Review",         "doc_status": "0", "allow_edit": "System Manager", "style": "Primary"},
-    {"state": "Pending QA Approval",  "doc_status": "0", "allow_edit": "System Manager", "style": "Primary"},
-    {"state": "Approved",             "doc_status": "1", "allow_edit": "System Manager", "style": "Success"},
-    {"state": "Revision Requested",   "doc_status": "0", "allow_edit": "QA Manager",     "style": "Danger"},
+    {"state": "Draft",                "doc_status": 0, "allow_edit": "QA Manager",     "style": "Warning"},
+    {"state": "Under Review",         "doc_status": 0, "allow_edit": "System Manager", "style": "Primary"},
+    {"state": "Pending QA Approval",  "doc_status": 0, "allow_edit": "System Manager", "style": "Primary"},
+    {"state": "Approved",             "doc_status": 1, "allow_edit": "System Manager", "style": "Success"},
+    {"state": "Revision Requested",   "doc_status": 0, "allow_edit": "QA Manager",     "style": "Danger"},
 ]
 
 # Role-level perms only — the controller adds User-level actor enforcement
@@ -75,7 +75,6 @@ def after_install():
     _ensure_department_abbr_field()
     _ensure_employee_signature_field()
     _ensure_gmp_workflow()
-    _set_dms_as_default_workspace()
 
 
 def after_migrate():
@@ -161,15 +160,3 @@ def _ensure_gmp_workflow():
     # invalidating, every apply_workflow() call after install will keep
     # returning '' and raise DoesNotExistError until the worker recycles.
     frappe.cache.delete_key("workflow")
-
-
-def _set_dms_as_default_workspace():
-    """Make /app land on the DMS workspace for every existing real user.
-
-    Only runs in after_install (fresh install). Skipping after_migrate is
-    intentional — once a user picks a different default we don't want to
-    clobber it on every redeploy.
-    """
-    users = frappe.get_all("User", filters={"name": ["!=", "Guest"]}, pluck="name")
-    for u in users:
-        frappe.db.set_value("User", u, "default_workspace", "DMS")

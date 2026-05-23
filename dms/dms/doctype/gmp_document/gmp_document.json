@@ -49,6 +49,9 @@
   "last_revision_request",
   "section_tree",
   "parent_gmp_document",
+  "section_references",
+  "references",
+  "references_tree_html",
   "is_group",
   "column_break_tree_1",
   "lft",
@@ -332,6 +335,22 @@
    "options": "GMP Document",
    "ignore_user_permissions": 1,
    "search_index": 1
+  },
+  {
+   "fieldname": "section_references",
+   "fieldtype": "Section Break",
+   "label": "Document References"
+  },
+  {
+   "fieldname": "references",
+   "fieldtype": "Table",
+   "label": "References",
+   "options": "GMP Document Reference"
+  },
+  {
+   "fieldname": "references_tree_html",
+   "fieldtype": "HTML",
+   "label": "Reference Tree"
   },
   {
    "fieldname": "is_group",

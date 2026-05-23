@@ -13,6 +13,7 @@ frappe.ui.form.on("GMP Document", {
         render_workflow_indicator(frm);
         add_workflow_buttons(frm);
         toggle_assignment_fields(frm);
+        render_reference_tree(frm);
     },
 
     version_number(frm) {
@@ -370,4 +371,61 @@ function trigger_browser_download(blob, filename) {
     a.click();
     document.body.removeChild(a);
     window.URL.revokeObjectURL(blob_url);
+}
+
+
+// -------------------------------------------------------------------- //
+//  Document Reference Tree                                             //
+// -------------------------------------------------------------------- //
+
+function render_reference_tree(frm) {
+    if (frm.is_new()) return;
+    if (!frm.fields_dict.references_tree_html) return;
+
+    const wrapper = frm.fields_dict.references_tree_html.$wrapper;
+    wrapper.empty();
+
+    frappe.call({
+        method: 'dms.dms.doctype.gmp_document.gmp_document.get_document_reference_tree',
+        args: { docname: frm.doc.name, depth: 4 },
+        callback(r) {
+            if (!r.message) return;
+            const container = $('<div class="dms-ref-tree" style="padding:8px 0;"></div>');
+            _render_tree_node(r.message, container, 0);
+            wrapper.append(container);
+        },
+    });
+}
+
+
+function _render_tree_node(node, parent_el, depth) {
+    const indent = depth * 20;
+    const has_children = node.children && node.children.length > 0;
+
+    const row = $(`
+        <div style="margin-left:${indent}px; padding:4px 0; display:flex; align-items:center; gap:8px;">
+            <span style="color:#888; font-size:12px;">${has_children ? '▶' : '•'}</span>
+            <a href="/app/gmp-document/${encodeURIComponent(node.name)}" target="_blank"
+               style="font-size:13px; font-weight:500;">${frappe.utils.escape_html(node.label)}</a>
+            ${node.reference_type
+                ? `<span style="font-size:11px; color:#666; background:#f0f0f0; padding:1px 6px; border-radius:3px;">${frappe.utils.escape_html(node.reference_type)}</span>`
+                : ''}
+        </div>
+    `);
+
+    parent_el.append(row);
+
+    if (has_children) {
+        const children_container = $('<div class="dms-tree-children"></div>');
+        parent_el.append(children_container);
+
+        row.find('span:first').css('cursor', 'pointer').on('click', function () {
+            children_container.toggle();
+            $(this).text(children_container.is(':visible') ? '▼' : '▶');
+        });
+
+        node.children.forEach(child => {
+            _render_tree_node(child, children_container, depth + 1);
+        });
+    }
 }
