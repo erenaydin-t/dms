@@ -61,4 +61,4 @@ doc_events = {}
 # ------------------------------------------------------------------------- #
 #  Required apps                                                            #
 # ------------------------------------------------------------------------- #
-required_apps = ["frappe", "erpnext", "hrms"]  # hrms supplies Employee + Department
+required_apps = ["frappe", "erpnext"]

@@ -127,6 +127,31 @@ class GMPDocument(NestedSet):
     def validate(self):
         if self.amended_from and not (self.reason_for_change and self.reason_for_change.strip()):
             frappe.throw(_("Reason for Change is mandatory when amending a GMP Document."))
+        self._check_circular_references()
+
+    def _check_circular_references(self):
+        """Prevent circular reference chains (A → B → A)."""
+        if not self.references:
+            return
+
+        def _dfs(doc_name, visited):
+            if doc_name in visited:
+                frappe.throw(
+                    _("Circular reference detected: document {0} is already in the reference chain.").format(doc_name)
+                )
+            visited.add(doc_name)
+            children = frappe.get_all(
+                "GMP Document Reference",
+                filters={"parent": doc_name},
+                pluck="referenced_document",
+            )
+            for child in children:
+                _dfs(child, visited.copy())
+
+        for row in self.references:
+            if row.referenced_document == self.name:
+                frappe.throw(_("A document cannot reference itself."))
+            _dfs(row.referenced_document, {self.name})
 
     def before_save(self):
         self._calculate_lifecycle_dates()
@@ -823,8 +848,8 @@ def get_dms_tree_children(parent=None):
         latest = {}
         for d in docs:
             base = d.name.rsplit("-v", 1)[0]
-            v = d.version_number or 0
-            if base not in latest or v > (latest[base].version_number or 0):
+            v = int(d.version_number or 0)
+            if base not in latest or v > int(latest[base].version_number or 0):
                 latest[base] = d
 
         nodes = []
@@ -868,6 +893,50 @@ def download_word_document(docname):
     frappe.local.response.filename = f"{docname}.docx"
     frappe.local.response.filecontent = content
     frappe.local.response.type = "download"
+
+
+@frappe.whitelist()
+def get_document_reference_tree(docname, depth=3):
+    """Return a nested dict representing the reference tree for a GMP Document.
+
+    Each node: {"name": str, "label": str, "reference_type": str, "children": [...]}
+    depth limits recursion depth to avoid runaway queries on large graphs.
+    """
+    frappe.has_permission("GMP Document", "read", throw=True)
+
+    def _get_label(name):
+        row = frappe.db.get_value(
+            "GMP Document", name, ["document_name_en", "workflow_status", "is_active"], as_dict=True
+        )
+        if not row:
+            return name
+        label = name
+        if row.document_name_en:
+            label += f" — {row.document_name_en}"
+        return label
+
+    def _build(name, current_depth, visited):
+        node = {
+            "name": name,
+            "label": _get_label(name),
+            "reference_type": "",
+            "children": [],
+        }
+        if current_depth <= 0 or name in visited:
+            return node
+        visited = visited | {name}
+        refs = frappe.get_all(
+            "GMP Document Reference",
+            filters={"parent": name},
+            fields=["referenced_document", "reference_type"],
+        )
+        for r in refs:
+            child = _build(r.referenced_document, current_depth - 1, visited)
+            child["reference_type"] = r.reference_type or ""
+            node["children"].append(child)
+        return node
+
+    return _build(docname, int(depth), set())
 
 
 def _resolve_watermark_text(doc):
