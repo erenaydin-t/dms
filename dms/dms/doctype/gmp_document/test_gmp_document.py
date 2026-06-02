@@ -102,6 +102,20 @@ class TestGMPDocument(FrappeTestCase):
         doc.update(defaults)
         return doc
 
+    def _approve_via_workflow(self, doc):
+        """Drive a draft through the native Workflow to Approved (submitted).
+
+        Transitions go through Frappe's apply_workflow (the same path the
+        "Actions" menu uses). Tests run as Administrator, which satisfies every
+        transition role and the per-actor conditions' Administrator escape."""
+        from frappe.model.workflow import apply_workflow
+
+        apply_workflow(doc, "Submit for Review")
+        apply_workflow(doc, "Approve as Reviewer")
+        apply_workflow(doc, "Approve as QA")
+        doc.reload()
+        return doc
+
     # ------------------------------------------------------------------ #
     #  Autoname                                                          #
     # ------------------------------------------------------------------ #
@@ -295,49 +309,42 @@ class TestGMPDocument(FrappeTestCase):
     #  End-to-end submit (skipped unless LibreOffice is on PATH)         #
     # ------------------------------------------------------------------ #
 
-    @unittest.skipUnless(SOFFICE_AVAILABLE, "LibreOffice (soffice) not found on PATH")
-    def test_submit_persists_base_pdf(self):
-        # Build a minimal valid .docx via python-docx if available.
+    def _make_docx_file(self, fname="test_template.docx"):
+        """Persist a minimal valid .docx as a private File, or skip if
+        python-docx is unavailable."""
         try:
             from docx import Document as DocxDocument
         except ImportError:
-            self.skipTest("python-docx not installed; skipping end-to-end submit test")
+            self.skipTest("python-docx not installed; skipping end-to-end test")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            docx_path = os.path.join(tmpdir, "test_template.docx")
+            docx_path = os.path.join(tmpdir, fname)
             d = DocxDocument()
             d.add_paragraph("Document: {{ docname }}")
             d.add_paragraph("Version: {{ version_number }}")
             d.save(docx_path)
-
             with open(docx_path, "rb") as fh:
-                file_doc = frappe.get_doc({
+                return frappe.get_doc({
                     "doctype": "File",
-                    "file_name": "test_template.docx",
+                    "file_name": fname,
                     "is_private": 1,
                     "content": fh.read(),
                 }).insert(ignore_permissions=True)
 
-        # The before_submit guard requires workflow_status == 'Approved',
-        # which only the qa_approve() path sets. Drive through the full
-        # 3-stage workflow as Administrator (System Manager — bypasses
-        # the per-actor identity check in _ensure_actor).
-        from dms.dms.doctype.gmp_document.gmp_document import (
-            qa_approve,
-            reviewer_approve,
-            submit_for_review,
-        )
-
-        doc = self._build_doc(document_name_en="GMP-Test-E2E")
+    def _make_submitted_doc(self, en):
+        """Create a GMP Document, attach a real .docx, and drive it through the
+        native workflow to Approved/submitted. Returns the reloaded doc."""
+        file_doc = self._make_docx_file(fname=f"{en}.docx")
+        doc = self._build_doc(document_name_en=en)
         doc.attachment_file = file_doc.file_url
         doc.reviewer = "Administrator"
         doc.qa_approver = "Administrator"
         doc.insert(ignore_permissions=True)
+        return self._approve_via_workflow(doc)
 
-        submit_for_review(doc.name)
-        reviewer_approve(doc.name)
-        qa_approve(doc.name)
-        doc.reload()
+    @unittest.skipUnless(SOFFICE_AVAILABLE, "LibreOffice (soffice) not found on PATH")
+    def test_submit_persists_base_pdf(self):
+        doc = self._make_submitted_doc("GMP-Test-E2E")
 
         self.assertEqual(doc.docstatus, 1)
         self.assertIsNotNone(doc.effective_date)
@@ -353,3 +360,112 @@ class TestGMPDocument(FrappeTestCase):
             },
         )
         self.assertTrue(base_pdf, "Base PDF should be persisted on submit")
+
+    # ------------------------------------------------------------------ #
+    #  Issue #3 — amendment naming via the real insert path              #
+    # ------------------------------------------------------------------ #
+
+    def test_amend_insert_produces_versioned_name(self):
+        # The 'Default Naming' amend rule must let our autoname() run via the
+        # real insert path so the name becomes …-v1, not the framework's
+        # …-v0-1 counter. Hermetic: no submit/LibreOffice needed — the
+        # predecessor is forced to a cancelled docstatus so it is amendable.
+        from dms.install import _ensure_amend_naming_rule
+
+        _ensure_amend_naming_rule()
+
+        original = self._build_doc(document_name_en="GMP-Test-AmendName")
+        original.insert(ignore_permissions=True)
+        frappe.db.set_value("GMP Document", original.name, "docstatus", 2)
+
+        amended = frappe.copy_doc(original)
+        amended.amended_from = original.name
+        amended.reason_for_change = "CAPA-2026-002 procedural fix"
+        amended.insert(ignore_permissions=True)
+
+        base = original.name.rsplit("-v", 1)[0]
+        self.assertEqual(amended.name, f"{base}-v1")
+        self.assertNotIn("-v0-1", amended.name)
+        self.assertEqual(amended.version_number, 1)
+
+    # ------------------------------------------------------------------ #
+    #  Issue #2 — cancel transitions status to Obsolete                  #
+    # ------------------------------------------------------------------ #
+
+    @unittest.skipUnless(SOFFICE_AVAILABLE, "LibreOffice (soffice) not found on PATH")
+    def test_cancel_sets_obsolete_status(self):
+        doc = self._make_submitted_doc("GMP-Test-Cancel")
+        doc.cancel()
+        doc.reload()
+
+        self.assertEqual(doc.docstatus, 2)
+        self.assertEqual(doc.is_active, 0)
+        self.assertEqual(doc.workflow_status, "Obsolete")
+
+    # ------------------------------------------------------------------ #
+    #  Issue #4 — references repoint to the new version on amend         #
+    # ------------------------------------------------------------------ #
+
+    @unittest.skipUnless(SOFFICE_AVAILABLE, "LibreOffice (soffice) not found on PATH")
+    def test_amend_repoints_dependent_references(self):
+        from dms.install import _ensure_amend_naming_rule
+        from frappe.model.workflow import apply_workflow
+
+        _ensure_amend_naming_rule()
+
+        target = self._make_submitted_doc("GMP-Test-RefTarget")
+
+        # A dependent document referencing the target version.
+        dependent = self._make_docx_file(fname="GMP-Test-RefDependent.docx")
+        dep = self._build_doc(document_name_en="GMP-Test-RefDependent")
+        dep.attachment_file = dependent.file_url
+        dep.reviewer = "Administrator"
+        dep.qa_approver = "Administrator"
+        dep.append("references", {"referenced_document": target.name, "reference_type": "References"})
+        dep.insert(ignore_permissions=True)
+        dep = self._approve_via_workflow(dep)
+
+        # Cancel + amend the target — link validation must not block this.
+        target.cancel()
+        amended = frappe.copy_doc(target)
+        amended.amended_from = target.name
+        amended.reason_for_change = "Revised per change control"
+        amended.attachment_file = self._make_docx_file(fname="GMP-Test-RefTarget-v1.docx").file_url
+        amended.insert(ignore_permissions=True)
+        amended = self._approve_via_workflow(amended)
+
+        # The dependent's reference row should now point at the new version.
+        repointed = frappe.get_all(
+            "GMP Document Reference",
+            filters={"parent": dep.name},
+            pluck="referenced_document",
+        )
+        self.assertIn(amended.name, repointed)
+        self.assertNotIn(target.name, repointed)
+
+    # ------------------------------------------------------------------ #
+    #  Issue #1 — base PDF regenerates when the File record is missing   #
+    # ------------------------------------------------------------------ #
+
+    @unittest.skipUnless(SOFFICE_AVAILABLE, "LibreOffice (soffice) not found on PATH")
+    def test_download_regenerates_missing_base_pdf(self):
+        from dms.dms.doctype.gmp_document.gmp_document import download_watermarked_pdf
+
+        doc = self._make_submitted_doc("GMP-Test-Regen")
+
+        # Delete the persisted base PDF to simulate the Issue #1 failure mode.
+        for pdf in frappe.get_all(
+            "File",
+            filters={
+                "attached_to_doctype": "GMP Document",
+                "attached_to_name": doc.name,
+                "file_name": ["like", "%.pdf"],
+            },
+            pluck="name",
+        ):
+            frappe.delete_doc("File", pdf, ignore_permissions=True, force=True)
+
+        # Should regenerate transparently instead of throwing.
+        download_watermarked_pdf(doc.name)
+        self.assertEqual(frappe.local.response.type, "download")
+        self.assertTrue(frappe.local.response.filecontent.startswith(b"%PDF"))

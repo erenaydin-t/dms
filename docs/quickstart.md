@@ -115,24 +115,31 @@ Save as `.docx`. The full placeholder reference is in
 
 ### 4.2 Preparer → Submit for Review
 
-Top-right of the form: **Workflow → Submit for Review**.
+Top-right of the form: the native **Actions** menu → **Submit for Review**.
 Status flips to **Under Review**. A ToDo is created for the Reviewer; the
 Reviewer/QA Approver fields lock so the assignments can't drift.
 
+> All transitions are driven by the standard ERPNext Workflow **Actions**
+> menu — there are no separate custom workflow buttons. Each action is
+> visible only to the assigned actor (the transition `condition` enforces
+> the specific preparer / reviewer / QA approver; `Administrator` is the
+> escape hatch).
+
 ### 4.3 Reviewer → Approve (or Request Revision)
 
-Stay logged in as `Administrator` (System Manager bypasses the actor
-check) — or log in as the assigned Reviewer.
+Stay logged in as `Administrator` (the per-actor escape hatch) — or log in
+as the assigned Reviewer.
 
-- **Workflow → Approve as Reviewer** → status flips to
+- **Actions → Approve as Reviewer** → status flips to
   **Pending QA Approval**, ToDo bounces to QA.
-- *Or* **Request Revision (Reviewer)** → enter a reason → status flips
-  to **Revision Requested**, ToDo goes back to the preparer, and the
-  reason is captured under the **Latest Revision Request** section.
+- *Or* enter the reason in **Latest Revision Request → Reason** first, then
+  **Actions → Request Revision (Reviewer)** → status flips to
+  **Revision Requested**, ToDo goes back to the preparer, and the requester
+  and timestamp are stamped under the **Latest Revision Request** section.
 
 ### 4.4 QA Approver → Approve
 
-**Workflow → Approve as QA**.
+**Actions → Approve as QA**.
 
 This is the moment everything happens server-side:
 
@@ -146,8 +153,9 @@ This is the moment everything happens server-side:
 4. Watermark logic activates: future downloads will overlay
    `CONTROLLED COPY` on the PDF
 
-The status pill now shows **Approved**, dashboard indicator shows
-`CONTROLLED COPY` in green.
+The single native workflow status badge in the form header now shows
+**Approved** (green). That badge is the one authoritative lifecycle
+indicator — there are no longer any duplicate custom status indicators.
 
 ---
 
@@ -168,13 +176,13 @@ controlled PDF carries the actor signatures.
 
 ## 6. Test the amendment flow
 
-1. **Menu → Cancel** the submitted document → status becomes
-   `Cancelled`, `is_active` flips to 0, dashboard indicator switches to
-   `OBSOLETE` (red)
+1. **Menu → Cancel** the submitted document → `docstatus` becomes
+   `Cancelled`, `is_active` flips to 0, and the workflow status badge
+   transitions to **Obsolete** (red)
 2. Re-download the PDF — the watermark is now `OBSOLETE` instead of
    `CONTROLLED COPY` (same base PDF, dynamic overlay)
 3. **Menu → Amend** → a new draft opens with:
-   - Same logical ID, version bumped: `SOP-ACC-01-v1`
+   - Same logical ID, version bumped: `SOP-ACC-01-v1` (not `…-v0-1`)
    - `attachment_file`, `file_integrity_hash`, `effective_date` cleared
    - **Reason for Change** field visible AND mandatory
 4. Fill **Reason for Change**, re-upload the `.docx`, run through the

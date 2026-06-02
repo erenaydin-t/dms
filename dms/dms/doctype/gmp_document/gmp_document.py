@@ -17,7 +17,6 @@ from io import BytesIO
 
 import frappe
 from frappe import _
-from frappe.model.workflow import apply_workflow
 from frappe.utils import add_months, add_years, cstr, getdate, now_datetime, today
 from frappe.utils.file_manager import save_file
 from frappe.utils.nestedset import NestedSet
@@ -36,8 +35,9 @@ WF_UNDER_REVIEW = "Under Review"
 WF_PENDING_QA = "Pending QA Approval"
 WF_APPROVED = "Approved"
 WF_REVISION = "Revision Requested"
+WF_OBSOLETE = "Obsolete"
 
-WF_ALL = (WF_DRAFT, WF_UNDER_REVIEW, WF_PENDING_QA, WF_APPROVED, WF_REVISION)
+WF_ALL = (WF_DRAFT, WF_UNDER_REVIEW, WF_PENDING_QA, WF_APPROVED, WF_REVISION, WF_OBSOLETE)
 
 
 class GMPDocument(NestedSet):
@@ -114,7 +114,10 @@ class GMPDocument(NestedSet):
         self.effective_date = None
         self.expiry_date = None
         self.next_revision_date = None
-        # The amended draft starts a fresh review cycle.
+        # The amended draft starts a fresh review cycle. It is also the new
+        # active version — the predecessor was amended from a cancelled
+        # (is_active=0) doc, so re-assert active here rather than inherit 0.
+        self.is_active = 1
         self.workflow_status = WF_DRAFT
         self.reviewed_by = None
         self.reviewed_on = None
@@ -158,20 +161,29 @@ class GMPDocument(NestedSet):
         self._handle_attachment_changes()
 
     def before_submit(self):
-        # Hard guard: submit must arrive via qa_approve(), which sets
-        # workflow_status to Approved before calling doc.submit(). Without
-        # this, any user with the DocType-level 'submit' permission
-        # (QA Manager, System Manager) could click Frappe's standard Submit
-        # button and bypass the Reviewer + QA Approver actors entirely.
+        # Hard guard: submit must arrive via the native "Approve as QA"
+        # workflow transition, whose target state (Approved) has doc_status=1
+        # and therefore auto-submits — by which point workflow_status is
+        # already Approved. Without this, any user with the DocType-level
+        # 'submit' permission (QA Manager, System Manager) could click
+        # Frappe's standard Submit button and bypass the Reviewer + QA
+        # Approver actors entirely.
         if self.workflow_status != WF_APPROVED:
             frappe.throw(
                 _(
                     "This document cannot be submitted directly. It must pass "
-                    "through the Reviewer and QA Approver workflow — use "
-                    "'Submit for Review' under the Workflow menu."
+                    "through the Reviewer and QA Approver workflow — use the "
+                    "actions in the workflow 'Actions' menu."
                 ),
                 frappe.PermissionError,
             )
+
+    def on_update(self):
+        # Workflow transitions arrive via Frappe's native apply_workflow(),
+        # which save()s the doc — so audit stamping and ToDo housekeeping that
+        # used to live in the (now removed) custom transition endpoints is
+        # driven here by detecting a change in workflow_status.
+        self._apply_workflow_side_effects()
 
     def on_submit(self):
         if not self.attachment_file:
@@ -185,10 +197,38 @@ class GMPDocument(NestedSet):
             self.db_set("next_revision_date", self.next_revision_date, update_modified=False)
 
         self._render_and_generate_pdf()
+        # Now that this revision is officially approved, swing any dependent
+        # references off the superseded version and onto this one.
+        self._repoint_references_to_self()
+
+    def before_cancel(self):
+        # A controlled document is routinely listed in the `references` child
+        # table of other GMP Documents. Without this exemption Frappe's
+        # check_no_back_links_exist() blocks cancellation (and therefore the
+        # cancel-and-amend revision flow) whenever the document is referenced
+        # by a submitted peer. Revision is a first-class GMP lifecycle event,
+        # so we opt GMP Document references out of the cancel-time link guard;
+        # the new version then repoints dependents in
+        # _repoint_references_to_self(). It must be an *instance* attribute —
+        # the guard reads it via doc.get(), which ignores class attributes —
+        # and set here, before check_no_back_links_exist() runs post-cancel.
+        self.ignore_linked_doctypes = ("GMP Document",)
 
     def on_cancel(self):
-        # A cancelled controlled document is, by definition, obsolete.
+        # A cancelled controlled document is, by definition, obsolete. Reflect
+        # that in both the active flag and the lifecycle status field so the
+        # native workflow badge stops reading "Approved".
         self.db_set("is_active", 0, update_modified=False)
+        self.db_set("workflow_status", WF_OBSOLETE, update_modified=False)
+
+    def copy_attachments_from_amended_from(self):
+        # GMP change control: a revised document must re-acquire its own
+        # controlled file — before_insert() deliberately clears attachment_file
+        # so nothing is inherited. We therefore override Frappe's default amend
+        # behaviour, which would (a) carry the predecessor's File forward
+        # against policy, and (b) raise FileNotFoundError when the predecessor's
+        # physical .docx is no longer on disk, crashing the whole amendment.
+        return
 
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                  #
@@ -440,6 +480,116 @@ class GMPDocument(NestedSet):
 
         return context
 
+    # ------------------------------------------------------------------ #
+    #  Workflow side effects (driven by native apply_workflow)           #
+    # ------------------------------------------------------------------ #
+
+    def _apply_workflow_side_effects(self):
+        """Stamp audit fields and shuffle ToDos when workflow_status changes.
+
+        Transitions are performed by Frappe's native Workflow engine (the
+        "Actions" menu); this hook supplies the GMP bookkeeping the engine
+        does not: who reviewed/approved/requested-revision and when, plus the
+        task hand-off between the assigned preparer, reviewer and QA approver.
+        Per-actor authorisation is enforced separately by the transition
+        `condition` expressions defined in install.py.
+        """
+        before = self.get_doc_before_save()
+        if not before:
+            return  # initial insert — no transition to react to
+
+        prev = before.workflow_status
+        curr = self.workflow_status
+        if prev == curr:
+            return
+
+        actor = frappe.session.user
+
+        if curr == WF_UNDER_REVIEW and prev in (WF_DRAFT, WF_REVISION):
+            # Preparer submitted for review.
+            self.add_comment("Workflow", _("Submitted for review by {0}").format(actor))
+            _close_open_todos(self, allocated_to=self.prepared_by)
+            _create_todo(self, self.reviewer, _("Review GMP Document {0}").format(self.name))
+
+        elif curr == WF_PENDING_QA:
+            # Reviewer approved — forward to QA.
+            self.db_set("reviewed_by", actor, update_modified=False)
+            self.db_set("reviewed_on", now_datetime(), update_modified=False)
+            self.add_comment("Workflow", _("Reviewer approved — forwarded to QA"))
+            _close_open_todos(self, allocated_to=self.reviewer)
+            _create_todo(self, self.qa_approver, _("QA approval — GMP Document {0}").format(self.name))
+
+        elif curr == WF_APPROVED:
+            # QA approved (this save also auto-submits the document).
+            self.db_set("approved_by", actor, update_modified=False)
+            self.db_set("approved_on", now_datetime(), update_modified=False)
+            self.add_comment("Workflow", _("QA approval granted — document submitted"))
+            _close_open_todos(self, allocated_to=self.qa_approver)
+
+        elif curr == WF_REVISION and prev == WF_UNDER_REVIEW:
+            # Reviewer bounced the document back to the preparer.
+            self._stamp_revision_request(actor)
+            _close_open_todos(self, allocated_to=self.reviewer)
+            _create_todo(self, self.prepared_by, _("Address revision request — {0}").format(self.name))
+
+        elif curr == WF_UNDER_REVIEW and prev == WF_PENDING_QA:
+            # QA bounced the document back to the reviewer.
+            self._stamp_revision_request(actor)
+            _close_open_todos(self, allocated_to=self.qa_approver)
+            _create_todo(self, self.reviewer, _("Re-review — QA requested revision on {0}").format(self.name))
+
+    def _stamp_revision_request(self, actor):
+        """Record who/when on a revision request. The reason text is captured
+        in the writable `last_revision_request` field on the form before the
+        actor selects the native Request Revision action."""
+        self.db_set("last_revision_by", actor, update_modified=False)
+        self.db_set("last_revision_on", now_datetime(), update_modified=False)
+        reason = (self.last_revision_request or "").strip()
+        self.add_comment(
+            "Workflow",
+            _("Revision requested by {0}: {1}").format(actor, reason or _("(no reason given)")),
+        )
+
+    def _repoint_references_to_self(self):
+        """Swing dependents' reference rows from the superseded version to this
+        newly-approved one, so cross-references always resolve to the current
+        controlled version (Issue #4)."""
+        if not self.amended_from:
+            return
+
+        rows = frappe.get_all(
+            "GMP Document Reference",
+            filters={"referenced_document": self.amended_from},
+            fields=["name", "parent", "parenttype"],
+        )
+        repointed_parents = set()
+        for row in rows:
+            if row.parent == self.name:
+                continue  # never repoint this revision's own reference rows
+            frappe.db.set_value(
+                "GMP Document Reference",
+                row.name,
+                "referenced_document",
+                self.name,
+                update_modified=False,
+            )
+            if row.parenttype == "GMP Document":
+                repointed_parents.add(row.parent)
+
+        for parent_name in repointed_parents:
+            try:
+                frappe.get_doc("GMP Document", parent_name).add_comment(
+                    "Info",
+                    _("Reference {0} automatically superseded by {1}.").format(
+                        self.amended_from, self.name
+                    ),
+                )
+            except Exception:
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    "GMP Document: reference repoint comment failed",
+                )
+
     @staticmethod
     def _get_file_doc(file_url):
         file_name = frappe.db.get_value("File", {"file_url": file_url}, "name")
@@ -543,30 +693,20 @@ def download_watermarked_pdf(docname):
     """Stream the base PDF with a status-driven watermark.
 
     Watermark is resolved at call time so a status change (is_active,
-    docstatus) is reflected immediately without re-rendering the PDF."""
+    docstatus) is reflected immediately without re-rendering the PDF. The
+    base PDF path is resolved dynamically and regenerated on demand if the
+    File record or the on-disk file has gone missing (Issue #1)."""
     doc = frappe.get_doc("GMP Document", docname)
     doc.check_permission("read")
 
-    base_pdf_filename = f"{docname}.pdf"
-    base_pdf_name = frappe.db.get_value(
-        "File",
-        {
-            "attached_to_doctype": "GMP Document",
-            "attached_to_name": docname,
-            "file_name": base_pdf_filename,
-        },
-        "name",
-    )
-    if not base_pdf_name:
+    if doc.docstatus != 1:
         frappe.throw(
-            _("Base PDF for {0} is not available. The document may not have been submitted yet.").format(
+            _("A controlled PDF is only available after {0} has been QA-approved (submitted).").format(
                 docname
             )
         )
 
-    base_pdf_path = frappe.get_doc("File", base_pdf_name).get_full_path()
-    if not os.path.exists(base_pdf_path):
-        frappe.throw(_("Base PDF file is missing on disk."))
+    base_pdf_path = _resolve_base_pdf_path(doc)
 
     watermark_text = _resolve_watermark_text(doc)
     watermarked = _apply_watermark(base_pdf_path, watermark_text)
@@ -577,136 +717,67 @@ def download_watermarked_pdf(docname):
     frappe.local.response.type = "download"
 
 
-# ---------------------------------------------------------------------- #
-#  Workflow transitions                                                  #
-# ---------------------------------------------------------------------- #
-#
-# The state machine:
-#
-#   Draft ── submit_for_review ──► Under Review
-#   Under Review ── reviewer_approve ──► Pending QA Approval
-#   Under Review ── reviewer_request_revision ──► Revision Requested
-#   Pending QA Approval ── qa_approve ──► Approved (docstatus=1)
-#   Pending QA Approval ── qa_request_revision ──► Under Review
-#   Revision Requested ── submit_for_review ──► Under Review
-#
-# Each transition validates that the caller is the assigned actor
-# (preparer / reviewer / qa_approver), creates a ToDo for the next
-# actor, and closes the previous actor's ToDo.
+def _resolve_base_pdf_path(doc):
+    """Return the on-disk path of the document's base PDF, regenerating it if
+    the File record or the physical file is missing.
 
+    Lookup is by attachment + ``.pdf`` extension (not an exact filename
+    match) so a renamed/re-versioned document still resolves. Regeneration
+    requires the source ``.docx`` to still be present."""
 
-@frappe.whitelist()
-def submit_for_review(docname):
-    doc = frappe.get_doc("GMP Document", docname)
-    _ensure_actor(doc.prepared_by, "preparer")
-    if doc.workflow_status not in (WF_DRAFT, WF_REVISION):
-        frappe.throw(_("Document must be Draft or Revision Requested to submit for review."))
+    def _find_pdf_on_disk():
+        for f in frappe.get_all(
+            "File",
+            filters={
+                "attached_to_doctype": doc.doctype,
+                "attached_to_name": doc.name,
+                "file_name": ["like", "%.pdf"],
+            },
+            fields=["name"],
+        ):
+            path = frappe.get_doc("File", f.name).get_full_path()
+            if os.path.exists(path):
+                return path
+        return None
+
+    path = _find_pdf_on_disk()
+    if path:
+        return path
+
+    # Missing base PDF — try to regenerate from the controlled .docx.
     if not doc.attachment_file:
-        frappe.throw(_("Attach the .docx controlled file before submitting for review."))
-    if not doc.reviewer:
-        frappe.throw(_("Assign a Reviewer before submitting for review."))
-    if not doc.qa_approver:
-        frappe.throw(_("Assign a QA Approver before submitting for review."))
+        frappe.throw(
+            _(
+                "Base PDF for {0} is unavailable and cannot be regenerated: "
+                "the controlled .docx attachment is missing."
+            ).format(doc.name)
+        )
+    doc._render_and_generate_pdf()
 
-    doc.flags.ignore_permissions = True
-    apply_workflow(doc, "Submit for Review")
-    doc.add_comment("Workflow", _("Submitted for review by {0}").format(frappe.session.user))
-    _close_open_todos(doc, allocated_to=doc.prepared_by)
-    _create_todo(doc, doc.reviewer, _("Review GMP Document {0}").format(doc.name))
-    return doc.workflow_status
-
-
-@frappe.whitelist()
-def reviewer_approve(docname):
-    doc = frappe.get_doc("GMP Document", docname)
-    _ensure_actor(doc.reviewer, "reviewer")
-    if doc.workflow_status != WF_UNDER_REVIEW:
-        frappe.throw(_("Document must be Under Review."))
-    if not doc.qa_approver:
-        frappe.throw(_("Assign a QA Approver before approving."))
-
-    # apply_workflow() does doc.load_from_db() and would wipe in-memory
-    # changes. Persist audit fields via db.set_value first so the reload
-    # picks them up; the workflow framework then advances state on top.
-    frappe.db.set_value("GMP Document", docname, {
-        "reviewed_by": frappe.session.user,
-        "reviewed_on": now_datetime(),
-    }, update_modified=False)
-    doc.flags.ignore_permissions = True
-    apply_workflow(doc, "Approve as Reviewer")
-    doc.add_comment("Workflow", _("Reviewer approved — forwarded to QA"))
-    _close_open_todos(doc, allocated_to=doc.reviewer)
-    _create_todo(doc, doc.qa_approver, _("QA approval — GMP Document {0}").format(doc.name))
-    return doc.workflow_status
+    path = _find_pdf_on_disk()
+    if not path:
+        frappe.throw(_("Base PDF for {0} could not be generated.").format(doc.name))
+    return path
 
 
-@frappe.whitelist()
-def reviewer_request_revision(docname, reason):
-    doc = frappe.get_doc("GMP Document", docname)
-    _ensure_actor(doc.reviewer, "reviewer")
-    if doc.workflow_status != WF_UNDER_REVIEW:
-        frappe.throw(_("Document must be Under Review."))
-    reason = (reason or "").strip()
-    if not reason:
-        frappe.throw(_("Please provide a reason for the revision request."))
-
-    frappe.db.set_value("GMP Document", docname, {
-        "last_revision_request": reason,
-        "last_revision_by": frappe.session.user,
-        "last_revision_on": now_datetime(),
-    }, update_modified=False)
-    doc.flags.ignore_permissions = True
-    apply_workflow(doc, "Request Revision (Reviewer)")
-    doc.add_comment("Workflow", _("Reviewer requested revision: {0}").format(reason))
-    _close_open_todos(doc, allocated_to=doc.reviewer)
-    _create_todo(doc, doc.prepared_by, _("Address revision request — {0}").format(doc.name))
-    return doc.workflow_status
-
-
-@frappe.whitelist()
-def qa_approve(docname):
-    doc = frappe.get_doc("GMP Document", docname)
-    _ensure_actor(doc.qa_approver, "qa_approver")
-    if doc.workflow_status != WF_PENDING_QA:
-        frappe.throw(_("Document must be Pending QA Approval."))
-
-    frappe.db.set_value("GMP Document", docname, {
-        "approved_by": frappe.session.user,
-        "approved_on": now_datetime(),
-    }, update_modified=False)
-    doc.flags.ignore_permissions = True
-    # The "Approved" workflow state has doc_status=1, so apply_workflow
-    # auto-submits — that's what triggers the Word template render and
-    # base PDF generation in on_submit.
-    apply_workflow(doc, "Approve as QA")
-    doc.add_comment("Workflow", _("QA approval granted — document submitted"))
-    _close_open_todos(doc, allocated_to=doc.qa_approver)
-    return doc.workflow_status
-
-
-@frappe.whitelist()
-def qa_request_revision(docname, reason):
-    doc = frappe.get_doc("GMP Document", docname)
-    _ensure_actor(doc.qa_approver, "qa_approver")
-    if doc.workflow_status != WF_PENDING_QA:
-        frappe.throw(_("Document must be Pending QA Approval."))
-    reason = (reason or "").strip()
-    if not reason:
-        frappe.throw(_("Please provide a reason for the revision request."))
-
-    # QA bounces back to the reviewer (not all the way to preparer) — they
-    # may re-approve after re-checking, or request revision themselves.
-    frappe.db.set_value("GMP Document", docname, {
-        "last_revision_request": reason,
-        "last_revision_by": frappe.session.user,
-        "last_revision_on": now_datetime(),
-    }, update_modified=False)
-    doc.flags.ignore_permissions = True
-    apply_workflow(doc, "Request Revision (QA)")
-    doc.add_comment("Workflow", _("QA requested revision: {0}").format(reason))
-    _close_open_todos(doc, allocated_to=doc.qa_approver)
-    _create_todo(doc, doc.reviewer, _("Re-review — QA requested revision on {0}").format(doc.name))
-    return doc.workflow_status
+# ---------------------------------------------------------------------- #
+#  Workflow                                                              #
+# ---------------------------------------------------------------------- #
+#
+# Transitions are driven entirely by Frappe's native Workflow engine (the
+# form "Actions" menu). The state machine, per-actor authorisation
+# `condition`s, and roles are declared in install.py:
+#
+#   Draft / Revision Requested ── Submit for Review ──► Under Review
+#   Under Review ── Approve as Reviewer ──► Pending QA Approval
+#   Under Review ── Request Revision (Reviewer) ──► Revision Requested
+#   Pending QA Approval ── Approve as QA ──► Approved (docstatus=1)
+#   Pending QA Approval ── Request Revision (QA) ──► Under Review
+#
+# Audit stamping and ToDo hand-off run in GMPDocument._apply_workflow_side_effects
+# (invoked from on_update / on_submit). There are deliberately no custom
+# transition endpoints here — the controller reacts to workflow_status
+# changes instead of owning the transitions.
 
 
 @frappe.whitelist()
@@ -726,21 +797,6 @@ def get_my_pending_count(user=None):
     }
     counts["total"] = counts["to_review"] + counts["to_approve"] + counts["to_revise"]
     return counts
-
-
-def _ensure_actor(expected_user, role_label):
-    """Raise PermissionError unless the caller is the assigned actor or a System Manager."""
-    if not expected_user:
-        frappe.throw(_("No {0} is assigned to this document.").format(role_label))
-    me = frappe.session.user
-    if me == expected_user:
-        return
-    if "System Manager" in frappe.get_roles(me):
-        return
-    frappe.throw(
-        _("Only the assigned {0} ({1}) can perform this action.").format(role_label, expected_user),
-        frappe.PermissionError,
-    )
 
 
 def _create_todo(doc, allocated_to, description):

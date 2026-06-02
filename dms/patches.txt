@@ -3,3 +3,6 @@
 [post_model_sync]
 dms.patches.v0_3_0.backfill_workflow_status
 dms.patches.v0_5_1.fix_workflow_doc_status
+dms.patches.v0_7_0.set_amend_naming_rule
+dms.patches.v0_7_0.sync_gmp_workflow
+dms.patches.v0_7_0.backfill_obsolete_status

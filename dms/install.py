@@ -52,18 +52,29 @@ GMP_WORKFLOW_STATES = [
     {"state": "Pending QA Approval",  "doc_status": 0, "allow_edit": "System Manager", "style": "Primary"},
     {"state": "Approved",             "doc_status": 1, "allow_edit": "System Manager", "style": "Success"},
     {"state": "Revision Requested",   "doc_status": 0, "allow_edit": "QA Manager",     "style": "Danger"},
+    # Terminal state for cancelled (obsolete) documents. on_cancel() sets
+    # workflow_status to this directly (doc_status 2 = cancelled) so the
+    # native badge stops reading "Approved".
+    {"state": "Obsolete",             "doc_status": 2, "allow_edit": "System Manager", "style": "Danger"},
 ]
 
-# Role-level perms only — the controller adds User-level actor enforcement
-# on top (the user must literally be the assigned Reviewer / QA Approver,
-# not just anyone with the role).
+# Each transition is gated by role (QA Manager) AND a per-actor `condition`:
+# only the assigned preparer / reviewer / QA approver (or Administrator, as an
+# escape hatch) may act. frappe.session is exposed in the workflow condition
+# eval globals, so `doc.<field> == frappe.session.user` is a safe expression.
+# The controller's _apply_workflow_side_effects() reacts to the resulting
+# workflow_status change to stamp audit fields and shuffle ToDos.
+_PREPARER = 'doc.prepared_by == frappe.session.user or frappe.session.user == "Administrator"'
+_REVIEWER = 'doc.reviewer == frappe.session.user or frappe.session.user == "Administrator"'
+_QA = 'doc.qa_approver == frappe.session.user or frappe.session.user == "Administrator"'
+
 GMP_WORKFLOW_TRANSITIONS = [
-    {"state": "Draft",               "action": "Submit for Review",          "next_state": "Under Review",        "allowed": "QA Manager"},
-    {"state": "Revision Requested",  "action": "Submit for Review",          "next_state": "Under Review",        "allowed": "QA Manager"},
-    {"state": "Under Review",        "action": "Approve as Reviewer",        "next_state": "Pending QA Approval", "allowed": "QA Manager"},
-    {"state": "Under Review",        "action": "Request Revision (Reviewer)","next_state": "Revision Requested",  "allowed": "QA Manager"},
-    {"state": "Pending QA Approval", "action": "Approve as QA",              "next_state": "Approved",            "allowed": "QA Manager"},
-    {"state": "Pending QA Approval", "action": "Request Revision (QA)",      "next_state": "Under Review",        "allowed": "QA Manager"},
+    {"state": "Draft",               "action": "Submit for Review",          "next_state": "Under Review",        "allowed": "QA Manager", "condition": _PREPARER},
+    {"state": "Revision Requested",  "action": "Submit for Review",          "next_state": "Under Review",        "allowed": "QA Manager", "condition": _PREPARER},
+    {"state": "Under Review",        "action": "Approve as Reviewer",        "next_state": "Pending QA Approval", "allowed": "QA Manager", "condition": _REVIEWER},
+    {"state": "Under Review",        "action": "Request Revision (Reviewer)","next_state": "Revision Requested",  "allowed": "QA Manager", "condition": _REVIEWER},
+    {"state": "Pending QA Approval", "action": "Approve as QA",              "next_state": "Approved",            "allowed": "QA Manager", "condition": _QA},
+    {"state": "Pending QA Approval", "action": "Request Revision (QA)",      "next_state": "Under Review",        "allowed": "QA Manager", "condition": _QA},
 ]
 
 
@@ -74,7 +85,9 @@ def before_install():
 def after_install():
     _ensure_department_abbr_field()
     _ensure_employee_signature_field()
+    _ensure_amend_naming_rule()
     _ensure_gmp_workflow()
+    _sync_gmp_workflow()
 
 
 def after_migrate():
@@ -82,7 +95,9 @@ def after_migrate():
     # preferences (default_workspace) so existing customizations stick.
     _ensure_department_abbr_field()
     _ensure_employee_signature_field()
+    _ensure_amend_naming_rule()
     _ensure_gmp_workflow()
+    _sync_gmp_workflow()
 
 
 def _ensure_role(role_name, desk_access=1):
@@ -105,6 +120,74 @@ def _ensure_employee_signature_field():
     create_custom_field("Employee", EMPLOYEE_SIGNATURE_FIELD, ignore_validate=True)
 
 
+def _ensure_amend_naming_rule():
+    """Issue #3: make amended GMP Documents run autoname() (…-v1) instead of
+    Frappe's default `-1` counter.
+
+    Amend naming is governed by a per-doctype row in the Document Naming
+    Settings single's `amend_naming_override` child table (falling back to the
+    global `default_amend_naming`, which ships as 'Amend Counter'). With the
+    GMP Document row set to 'Default Naming', `_set_amended_name()` returns
+    early and the controller's autoname() produces the versioned name.
+
+    Idempotent: upserts the child row directly (without re-saving the single,
+    which carries unrelated naming-series side effects)."""
+    existing = frappe.db.get_value(
+        "Amended Document Naming Settings",
+        {"document_type": "GMP Document", "parent": "Document Naming Settings"},
+        "name",
+    )
+    if existing:
+        frappe.db.set_value("Amended Document Naming Settings", existing, "action", "Default Naming")
+        return
+
+    frappe.get_doc({
+        "doctype": "Amended Document Naming Settings",
+        "parent": "Document Naming Settings",
+        "parenttype": "Document Naming Settings",
+        "parentfield": "amend_naming_override",
+        "document_type": "GMP Document",
+        "action": "Default Naming",
+    }).insert(ignore_permissions=True)
+
+
+def _sync_gmp_workflow():
+    """Idempotently bring an existing GMP Document Workflow up to date with the
+    states/transitions this module owns: add the 'Obsolete' state and
+    (re)assert the per-actor transition `condition`s. Safe on every migrate."""
+    if not frappe.db.exists("Workflow", GMP_WORKFLOW_NAME):
+        return
+
+    wf = frappe.get_doc("Workflow", GMP_WORKFLOW_NAME)
+
+    have_obsolete = any(s.state == "Obsolete" for s in wf.states)
+    if not have_obsolete:
+        if not frappe.db.exists("Workflow State", "Obsolete"):
+            frappe.get_doc({
+                "doctype": "Workflow State",
+                "workflow_state_name": "Obsolete",
+                "style": "Danger",
+            }).insert(ignore_permissions=True)
+        wf.append("states", {
+            "state": "Obsolete",
+            "doc_status": 2,
+            "allow_edit": "System Manager",
+            "style": "Danger",
+        })
+
+    cond_by_action = {tr["action"]: tr["condition"] for tr in GMP_WORKFLOW_TRANSITIONS}
+    changed = not have_obsolete
+    for tr in wf.transitions:
+        desired = cond_by_action.get(tr.action)
+        if desired and tr.condition != desired:
+            tr.condition = desired
+            changed = True
+
+    if changed:
+        wf.save(ignore_permissions=True)
+        frappe.cache.delete_key("workflow")
+
+
 def _ensure_gmp_workflow():
     """Inject the Frappe Workflow that mirrors the controller's state machine.
 
@@ -112,13 +195,13 @@ def _ensure_gmp_workflow():
     user can edit transitions in the desk UI without us clobbering them on
     every migrate.
 
-    Coexistence model: the custom whitelisted methods in gmp_document.py
-    (submit_for_review, reviewer_approve, qa_approve, ...) call
-    frappe.model.workflow.apply_workflow() under the hood, so the form's
-    custom buttons and the Frappe-native Action dropdown drive the same
-    state transitions. apply_workflow enforces the role on each transition
-    (QA Manager); the controller's _ensure_actor() runs first and tightens
-    that to the specific assigned User (Reviewer / QA Approver).
+    Authorisation model: transitions are driven entirely by Frappe's native
+    Workflow engine (the form "Actions" menu). apply_workflow() enforces the
+    role on each transition (QA Manager) and the per-transition `condition`
+    tightens that to the specific assigned User (preparer / Reviewer / QA
+    Approver). The controller reacts to the resulting workflow_status change
+    in _apply_workflow_side_effects() to stamp audit fields and hand off
+    ToDos. _sync_gmp_workflow() keeps existing installs in step.
     """
     if frappe.db.exists("Workflow", GMP_WORKFLOW_NAME):
         return

@@ -191,6 +191,7 @@
    "fieldname": "attachment_file",
    "fieldtype": "Attach",
    "label": "Attachment (.docx)",
+   "no_copy": 1,
    "description": "Only .docx files are accepted. The file will be renamed and hashed automatically."
   },
   {
@@ -198,6 +199,7 @@
    "fieldtype": "Data",
    "label": "File Integrity Hash (SHA-256)",
    "read_only": 1,
+   "no_copy": 1,
    "length": 64,
    "description": "SHA-256 digest of the controlled file. Recomputed after every render to match the distributed bytes."
   },
@@ -210,7 +212,7 @@
    "fieldname": "workflow_status",
    "fieldtype": "Select",
    "label": "Workflow Status",
-   "options": "Draft\nUnder Review\nPending QA Approval\nApproved\nRevision Requested",
+   "options": "Draft\nUnder Review\nPending QA Approval\nApproved\nRevision Requested\nObsolete",
    "default": "Draft",
    "read_only": 1,
    "in_list_view": 1,
@@ -301,7 +303,7 @@
    "fieldtype": "Section Break",
    "label": "Latest Revision Request",
    "collapsible": 1,
-   "depends_on": "eval:doc.last_revision_request"
+   "depends_on": "eval:doc.last_revision_request || ['Under Review','Pending QA Approval'].includes(doc.workflow_status)"
   },
   {
    "fieldname": "last_revision_by",
@@ -320,7 +322,8 @@
    "fieldname": "last_revision_request",
    "fieldtype": "Small Text",
    "label": "Reason",
-   "read_only": 1
+   "read_only_depends_on": "eval:!['Under Review','Pending QA Approval'].includes(doc.workflow_status)",
+   "description": "Reviewer/QA: enter the reason here before choosing 'Request Revision' from the Actions menu. Recorded with the requester and timestamp."
   },
   {
    "fieldname": "section_tree",
