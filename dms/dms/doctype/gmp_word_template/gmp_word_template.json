@@ -1,0 +1,122 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "field:template_title",
+ "creation": "2026-06-13 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "section_main",
+  "template_title",
+  "document_type",
+  "is_active",
+  "column_break_main",
+  "template_file",
+  "description",
+  "section_mapping",
+  "mapping_help",
+  "field_mappings"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_main",
+   "fieldtype": "Section Break",
+   "label": "Template"
+  },
+  {
+   "fieldname": "template_title",
+   "fieldtype": "Data",
+   "label": "Template Title",
+   "reqd": 1,
+   "unique": 1,
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "document_type",
+   "fieldtype": "Link",
+   "label": "Document Type",
+   "options": "GMP Document Type",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "description": "Optional. Restricts this template to GMP Documents of this type in the selector."
+  },
+  {
+   "fieldname": "is_active",
+   "fieldtype": "Check",
+   "label": "Is Active",
+   "default": "1",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "column_break_main",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "template_file",
+   "fieldtype": "Attach",
+   "label": "Template File (.docx)",
+   "reqd": 1,
+   "description": "The controlled .docx template containing {{ tags }}. Used as the render source for documents that select this template."
+  },
+  {
+   "fieldname": "description",
+   "fieldtype": "Small Text",
+   "label": "Description"
+  },
+  {
+   "fieldname": "section_mapping",
+   "fieldtype": "Section Break",
+   "label": "Field Mapping"
+  },
+  {
+   "fieldname": "mapping_help",
+   "fieldtype": "HTML",
+   "options": "<p class='text-muted'>Use <b>Scan Template Tags</b> to detect every <code>{{ tag }}</code> in the uploaded file, then choose which system field feeds each tag. Tags left unmapped render blank.</p>"
+  },
+  {
+   "fieldname": "field_mappings",
+   "fieldtype": "Table",
+   "label": "Tag Mappings",
+   "options": "GMP Template Field Mapping"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-06-13 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "DMS",
+ "name": "GMP Word Template",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "role": "System Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 1,
+   "report": 1,
+   "export": 1,
+   "share": 1
+  },
+  {
+   "role": "QA Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 1,
+   "report": 1,
+   "export": 1,
+   "share": 1
+  },
+  {
+   "role": "Employee",
+   "read": 1
+  }
+ ],
+ "search_fields": "document_type",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "template_title",
+ "track_changes": 1
+}

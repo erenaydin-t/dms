@@ -243,11 +243,16 @@ function trigger_browser_download(blob, filename) {
 // -------------------------------------------------------------------- //
 
 function render_reference_tree(frm) {
-    if (frm.is_new()) return;
     if (!frm.fields_dict.references_tree_html) return;
 
+    // Always clear first: the form control is reused across navigation, so a
+    // tree rendered for a previously-open document would otherwise linger in
+    // the DOM when switching to a new (unsaved) record. Clearing before the
+    // is_new() guard ensures new documents show an empty tree, not stale data.
     const wrapper = frm.fields_dict.references_tree_html.$wrapper;
     wrapper.empty();
+
+    if (frm.is_new()) return;
 
     frappe.call({
         method: 'dms.dms.doctype.gmp_document.gmp_document.get_document_reference_tree',

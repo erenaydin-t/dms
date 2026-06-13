@@ -25,10 +25,13 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from dms.dms.doctype.gmp_document.gmp_document import (
+    TEMPLATE_FIELDS,
+    TEMPLATE_FIELD_KEYS,
     VALIDITY_YEARS_MAP,
     _apply_watermark,
     _compute_sha256,
     _resolve_watermark_text,
+    get_template_field_catalog,
 )
 
 
@@ -47,6 +50,20 @@ def _ensure_test_department():
         dept.flags.ignore_permissions = True
         dept.insert(ignore_permissions=True)
     frappe.db.set_value("Department", TEST_DEPT, "custom_abbr", TEST_DEPT_ABBR)
+    frappe.db.commit()
+
+
+def _ensure_test_document_types():
+    """document_type is a Link to GMP Document Type, so the codes used by the
+    tests must exist as master records (normally seeded by install.after_migrate;
+    asserted here so the suite is hermetic on a fresh site)."""
+    for type_name, code in (("SOP", "SOP"), ("Work Instruction", "WI")):
+        if not frappe.db.exists("GMP Document Type", code):
+            frappe.get_doc({
+                "doctype": "GMP Document Type",
+                "code": code,
+                "type_name": type_name,
+            }).insert(ignore_permissions=True)
     frappe.db.commit()
 
 
@@ -72,6 +89,7 @@ class TestGMPDocument(FrappeTestCase):
     def setUpClass(cls):
         super().setUpClass()
         _ensure_test_department()
+        _ensure_test_document_types()
         _purge_test_documents()
 
     @classmethod
@@ -208,6 +226,45 @@ class TestGMPDocument(FrappeTestCase):
 
         with self.assertRaises(frappe.ValidationError):
             amended.insert(ignore_permissions=True)
+
+    # ------------------------------------------------------------------ #
+    #  Word template field mapping                                        #
+    # ------------------------------------------------------------------ #
+
+    def test_template_context_includes_native_keys(self):
+        doc = self._build_doc(document_name_en="GMP-Test-Ctx")
+        ctx = doc._build_template_context()
+        self.assertEqual(ctx["document_name_en"], "GMP-Test-Ctx")
+        # Native keys remain available with no mappings (backward compatible).
+        self.assertIn("version_number", ctx)
+
+    def test_custom_tag_alias_mirrors_system_field(self):
+        doc = self._build_doc(document_name_en="GMP-Test-Alias")
+        mappings = [
+            frappe._dict(custom_tag="my_title", system_field="document_name_en"),
+            frappe._dict(custom_tag="rev_no", system_field="version_number"),
+        ]
+        ctx = doc._build_template_context(field_mappings=mappings)
+        self.assertEqual(ctx["my_title"], ctx["document_name_en"])
+        self.assertEqual(ctx["rev_no"], ctx["version_number"])
+
+    def test_alias_to_unknown_system_field_is_ignored(self):
+        doc = self._build_doc()
+        mappings = [frappe._dict(custom_tag="ghost", system_field="not_a_field")]
+        ctx = doc._build_template_context(field_mappings=mappings)
+        self.assertNotIn("ghost", ctx)
+
+    def test_field_catalog_matches_context_keys(self):
+        # Every catalog key must be a real context key, or the mapping UI would
+        # offer fields that render blank.
+        ctx = self._build_doc()._build_template_context()
+        for key in TEMPLATE_FIELD_KEYS:
+            self.assertIn(key, ctx, f"catalog key '{key}' missing from template context")
+
+    def test_get_template_field_catalog_shape(self):
+        catalog = get_template_field_catalog()
+        self.assertEqual(len(catalog), len(TEMPLATE_FIELDS))
+        self.assertEqual(catalog[0].keys(), {"value", "label"})
 
     # ------------------------------------------------------------------ #
     #  Lifecycle date calculation                                        #

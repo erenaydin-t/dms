@@ -33,6 +33,7 @@
   "next_revision_date",
   "version_number",
   "section_attachment",
+  "word_template",
   "attachment_file",
   "file_integrity_hash",
   "section_change_control",
@@ -86,9 +87,9 @@
   },
   {
    "fieldname": "document_type",
-   "fieldtype": "Select",
+   "fieldtype": "Link",
    "label": "Document Type",
-   "options": "\nSOP\nWI\nForm\nProtocol\nPolicy",
+   "options": "GMP Document Type",
    "reqd": 1,
    "in_list_view": 1,
    "in_standard_filter": 1
@@ -188,11 +189,19 @@
    "label": "Controlled File"
   },
   {
+   "fieldname": "word_template",
+   "fieldtype": "Link",
+   "label": "Word Template",
+   "options": "GMP Word Template",
+   "description": "Select a controlled template; the document's .docx and PDF are generated from it on QA approval. Leave blank to attach a .docx manually instead."
+  },
+  {
    "fieldname": "attachment_file",
    "fieldtype": "Attach",
    "label": "Attachment (.docx)",
    "no_copy": 1,
-   "description": "Only .docx files are accepted. The file will be renamed and hashed automatically."
+   "depends_on": "eval:!doc.word_template",
+   "description": "Only .docx files are accepted. The file is renamed and hashed automatically. When a Word Template is selected this is generated for you on submit."
   },
   {
    "fieldname": "file_integrity_hash",

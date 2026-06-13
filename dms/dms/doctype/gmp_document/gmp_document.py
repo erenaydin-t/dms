@@ -28,6 +28,72 @@ from docxtpl import DocxTemplate, InlineImage
 VALIDITY_YEARS_MAP = {"2 Years": 2, "3 Years": 3, "5 Years": 5}
 ALLOWED_EXTENSIONS = (".docx",)
 SIGNATURE_WIDTH_MM = 40  # rendered signature width in PDF
+# python-docx/InlineImage embeds these raster formats reliably. PNG is
+# preferred (transparency); JPG/JPEG accepted because HR uploads vary.
+ALLOWED_SIGNATURE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+
+
+def document_type_label(code):
+    """Human label for a GMP Document Type code (the link stores the code, which
+    is the master's name). Falls back to the code itself if unresolved."""
+    if not code:
+        return ""
+    return frappe.db.get_value("GMP Document Type", code, "type_name") or code
+
+
+# Single source of truth for the values a Word template may pull in. Each entry
+# is (context_key, human_label). The context_key must exist in
+# _build_template_context(); the label drives the mapping UI dropdown. The three
+# *_signature keys resolve to an inline image in the signed-PDF render pass and
+# to an empty string in the clean .docx (mirroring the native signature tags).
+TEMPLATE_FIELDS = [
+    ("docname", "Document ID"),
+    ("document_name_fa", "Document Name (FA)"),
+    ("document_name_en", "Document Name (EN)"),
+    ("document_type", "Document Type (label)"),
+    ("document_type_code", "Document Type (code)"),
+    ("department", "Department (ID)"),
+    ("department_name", "Department Name"),
+    ("document_owner", "Document Owner (ID)"),
+    ("document_owner_name", "Document Owner Name"),
+    ("gmp_impact", "GMP Impact"),
+    ("validity_period", "Validity Period"),
+    ("effective_date", "Effective Date"),
+    ("expiry_date", "Expiry Date"),
+    ("next_revision_date", "Next Revision Date"),
+    ("version_number", "Version Number"),
+    ("is_active", "Is Active"),
+    ("requires_training", "Requires Training"),
+    ("reason_for_change", "Reason for Change"),
+    ("prepared_by", "Prepared By (user)"),
+    ("prepared_by_name", "Prepared By (name)"),
+    ("reviewer", "Reviewer (user)"),
+    ("reviewer_name", "Reviewer (name)"),
+    ("qa_approver", "QA Approver (user)"),
+    ("qa_approver_name", "QA Approver (name)"),
+    ("reviewed_by", "Reviewed By (user)"),
+    ("reviewed_by_name", "Reviewed By (name)"),
+    ("reviewed_on", "Reviewed On"),
+    ("approved_by", "Approved By (user)"),
+    ("approved_by_name", "Approved By (name)"),
+    ("approved_on", "Approved On"),
+    ("workflow_status", "Workflow Status"),
+    ("preparer_signature", "Preparer Signature (image)"),
+    ("reviewer_signature", "Reviewer Signature (image)"),
+    ("qa_signature", "QA Approver Signature (image)"),
+]
+
+TEMPLATE_FIELD_KEYS = frozenset(key for key, _label in TEMPLATE_FIELDS)
+
+
+@frappe.whitelist()
+def get_template_field_catalog():
+    """Mappable system fields for the GMP Word Template mapping UI.
+
+    Returns the catalog as [{"value": key, "label": label}] so the client can
+    populate the `system_field` Select from a single Python source of truth,
+    keeping it in lockstep with _build_template_context()."""
+    return [{"value": key, "label": label} for key, label in TEMPLATE_FIELDS]
 
 # Workflow states ----------------------------------------------------------- #
 WF_DRAFT = "Draft"
@@ -75,7 +141,10 @@ class GMPDocument(NestedSet):
             self.name = f"{base_name}-v{version}"
             return
 
-        prefix = f"{self.document_type}-{dept_abbr}-"
+        # document_type links to GMP Document Type, whose record name *is* the
+        # short code (e.g. "BMR"), so it is already filesystem/name safe.
+        type_code = self.document_type
+        prefix = f"{type_code}-{dept_abbr}-"
         existing = frappe.get_all(
             "GMP Document",
             filters=[["name", "like", f"{prefix}%"]],
@@ -94,7 +163,7 @@ class GMPDocument(NestedSet):
                 continue
 
         next_inc = str(max_increment + 1).zfill(2)
-        self.name = f"{self.document_type}-{dept_abbr}-{next_inc}-v{version}"
+        self.name = f"{type_code}-{dept_abbr}-{next_inc}-v{version}"
 
     def before_insert(self):
         if not self.prepared_by:
@@ -130,7 +199,16 @@ class GMPDocument(NestedSet):
     def validate(self):
         if self.amended_from and not (self.reason_for_change and self.reason_for_change.strip()):
             frappe.throw(_("Reason for Change is mandatory when amending a GMP Document."))
+        self._validate_word_template()
         self._check_circular_references()
+
+    def _validate_word_template(self):
+        if not self.word_template:
+            return
+        if not frappe.db.get_value("GMP Word Template", self.word_template, "is_active"):
+            frappe.throw(
+                _("Word Template {0} is inactive and cannot be used.").format(self.word_template)
+            )
 
     def _check_circular_references(self):
         """Prevent circular reference chains (A → B → A)."""
@@ -186,8 +264,10 @@ class GMPDocument(NestedSet):
         self._apply_workflow_side_effects()
 
     def on_submit(self):
-        if not self.attachment_file:
-            frappe.throw(_("A .docx attachment is required before submitting."))
+        if not (self.word_template or self.attachment_file):
+            frappe.throw(
+                _("Select a Word Template or attach a .docx file before submitting.")
+            )
 
         if not self.effective_date:
             self.effective_date = today()
@@ -295,12 +375,15 @@ class GMPDocument(NestedSet):
         Result: the persisted base PDF carries the signatures, the saved
         .docx does not. Watermarking still happens on-demand at download
         time on top of the signed base PDF.
+
+        The render source is either the linked Word Template's controlled file
+        (which is read-only and never overwritten) or, for legacy documents
+        with no template, the per-document attachment.
         """
-        file_doc = self._get_file_doc(self.attachment_file)
-        source_path = file_doc.get_full_path()
+        source_path, field_mappings = self._resolve_render_source()
 
         if not source_path.lower().endswith(ALLOWED_EXTENSIONS):
-            frappe.throw(_("Submitted attachment must be a .docx file."))
+            frappe.throw(_("Render source must be a .docx file."))
 
         soffice = shutil.which("soffice") or shutil.which("libreoffice")
         if not soffice:
@@ -311,7 +394,7 @@ class GMPDocument(NestedSet):
             clean_path = os.path.join(tmpdir, f"{self.name}.docx")
             try:
                 clean_template = DocxTemplate(source_path)
-                clean_template.render(self._build_template_context())
+                clean_template.render(self._build_template_context(field_mappings=field_mappings))
                 clean_template.save(clean_path)
             except Exception:
                 frappe.log_error(
@@ -324,7 +407,9 @@ class GMPDocument(NestedSet):
             sig_path = os.path.join(tmpdir, f"{self.name}-with-signatures.docx")
             try:
                 sig_template = DocxTemplate(source_path)
-                sig_context = self._build_template_context(template_for_images=sig_template)
+                sig_context = self._build_template_context(
+                    template_for_images=sig_template, field_mappings=field_mappings
+                )
                 sig_template.render(sig_context)
                 sig_template.save(sig_path)
             except Exception:
@@ -357,15 +442,25 @@ class GMPDocument(NestedSet):
 
             with open(generated_pdf, "rb") as fh:
                 pdf_bytes = fh.read()
+            with open(clean_path, "rb") as fh:
+                clean_bytes = fh.read()
 
-            # 4. Replace the source .docx with the clean render. This is the
-            # version users will download as the controlled Word file.
-            shutil.copyfile(clean_path, source_path)
+            # 4. Persist the clean render as this document's controlled .docx.
+            if self.word_template:
+                # Template-sourced: source_path is the shared, controlled
+                # template — never overwrite it. Store the clean render as this
+                # document's own attachment instead.
+                self._store_generated_docx(clean_bytes)
+            else:
+                # Attachment-sourced (legacy): overwrite the per-document file
+                # in place with the clean render.
+                with open(source_path, "wb") as fh:
+                    fh.write(clean_bytes)
 
         # 5. SHA-256 reflects the deliverable (clean) bytes, not the signed PDF.
         self.db_set(
             "file_integrity_hash",
-            _compute_sha256(source_path),
+            hashlib.sha256(clean_bytes).hexdigest(),
             update_modified=False,
         )
 
@@ -390,7 +485,49 @@ class GMPDocument(NestedSet):
             is_private=1,
         )
 
-    def _build_template_context(self, template_for_images=None):
+    def _resolve_render_source(self):
+        """Return (source_docx_path, field_mappings) for the render.
+
+        With a Word Template selected, the template's controlled file is the
+        source (read-only — callers must not overwrite it) and its mapping rows
+        are returned. Otherwise fall back to the per-document attachment, with
+        no aliases."""
+        if self.word_template:
+            template = frappe.get_doc("GMP Word Template", self.word_template)
+            return template.get_template_physical_path(), list(template.field_mappings or [])
+
+        file_doc = self._get_file_doc(self.attachment_file)
+        return file_doc.get_full_path(), []
+
+    def _store_generated_docx(self, content):
+        """Persist `content` as this document's controlled .docx attachment,
+        replacing any prior generated copy, and point attachment_file at it.
+
+        Used for template-sourced documents: the render source is the shared
+        template, so the deliverable .docx has to be saved as the document's own
+        File rather than written back over the source."""
+        target = f"{self.name}.docx"
+        for old in frappe.get_all(
+            "File",
+            filters={
+                "attached_to_doctype": self.doctype,
+                "attached_to_name": self.name,
+                "file_name": target,
+            },
+            pluck="name",
+        ):
+            frappe.delete_doc("File", old, ignore_permissions=True, force=True)
+
+        file_doc = save_file(
+            fname=target,
+            content=content,
+            dt=self.doctype,
+            dn=self.name,
+            is_private=1,
+        )
+        self.db_set("attachment_file", file_doc.file_url, update_modified=False)
+
+    def _build_template_context(self, template_for_images=None, field_mappings=None):
         """Context dict consumed by docxtpl. Every editable GMP Document
         field is exposed as a Jinja variable so users can place any
         ``{{ field_name }}`` in the .docx template.
@@ -398,7 +535,13 @@ class GMPDocument(NestedSet):
         Signature variables (preparer_signature, reviewer_signature,
         qa_signature) render as empty strings unless ``template_for_images``
         is supplied — in which case they become InlineImage objects sized
-        to SIGNATURE_WIDTH_MM."""
+        to SIGNATURE_WIDTH_MM.
+
+        ``field_mappings`` (GMP Template Field Mapping rows) add user-defined
+        aliases: each row copies the value of its ``system_field`` to a
+        ``custom_tag`` key, so a template authored with ``{{ my_title }}`` can
+        be fed by the system ``document_name_en`` field. Aliases are additive —
+        native ``{{ field_name }}`` tags keep working."""
 
         def user_full_name(user_id):
             if not user_id:
@@ -423,7 +566,8 @@ class GMPDocument(NestedSet):
             "document_name_fa": self.document_name_fa or "",
             "document_name_en": self.document_name_en or "",
             # ----- classification -----
-            "document_type": self.document_type or "",
+            "document_type": document_type_label(self.document_type),
+            "document_type_code": self.document_type or "",
             "department": self.department or "",
             "department_name": department_full_name(self.department),
             "document_owner": self.document_owner or "",
@@ -477,6 +621,14 @@ class GMPDocument(NestedSet):
                 context["qa_signature"] = InlineImage(
                     template_for_images, qa_path, width=Mm(SIGNATURE_WIDTH_MM)
                 )
+
+        # Apply user-defined aliases last so a custom tag can mirror any
+        # resolved system value — text fields, the *_name lookups above, or a
+        # *_signature InlineImage (so {{ my_sig }} can map to a signature).
+        for row in (field_mappings or []):
+            tag = (row.custom_tag or "").strip()
+            if tag and row.system_field in context:
+                context[tag] = context[row.system_field]
 
         return context
 
@@ -618,16 +770,28 @@ def _resolve_signature_path(user_email):
         User (user_email) -> Employee.user_id -> Employee.custom_signature_image
         -> File.file_url -> File.get_full_path()
 
-    Each failure branch writes to the Error Log so a missing signature
-    on a rendered PDF is diagnosable without silent data loss.
+    A user can be linked to more than one Employee (rehire, a prior Left/
+    Inactive record, or a duplicate). A bare get_value() returns an arbitrary
+    row with no ordering guarantee, which is why a signature can appear in one
+    render and vanish in the next. We resolve deterministically instead:
+    prefer an Employee that actually has a signature, then an Active one, with
+    a stable most-recently-modified tiebreak.
+
+    Each failure branch writes to the Error Log so a missing signature on a
+    rendered PDF is diagnosable without silent data loss.
     """
     if not user_email:
         return None
 
     log_title = "GMP Document signature lookup"
 
-    employee_name = frappe.db.get_value("Employee", {"user_id": user_email}, "name")
-    if not employee_name:
+    employees = frappe.get_all(
+        "Employee",
+        filters={"user_id": user_email},
+        fields=["name", "status", "custom_signature_image"],
+        order_by="modified desc",
+    )
+    if not employees:
         frappe.log_error(
             title=log_title,
             message=(
@@ -637,13 +801,23 @@ def _resolve_signature_path(user_email):
         )
         return None
 
-    sig_url = frappe.db.get_value("Employee", employee_name, "custom_signature_image")
+    # Stable sort keeps the modified-desc order within ties; key ranks an
+    # Employee with a signature above one without, and Active above the rest.
+    def _rank(emp):
+        has_sig = 1 if (emp.custom_signature_image or "").strip() else 0
+        is_active = 1 if (emp.status or "") == "Active" else 0
+        return (has_sig, is_active)
+
+    employees.sort(key=_rank, reverse=True)
+    emp = employees[0]
+    employee_name = emp.name
+    sig_url = (emp.custom_signature_image or "").strip()
     if not sig_url:
         frappe.log_error(
             title=log_title,
             message=(
-                f"Employee {employee_name} (user {user_email}) has no "
-                f"'custom_signature_image' uploaded."
+                f"User '{user_email}' has {len(employees)} linked Employee record(s) "
+                f"but none has a 'custom_signature_image' uploaded."
             ),
         )
         return None
@@ -669,13 +843,12 @@ def _resolve_signature_path(user_email):
         )
         return None
 
-    if not physical_path.lower().endswith(".png"):
-        # Spec: only PNG is accepted as a signature (transparency support).
+    if not physical_path.lower().endswith(ALLOWED_SIGNATURE_EXTENSIONS):
         frappe.log_error(
             title=log_title,
             message=(
-                f"Employee {employee_name} signature must be a PNG file — "
-                f"got '{physical_path}'. Re-upload as .png."
+                f"Employee {employee_name} signature must be one of "
+                f"{', '.join(ALLOWED_SIGNATURE_EXTENSIONS)} — got '{physical_path}'."
             ),
         )
         return None
@@ -744,12 +917,12 @@ def _resolve_base_pdf_path(doc):
     if path:
         return path
 
-    # Missing base PDF — try to regenerate from the controlled .docx.
-    if not doc.attachment_file:
+    # Missing base PDF — try to regenerate from the template or the .docx.
+    if not (doc.word_template or doc.attachment_file):
         frappe.throw(
             _(
                 "Base PDF for {0} is unavailable and cannot be regenerated: "
-                "the controlled .docx attachment is missing."
+                "no Word Template is selected and the controlled .docx attachment is missing."
             ).format(doc.name)
         )
     doc._render_and_generate_pdf()
@@ -884,7 +1057,7 @@ def get_dms_tree_children(parent=None):
             )
             nodes.append({
                 "value": f"Type::{dept}::{dtype}",
-                "title": f"{dtype} ({cnt})",
+                "title": f"{document_type_label(dtype)} ({cnt})",
                 "expandable": 1,
             })
         return nodes
