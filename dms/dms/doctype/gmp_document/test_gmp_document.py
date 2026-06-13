@@ -67,6 +67,25 @@ def _ensure_test_document_types():
     frappe.db.commit()
 
 
+TEST_WORD_TEMPLATE = "GMP-Test-Template"
+
+
+def _ensure_test_word_template():
+    """word_template is now mandatory on GMP Document, so a template must exist.
+    A template is file-less (title + mappings); one native mapping is enough to
+    exercise the alias path. Returns the template name."""
+    if not frappe.db.exists("GMP Word Template", TEST_WORD_TEMPLATE):
+        frappe.get_doc({
+            "doctype": "GMP Word Template",
+            "template_title": TEST_WORD_TEMPLATE,
+            "field_mappings": [
+                {"custom_tag": "my_title", "system_field": "document_name_en"},
+            ],
+        }).insert(ignore_permissions=True)
+    frappe.db.commit()
+    return TEST_WORD_TEMPLATE
+
+
 def _purge_test_documents():
     for name in frappe.get_all(
         "GMP Document",
@@ -90,6 +109,7 @@ class TestGMPDocument(FrappeTestCase):
         super().setUpClass()
         _ensure_test_department()
         _ensure_test_document_types()
+        _ensure_test_word_template()
         _purge_test_documents()
 
     @classmethod
@@ -103,6 +123,18 @@ class TestGMPDocument(FrappeTestCase):
     # ------------------------------------------------------------------ #
     #  Helpers                                                           #
     # ------------------------------------------------------------------ #
+
+    def _dummy_attachment(self, en):
+        """A minimal .docx-named private File with arbitrary bytes. Valid for
+        save/hash/rename; only actual rendering (on_submit) needs a real .docx,
+        which the LibreOffice end-to-end tests supply via _make_docx_file()."""
+        fname = f"{en}-{frappe.generate_hash(length=6)}.docx"
+        return frappe.get_doc({
+            "doctype": "File",
+            "file_name": fname,
+            "is_private": 1,
+            "content": b"PK\x03\x04 dummy docx for tests",
+        }).insert(ignore_permissions=True)
 
     def _build_doc(self, **overrides):
         defaults = {
@@ -118,6 +150,12 @@ class TestGMPDocument(FrappeTestCase):
         defaults.update(overrides)
         doc = frappe.new_doc("GMP Document")
         doc.update(defaults)
+        # word_template and attachment_file are mandatory; satisfy them unless a
+        # test overrides them explicitly.
+        if "word_template" not in overrides:
+            doc.word_template = _ensure_test_word_template()
+        if "attachment_file" not in overrides:
+            doc.attachment_file = self._dummy_attachment(defaults["document_name_en"]).file_url
         return doc
 
     def _approve_via_workflow(self, doc):
@@ -193,15 +231,16 @@ class TestGMPDocument(FrappeTestCase):
     #  Amendment lifecycle                                               #
     # ------------------------------------------------------------------ #
 
-    def test_amendment_resets_fields_and_bumps_version(self):
+    def test_amendment_clears_inherited_file_and_bumps_version(self):
         original = self._build_doc(document_name_en="GMP-Test-Reset-Origin")
         original.insert(ignore_permissions=True)
-        # Simulate a submitted-but-not-rendered original
-        frappe.db.set_value("GMP Document", original.name, "version_number", 0)
 
-        amended = self._build_doc(document_name_en="GMP-Test-Reset-V1")
+        amended = self._build_doc(
+            document_name_en="GMP-Test-Reset-V1",
+            # Inherited from the predecessor (as the amend copy would carry):
+            attachment_file=original.attachment_file,
+        )
         amended.amended_from = original.name
-        amended.attachment_file = "/private/files/should-be-cleared.docx"
         amended.file_integrity_hash = "deadbeef" * 8
         amended.effective_date = "2026-04-01"
         amended.expiry_date = "2029-04-01"
@@ -210,11 +249,54 @@ class TestGMPDocument(FrappeTestCase):
         amended.before_insert()
 
         self.assertEqual(amended.version_number, 1)
+        # An inherited file must be cleared so the user re-uploads a fresh one.
         self.assertIsNone(amended.attachment_file)
         self.assertIsNone(amended.file_integrity_hash)
         self.assertIsNone(amended.effective_date)
         self.assertIsNone(amended.expiry_date)
         self.assertIsNone(amended.next_revision_date)
+
+    def test_amendment_keeps_freshly_uploaded_file(self):
+        original = self._build_doc(document_name_en="GMP-Test-Fresh-Origin")
+        original.insert(ignore_permissions=True)
+
+        fresh_url = self._dummy_attachment("GMP-Test-Fresh-New").file_url
+        amended = self._build_doc(
+            document_name_en="GMP-Test-Fresh-V1",
+            attachment_file=fresh_url,  # user uploaded a new file for the revision
+        )
+        amended.amended_from = original.name
+
+        amended.before_insert()
+
+        self.assertEqual(amended.version_number, 1)
+        self.assertEqual(amended.attachment_file, fresh_url)
+
+    # ------------------------------------------------------------------ #
+    #  Approver stamping (drives the approver's PDF signature)            #
+    # ------------------------------------------------------------------ #
+
+    def test_stamp_approver_fills_when_missing(self):
+        # The approver's signature is resolved from approved_by during render;
+        # on_submit must guarantee it is stamped before that, independent of the
+        # on_update workflow side-effect.
+        doc = self._build_doc(document_name_en="GMP-Test-Approver")
+        doc.insert(ignore_permissions=True)
+        self.assertFalse(doc.approved_by)
+
+        doc._stamp_approver()
+
+        self.assertEqual(doc.approved_by, frappe.session.user)
+        self.assertIsNotNone(doc.approved_on)
+
+    def test_stamp_approver_is_idempotent(self):
+        doc = self._build_doc(document_name_en="GMP-Test-Approver2")
+        doc.insert(ignore_permissions=True)
+        doc.db_set("approved_by", "Administrator", update_modified=False)
+
+        doc._stamp_approver()
+
+        self.assertEqual(doc.approved_by, "Administrator")
 
     def test_amendment_requires_reason_for_change(self):
         original = self._build_doc(document_name_en="GMP-Test-ReasonReq-Origin")
@@ -438,6 +520,9 @@ class TestGMPDocument(FrappeTestCase):
         amended = frappe.copy_doc(original)
         amended.amended_from = original.name
         amended.reason_for_change = "CAPA-2026-002 procedural fix"
+        # attachment_file is no_copy (not carried by the amend copy) and is now
+        # mandatory, so the revision must supply its own controlled file.
+        amended.attachment_file = self._dummy_attachment("GMP-Test-AmendName-V1").file_url
         amended.insert(ignore_permissions=True)
 
         base = original.name.rsplit("-v", 1)[0]

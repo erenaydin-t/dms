@@ -174,12 +174,20 @@ class GMPDocument(NestedSet):
         if not self.amended_from:
             return
 
-        old_version = frappe.db.get_value("GMP Document", self.amended_from, "version_number") or 0
-        self.version_number = old_version + 1
-        # Change control: a revised document must re-acquire its own
-        # attachment, integrity hash, and effective date — never inherit.
-        self.attachment_file = None
-        self.file_integrity_hash = None
+        predecessor = frappe.db.get_value(
+            "GMP Document",
+            self.amended_from,
+            ["version_number", "attachment_file"],
+            as_dict=True,
+        ) or frappe._dict()
+        self.version_number = (predecessor.version_number or 0) + 1
+        # Change control: a revised document must re-acquire its own controlled
+        # file. The amend copy inherits the predecessor's attachment_file — clear
+        # that so the user is forced to upload a fresh .docx (which is mandatory).
+        # If the user already attached a *new* file on the amend form, keep it.
+        if not self.attachment_file or self.attachment_file == predecessor.attachment_file:
+            self.attachment_file = None
+            self.file_integrity_hash = None
         self.effective_date = None
         self.expiry_date = None
         self.next_revision_date = None
@@ -199,16 +207,7 @@ class GMPDocument(NestedSet):
     def validate(self):
         if self.amended_from and not (self.reason_for_change and self.reason_for_change.strip()):
             frappe.throw(_("Reason for Change is mandatory when amending a GMP Document."))
-        self._validate_word_template()
         self._check_circular_references()
-
-    def _validate_word_template(self):
-        if not self.word_template:
-            return
-        if not frappe.db.get_value("GMP Word Template", self.word_template, "is_active"):
-            frappe.throw(
-                _("Word Template {0} is inactive and cannot be used.").format(self.word_template)
-            )
 
     def _check_circular_references(self):
         """Prevent circular reference chains (A → B → A)."""
@@ -264,10 +263,19 @@ class GMPDocument(NestedSet):
         self._apply_workflow_side_effects()
 
     def on_submit(self):
-        if not (self.word_template or self.attachment_file):
-            frappe.throw(
-                _("Select a Word Template or attach a .docx file before submitting.")
-            )
+        if not self.word_template:
+            frappe.throw(_("A Word Template must be selected before submitting."))
+        if not self.attachment_file:
+            frappe.throw(_("A .docx attachment is required before submitting."))
+
+        # Stamp the approver *before* the PDF render so the approver's signature
+        # is resolved and embedded. on_submit fires only on the QA-approval
+        # transition (before_submit enforces workflow_status == Approved), so the
+        # submitting session user is the QA approver. Doing it here — rather than
+        # relying solely on the on_update workflow side-effect, which runs in the
+        # same save and can be skipped — guarantees approved_by is populated when
+        # _render_and_generate_pdf() builds the signature context.
+        self._stamp_approver()
 
         if not self.effective_date:
             self.effective_date = today()
@@ -280,6 +288,22 @@ class GMPDocument(NestedSet):
         # Now that this revision is officially approved, swing any dependent
         # references off the superseded version and onto this one.
         self._repoint_references_to_self()
+
+    def _stamp_approver(self):
+        """Record the QA approver (and timestamp) if not already set.
+
+        Idempotent: when the on_update workflow side-effect already stamped
+        approved_by, this is a no-op; otherwise it fills it from the submitting
+        session user. Either way approved_by is guaranteed populated before the
+        signature render so the approver's signature is embedded in the PDF."""
+        if not self.approved_by:
+            self.approved_by = frappe.session.user
+            if not self.is_new():
+                self.db_set("approved_by", self.approved_by, update_modified=False)
+        if not self.approved_on:
+            self.approved_on = now_datetime()
+            if not self.is_new():
+                self.db_set("approved_on", self.approved_on, update_modified=False)
 
     def before_cancel(self):
         # A controlled document is routinely listed in the `references` child
@@ -376,9 +400,9 @@ class GMPDocument(NestedSet):
         .docx does not. Watermarking still happens on-demand at download
         time on top of the signed base PDF.
 
-        The render source is either the linked Word Template's controlled file
-        (which is read-only and never overwritten) or, for legacy documents
-        with no template, the per-document attachment.
+        The render source is the user's uploaded attachment; the linked Word
+        Template supplies only the custom-tag -> system-field mappings applied
+        during the render.
         """
         source_path, field_mappings = self._resolve_render_source()
 
@@ -445,17 +469,10 @@ class GMPDocument(NestedSet):
             with open(clean_path, "rb") as fh:
                 clean_bytes = fh.read()
 
-            # 4. Persist the clean render as this document's controlled .docx.
-            if self.word_template:
-                # Template-sourced: source_path is the shared, controlled
-                # template — never overwrite it. Store the clean render as this
-                # document's own attachment instead.
-                self._store_generated_docx(clean_bytes)
-            else:
-                # Attachment-sourced (legacy): overwrite the per-document file
-                # in place with the clean render.
-                with open(source_path, "wb") as fh:
-                    fh.write(clean_bytes)
+            # 4. Overwrite the user's uploaded .docx in place with the clean
+            # render — this becomes the controlled deliverable Word file.
+            with open(source_path, "wb") as fh:
+                fh.write(clean_bytes)
 
         # 5. SHA-256 reflects the deliverable (clean) bytes, not the signed PDF.
         self.db_set(
@@ -488,44 +505,13 @@ class GMPDocument(NestedSet):
     def _resolve_render_source(self):
         """Return (source_docx_path, field_mappings) for the render.
 
-        With a Word Template selected, the template's controlled file is the
-        source (read-only — callers must not overwrite it) and its mapping rows
-        are returned. Otherwise fall back to the per-document attachment, with
-        no aliases."""
-        if self.word_template:
-            template = frappe.get_doc("GMP Word Template", self.word_template)
-            return template.get_template_physical_path(), list(template.field_mappings or [])
-
+        The render source is always the user's uploaded .docx; the linked Word
+        Template contributes only its tag mappings (custom_tag -> system_field).
+        word_template is mandatory, so mappings are always read from it."""
+        template = frappe.get_doc("GMP Word Template", self.word_template)
+        mappings = list(template.field_mappings or [])
         file_doc = self._get_file_doc(self.attachment_file)
-        return file_doc.get_full_path(), []
-
-    def _store_generated_docx(self, content):
-        """Persist `content` as this document's controlled .docx attachment,
-        replacing any prior generated copy, and point attachment_file at it.
-
-        Used for template-sourced documents: the render source is the shared
-        template, so the deliverable .docx has to be saved as the document's own
-        File rather than written back over the source."""
-        target = f"{self.name}.docx"
-        for old in frappe.get_all(
-            "File",
-            filters={
-                "attached_to_doctype": self.doctype,
-                "attached_to_name": self.name,
-                "file_name": target,
-            },
-            pluck="name",
-        ):
-            frappe.delete_doc("File", old, ignore_permissions=True, force=True)
-
-        file_doc = save_file(
-            fname=target,
-            content=content,
-            dt=self.doctype,
-            dn=self.name,
-            is_private=1,
-        )
-        self.db_set("attachment_file", file_doc.file_url, update_modified=False)
+        return file_doc.get_full_path(), mappings
 
     def _build_template_context(self, template_for_images=None, field_mappings=None):
         """Context dict consumed by docxtpl. Every editable GMP Document
@@ -917,12 +903,12 @@ def _resolve_base_pdf_path(doc):
     if path:
         return path
 
-    # Missing base PDF — try to regenerate from the template or the .docx.
-    if not (doc.word_template or doc.attachment_file):
+    # Missing base PDF — regenerate from the controlled .docx attachment.
+    if not doc.attachment_file:
         frappe.throw(
             _(
                 "Base PDF for {0} is unavailable and cannot be regenerated: "
-                "no Word Template is selected and the controlled .docx attachment is missing."
+                "the controlled .docx attachment is missing."
             ).format(doc.name)
         )
     doc._render_and_generate_pdf()

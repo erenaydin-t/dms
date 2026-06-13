@@ -193,15 +193,16 @@
    "fieldtype": "Link",
    "label": "Word Template",
    "options": "GMP Word Template",
-   "description": "Select a controlled template; the document's .docx and PDF are generated from it on QA approval. Leave blank to attach a .docx manually instead."
+   "reqd": 1,
+   "description": "Mandatory. The selected template's tag mappings are applied when rendering your uploaded .docx."
   },
   {
    "fieldname": "attachment_file",
    "fieldtype": "Attach",
    "label": "Attachment (.docx)",
    "no_copy": 1,
-   "depends_on": "eval:!doc.word_template",
-   "description": "Only .docx files are accepted. The file is renamed and hashed automatically. When a Word Template is selected this is generated for you on submit."
+   "reqd": 1,
+   "description": "Mandatory. Upload your .docx; on QA approval its {{ tags }} are rendered using the selected template's mappings. The file is renamed and hashed automatically."
   },
   {
    "fieldname": "file_integrity_hash",
