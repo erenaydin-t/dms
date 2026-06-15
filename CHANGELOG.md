@@ -4,6 +4,15 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-06-16
+
+### Fixed
+- **Documents still hidden from users not named on them (completes the 1.1.1 fix).** 1.1.1 only flagged `document_owner` (→ Employee), but a User Permission on the **User** doctype was still applied through the `reviewer`, `qa_approver`, `prepared_by`, `reviewed_by`, `approved_by`, and `last_revision_by` Link fields — so an approver (or anyone not named on the document) couldn't see it. All of those fields, plus `department`, now set `ignore_user_permissions`, restoring purely role-based visibility. (Revert `department` if department-scoped visibility is later wanted.)
+- **`Value missing for Attachment (.docx)` when amending.** On amend, `before_insert` decided whether an attachment was inherited from the predecessor by comparing `file_url` *strings*. Frappe deduplicates uploads by content hash, so a freshly attached `.docx` could be handed the predecessor's `file_url` and was wrongly nulled, failing the mandatory check. Inheritance is now determined by File *ownership* (is the `File` still attached to the predecessor?), so a newly uploaded revision file is always kept.
+
+### Upgrade notes
+- Run `bench --site <site> migrate`, then `bench restart`.
+
 ## [1.1.1] - 2026-06-15
 
 ### Fixed
@@ -82,6 +91,7 @@ First stable release.
 ### Added
 - Initial release of the GMP Document DocType: versioning, autonaming, file integrity hashing, Word template rendering, and PDF watermarking.
 
+[1.1.2]: https://github.com/erenaydin-t/dms/releases/tag/v1.1.2
 [1.1.1]: https://github.com/erenaydin-t/dms/releases/tag/v1.1.1
 [1.1.0]: https://github.com/erenaydin-t/dms/releases/tag/v1.1.0
 [1.0.0]: https://github.com/erenaydin-t/dms/releases/tag/v1.0.0

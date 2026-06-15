@@ -101,7 +101,8 @@
    "options": "Department",
    "reqd": 1,
    "in_list_view": 1,
-   "in_standard_filter": 1
+   "in_standard_filter": 1,
+   "ignore_user_permissions": 1
   },
   {
    "fieldname": "document_owner",
@@ -235,7 +236,8 @@
    "label": "Prepared By",
    "options": "User",
    "read_only": 1,
-   "in_standard_filter": 1
+   "in_standard_filter": 1,
+   "ignore_user_permissions": 1
   },
   {
    "fieldname": "column_break_wf_1",
@@ -248,6 +250,7 @@
    "options": "User",
    "reqd": 1,
    "in_standard_filter": 1,
+   "ignore_user_permissions": 1,
    "description": "User who must review the document before it goes to QA."
   },
   {
@@ -257,6 +260,7 @@
    "options": "User",
    "reqd": 1,
    "in_standard_filter": 1,
+   "ignore_user_permissions": 1,
    "description": "User who performs the final QA approval and triggers submit."
   },
   {
@@ -284,7 +288,8 @@
    "fieldtype": "Link",
    "label": "Reviewed By",
    "options": "User",
-   "read_only": 1
+   "read_only": 1,
+   "ignore_user_permissions": 1
   },
   {
    "fieldname": "reviewed_on",
@@ -301,7 +306,8 @@
    "fieldtype": "Link",
    "label": "Approved By",
    "options": "User",
-   "read_only": 1
+   "read_only": 1,
+   "ignore_user_permissions": 1
   },
   {
    "fieldname": "approved_on",
@@ -321,7 +327,8 @@
    "fieldtype": "Link",
    "label": "Requested By",
    "options": "User",
-   "read_only": 1
+   "read_only": 1,
+   "ignore_user_permissions": 1
   },
   {
    "fieldname": "last_revision_on",
