@@ -7,3 +7,4 @@ dms.patches.v0_7_0.set_amend_naming_rule
 dms.patches.v0_7_0.sync_gmp_workflow
 dms.patches.v0_7_0.backfill_obsolete_status
 dms.patches.v0_8_0.remap_document_type_codes
+dms.patches.v1_1_1.cleanup_template_file_remnants

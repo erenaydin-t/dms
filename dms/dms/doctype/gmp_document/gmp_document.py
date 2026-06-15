@@ -353,10 +353,13 @@ class GMPDocument(NestedSet):
         if not self.attachment_file:
             return
 
+        previous_url = None
         if not self.is_new():
             previous = self.get_doc_before_save()
-            if previous and previous.attachment_file == self.attachment_file:
-                return
+            if previous:
+                if previous.attachment_file == self.attachment_file:
+                    return
+                previous_url = previous.attachment_file
 
         if not self.attachment_file.lower().endswith(ALLOWED_EXTENSIONS):
             frappe.throw(_("Only .docx files are allowed for GMP Documents."))
@@ -370,21 +373,61 @@ class GMPDocument(NestedSet):
         self.file_integrity_hash = _compute_sha256(physical_path)
 
         # Rename the physical file to mirror the document ID for traceability.
+        # The controlled name is deterministic ({docname}.docx), so a re-upload
+        # for the same version always resolves to the same path/URL.
         target_filename = f"{self.name}.docx"
-        if file_doc.file_name == target_filename:
-            return
+        if file_doc.file_name != target_filename:
+            new_dir = os.path.dirname(physical_path)
+            new_path = os.path.join(new_dir, target_filename)
+            if os.path.exists(new_path) and os.path.abspath(new_path) != os.path.abspath(physical_path):
+                os.remove(new_path)
 
-        new_dir = os.path.dirname(physical_path)
-        new_path = os.path.join(new_dir, target_filename)
-        if os.path.exists(new_path) and os.path.abspath(new_path) != os.path.abspath(physical_path):
-            os.remove(new_path)
+            os.rename(physical_path, new_path)
+            new_url = ("/private/files/" if file_doc.is_private else "/files/") + target_filename
+            file_doc.file_name = target_filename
+            file_doc.file_url = new_url
+            file_doc.save(ignore_permissions=True)
+            self.attachment_file = new_url
 
-        os.rename(physical_path, new_path)
-        new_url = ("/private/files/" if file_doc.is_private else "/files/") + target_filename
-        file_doc.file_name = target_filename
-        file_doc.file_url = new_url
-        file_doc.save(ignore_permissions=True)
-        self.attachment_file = new_url
+        # Issue #3: replacing the attachment otherwise leaves the previous File
+        # row in place. Because the controlled URL is deterministic, that stale
+        # row ends up sharing a file_url with the new one, so _get_file_doc()
+        # (a get_value by file_url) can resolve to it and serve the *old* .docx;
+        # the unchanged URL also lets the browser/file cache return stale bytes.
+        # Purge every superseded File row, then drop the cached document so the
+        # next read re-resolves the fresh file.
+        self._purge_superseded_attachments(keep=file_doc.name, previous_url=previous_url)
+        frappe.clear_document_cache(self.doctype, self.name)
+
+    def _purge_superseded_attachments(self, keep, previous_url):
+        """Delete File rows left behind by an attachment replacement.
+
+        Targets the previous attachment's File row, any duplicate sharing the
+        current controlled URL, and any other .docx still attached to this
+        document — keeping only the File we just promoted. Frappe guards the
+        physical delete when another row references the same path, so the
+        retained file's bytes are never removed."""
+        stale = set()
+        if previous_url:
+            stale.update(frappe.get_all("File", filters={"file_url": previous_url}, pluck="name"))
+        if self.attachment_file:
+            stale.update(frappe.get_all("File", filters={"file_url": self.attachment_file}, pluck="name"))
+        stale.update(
+            frappe.get_all(
+                "File",
+                filters={
+                    "attached_to_doctype": self.doctype,
+                    "attached_to_name": self.name,
+                    "file_name": ["like", "%.docx"],
+                },
+                pluck="name",
+            )
+        )
+        stale.discard(keep)
+        for name in stale:
+            # force bypasses link checks; ignore_permissions because this runs
+            # inside the controlled save, not as the end user.
+            frappe.delete_doc("File", name, force=True, ignore_permissions=True)
 
     def _render_and_generate_pdf(self):
         """Two-pass render from a single pristine source template:

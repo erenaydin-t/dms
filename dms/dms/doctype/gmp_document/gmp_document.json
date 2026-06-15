@@ -107,7 +107,8 @@
    "fieldname": "document_owner",
    "fieldtype": "Link",
    "label": "Document Owner",
-   "options": "Employee"
+   "options": "Employee",
+   "ignore_user_permissions": 1
   },
   {
    "fieldname": "section_classification",
