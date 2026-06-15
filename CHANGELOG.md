@@ -82,6 +82,7 @@ First stable release.
 ### Added
 - Initial release of the GMP Document DocType: versioning, autonaming, file integrity hashing, Word template rendering, and PDF watermarking.
 
+[1.1.1]: https://github.com/erenaydin-t/dms/releases/tag/v1.1.1
 [1.1.0]: https://github.com/erenaydin-t/dms/releases/tag/v1.1.0
 [1.0.0]: https://github.com/erenaydin-t/dms/releases/tag/v1.0.0
 [0.7.0]: https://github.com/erenaydin-t/dms/releases/tag/v0.7.0
