@@ -107,9 +107,14 @@ GMP_WORKFLOW_TRANSITIONS = [
 
 def before_install():
     _ensure_role("QA Manager", desk_access=1)
+    # Module-owner / admin role with full CRUD + cancel across every document
+    # and department. Created before the DocTypes sync so their permission rows
+    # resolve the role on a fresh install.
+    _ensure_role("DMS Manager", desk_access=1)
 
 
 def after_install():
+    _ensure_role("DMS Manager", desk_access=1)
     _ensure_department_abbr_field()
     _ensure_employee_signature_field()
     _ensure_amend_naming_rule()
@@ -121,6 +126,7 @@ def after_install():
 def after_migrate():
     # Idempotent re-assertion of custom fields; never touches user
     # preferences (default_workspace) so existing customizations stick.
+    _ensure_role("DMS Manager", desk_access=1)
     _ensure_department_abbr_field()
     _ensure_employee_signature_field()
     _ensure_amend_naming_rule()

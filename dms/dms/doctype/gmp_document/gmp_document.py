@@ -17,13 +17,21 @@ from io import BytesIO
 
 import frappe
 from frappe import _
-from frappe.utils import add_months, add_years, cstr, getdate, now_datetime, today
+from frappe.utils import add_months, add_years, cint, cstr, getdate, now_datetime, today
 from frappe.utils.file_manager import save_file
 from frappe.utils.nestedset import NestedSet
 
 from docx.shared import Mm
 from docxtpl import DocxTemplate, InlineImage
 
+
+# Roles that read and operate on every GMP Document regardless of department or
+# creator. "DMS Manager" is the module-owner/admin role (full CRUD + cancel);
+# "QA Manager" drives the review/approval workflow; "System Manager" is the
+# Frappe super-admin. Everyone else (a plain "Employee") is a read-only
+# consumer scoped to their own department's approved, active documents — see
+# get_permission_query_conditions() / has_permission().
+UNRESTRICTED_ROLES = frozenset({"System Manager", "QA Manager", "DMS Manager"})
 
 VALIDITY_YEARS_MAP = {"2 Years": 2, "3 Years": 3, "5 Years": 5}
 ALLOWED_EXTENSIONS = (".docx",)
@@ -1050,6 +1058,116 @@ def _close_open_todos(doc, allocated_to):
 
 
 # ---------------------------------------------------------------------- #
+#  Permissions: department-scoped read for members, full access for      #
+#  module owners                                                         #
+# ---------------------------------------------------------------------- #
+#
+# Visibility model:
+#   - DMS Manager / QA Manager / System Manager (+ Administrator): every
+#     document, any department, any state.
+#   - Everyone else (a plain Employee): read-only access to the *approved,
+#     active* controlled copies of the department(s) they belong to, plus any
+#     document on which they are personally named (preparer / reviewer / QA
+#     approver) so workflow participants are never locked out.
+#
+# Enforcement is in two cooperating hooks (wired in hooks.py):
+#   - get_permission_query_conditions -> list / report / search visibility
+#   - has_permission                  -> opening a single document & the
+#                                        PDF-download whitelisted methods
+# The GMP Document Tree page bypasses both (it queries with frappe.get_all),
+# so get_dms_tree_children() applies the same scope explicitly.
+
+
+def _user_departments(user):
+    """Departments the user belongs to, resolved via their Employee record(s)
+    (Employee.user_id == user). A user with no Employee link has none."""
+    if not user or user == "Guest":
+        return []
+    return [
+        d
+        for d in frappe.get_all(
+            "Employee", filters={"user_id": user}, pluck="department"
+        )
+        if d
+    ]
+
+
+def _is_unrestricted(user):
+    """True for the module-owner / workflow / super-admin roles that see and
+    operate on every document regardless of department or creator."""
+    return user == "Administrator" or bool(
+        UNRESTRICTED_ROLES & set(frappe.get_roles(user))
+    )
+
+
+def _visibility_scope(user=None):
+    """Return (allowed_departments, active_only) for the calling user.
+
+    allowed_departments is None for unrestricted users (no department filter);
+    otherwise the set of departments they may see. active_only is True for
+    restricted users, who only ever see approved, active documents."""
+    user = user or frappe.session.user
+    if _is_unrestricted(user):
+        return None, False
+    return set(_user_departments(user)), True
+
+
+def get_permission_query_conditions(user=None):
+    """SQL visibility filter for GMP Document lists, reports and search.
+
+    Empty string = no restriction (unrestricted roles). Restricted users get
+    their department's approved/active documents OR any document naming them."""
+    user = user or frappe.session.user
+    if _is_unrestricted(user):
+        return ""
+
+    conditions = []
+    depts = _user_departments(user)
+    if depts:
+        dept_in = ", ".join(frappe.db.escape(d) for d in depts)
+        conditions.append(
+            "(`tabGMP Document`.department in ({0}) "
+            "and `tabGMP Document`.is_active = 1 "
+            "and `tabGMP Document`.docstatus = 1)".format(dept_in)
+        )
+
+    u = frappe.db.escape(user)
+    conditions.append("`tabGMP Document`.prepared_by = {0}".format(u))
+    conditions.append("`tabGMP Document`.reviewer = {0}".format(u))
+    conditions.append("`tabGMP Document`.qa_approver = {0}".format(u))
+
+    return "(" + " or ".join(conditions) + ")"
+
+
+def has_permission(doc, ptype="read", user=None):
+    """Per-document gate mirroring get_permission_query_conditions().
+
+    Returning False denies; True/None defers to the role permission. Unrestricted
+    roles always pass. A plain member may read (and print) an approved, active
+    document of their department, or any document naming them; everything else
+    is denied for them here (role perms already withhold write/create/etc. — this
+    is defence in depth)."""
+    if doc is None:
+        return None  # doctype-level check; leave to role perms + query conditions
+
+    user = user or frappe.session.user
+    if _is_unrestricted(user):
+        return True
+
+    read_like = ptype in ("read", "print")
+    named = user in (doc.get("prepared_by"), doc.get("reviewer"), doc.get("qa_approver"))
+    if named:
+        return read_like
+
+    in_scope = (
+        cint(doc.get("is_active"))
+        and cint(doc.get("docstatus")) == 1
+        and doc.get("department") in _user_departments(user)
+    )
+    return bool(read_like and in_scope)
+
+
+# ---------------------------------------------------------------------- #
 #  Tree page data source                                                 #
 # ---------------------------------------------------------------------- #
 
@@ -1062,23 +1180,35 @@ def get_dms_tree_children(parent=None):
         Root       -> Department (with submitted document count)
         Department -> Document Type (with submitted document count)
         Doc Type   -> latest submitted version per document family
-    """
+
+    Honours the same department scope as the list view (see _visibility_scope):
+    restricted members only see their department's approved, active documents;
+    unrestricted roles see everything submitted."""
     parent = (parent or "").strip()
+    allowed_depts, active_only = _visibility_scope()
+
+    def base_filters(extra=None):
+        f = {"docstatus": 1}
+        if active_only:
+            f["is_active"] = 1
+        if extra:
+            f.update(extra)
+        return f
+
+    def dept_allowed(dept):
+        return allowed_depts is None or dept in allowed_depts
 
     if not parent:
         rows = frappe.get_all(
             "GMP Document",
-            filters={"docstatus": 1},
+            filters=base_filters(),
             fields=["department"],
             distinct=True,
         )
-        depts = sorted({r.department for r in rows if r.department})
+        depts = sorted({r.department for r in rows if r.department and dept_allowed(r.department)})
         nodes = []
         for dept in depts:
-            cnt = frappe.db.count(
-                "GMP Document",
-                filters={"docstatus": 1, "department": dept},
-            )
+            cnt = frappe.db.count("GMP Document", filters=base_filters({"department": dept}))
             nodes.append({
                 "value": f"Dept::{dept}",
                 "title": f"{dept} ({cnt})",
@@ -1088,9 +1218,11 @@ def get_dms_tree_children(parent=None):
 
     if parent.startswith("Dept::"):
         dept = parent[len("Dept::"):]
+        if not dept_allowed(dept):
+            return []
         rows = frappe.get_all(
             "GMP Document",
-            filters={"docstatus": 1, "department": dept},
+            filters=base_filters({"department": dept}),
             fields=["document_type"],
             distinct=True,
         )
@@ -1099,7 +1231,7 @@ def get_dms_tree_children(parent=None):
         for dtype in types:
             cnt = frappe.db.count(
                 "GMP Document",
-                filters={"docstatus": 1, "department": dept, "document_type": dtype},
+                filters=base_filters({"department": dept, "document_type": dtype}),
             )
             nodes.append({
                 "value": f"Type::{dept}::{dtype}",
@@ -1113,10 +1245,12 @@ def get_dms_tree_children(parent=None):
         if "::" not in rest:
             return []
         dept, dtype = rest.split("::", 1)
+        if not dept_allowed(dept):
+            return []
 
         docs = frappe.get_all(
             "GMP Document",
-            filters={"docstatus": 1, "department": dept, "document_type": dtype},
+            filters=base_filters({"department": dept, "document_type": dtype}),
             fields=["name", "version_number", "document_name_en", "is_active"],
         )
 
@@ -1153,6 +1287,14 @@ def download_word_document(docname):
     without exposing actor signatures."""
     doc = frappe.get_doc("GMP Document", docname)
     doc.check_permission("read")
+
+    # The clean Word file is a manager-only control-distribution artifact;
+    # department members are limited to the watermarked controlled-copy PDF.
+    if not _is_unrestricted(frappe.session.user):
+        frappe.throw(
+            _("Only DMS/QA managers may download the Word file. Use 'Download PDF (Controlled Copy)' instead."),
+            frappe.PermissionError,
+        )
 
     if not doc.attachment_file:
         frappe.throw(_("No Word file is attached to {0}.").format(docname))

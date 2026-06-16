@@ -41,21 +41,31 @@ function toggle_reason_for_change(frm) {
 
 
 /**
- * Adds the "Download PDF" action under the standard "Get PDF" menu.
- * Visibility is gated by role on the client; the server-side whitelisted
- * method enforces read permission as the actual security boundary.
+ * Adds the download actions under the standard "Get PDF" menu.
+ *
+ * - The watermarked controlled-copy PDF is offered to anyone who can read an
+ *   approved (docstatus 1) document — including read-only department members.
+ * - The clean Word file stays a manager-only control-distribution action.
+ *
+ * Buttons are gated on the client for UX; the whitelisted methods enforce the
+ * real boundary (read permission for the PDF, manager role for the Word file).
  */
 function add_download_pdf_button(frm) {
     if (frm.is_new()) return;
-    if (!frappe.user.has_role("QA Manager")) return;
+    if (frm.doc.docstatus !== 1) return;
 
     frm.add_custom_button(
-        __("Download PDF (signed)"),
+        __("Download PDF (Controlled Copy)"),
         () => download_watermarked_pdf(frm),
         __("Get PDF")
     );
 
-    if (frm.doc.docstatus === 1) {
+    const is_manager =
+        frappe.user.has_role("DMS Manager") ||
+        frappe.user.has_role("QA Manager") ||
+        frappe.user.has_role("System Manager");
+
+    if (is_manager) {
         frm.add_custom_button(
             __("Download Word (clean)"),
             () => download_word_document(frm),

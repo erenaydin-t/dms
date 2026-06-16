@@ -18,8 +18,10 @@ revision lifecycle.
 - **Two-stage PDF pipeline** — DOCX → PDF conversion via LibreOffice runs
   once at submit and is persisted; downloads dynamically apply the
   `CONTROLLED COPY` / `OBSOLETE` watermark from the cached base PDF.
-- **Role-gated download** — only users with the `QA Manager` role see the
-  in-form "Download PDF" button.
+- **Department-scoped access** — read-only `Employee` members see and download
+  the controlled-copy PDFs of their own department's approved/active documents;
+  `QA Manager` (workflow) and `DMS Manager` (module owner) see and manage
+  everything. See **[`docs/permissions-guide.md`](docs/permissions-guide.md)**.
 
 ## Requirements
 
@@ -42,8 +44,12 @@ bench restart
 
 1. Open each **Department** record and set the `custom_abbr` field (e.g.
    `QA`, `QC`, `PROD`). `GMP Document` naming will fail without it.
-2. Ensure the `QA Manager` role exists (auto-created by `before_install`)
-   and is assigned to relevant users.
+2. Ensure the `QA Manager` and `DMS Manager` roles exist (auto-created on
+   install/migrate) and are assigned appropriately: `QA Manager` to workflow
+   actors (preparers/reviewers/QA approvers), `DMS Manager` to module owners,
+   and `Employee` to read-only department consumers. Link each consumer to an
+   **Employee** record (`User ID` + `Department`) so department scoping works.
+   See **[`docs/permissions-guide.md`](docs/permissions-guide.md)**.
 3. Verify LibreOffice is callable as `soffice` from the bench user:
    ```bash
    which soffice && soffice --version

@@ -35,7 +35,7 @@ fixtures = [
     },
     {
         "dt": "Role",
-        "filters": [["role_name", "in", ["QA Manager"]]],
+        "filters": [["role_name", "in", ["QA Manager", "DMS Manager"]]],
     },
 ]
 
@@ -45,6 +45,22 @@ fixtures = [
 # Lifecycle for GMP Document is handled inside the controller class; nothing
 # is wired here on purpose to keep the hook surface auditable.
 doc_events = {}
+
+# ------------------------------------------------------------------------- #
+#  Permissions                                                              #
+# ------------------------------------------------------------------------- #
+# Department-scoped, read-only visibility for plain members; full access for
+# the DMS Manager (module owner), QA Manager and System Manager roles. The
+# query-conditions hook filters lists/reports/search; the has_permission hook
+# gates opening a single document and the PDF-download methods. See the
+# controller for the model and docs/PERMISSIONS.md for configuration.
+permission_query_conditions = {
+    "GMP Document": "dms.dms.doctype.gmp_document.gmp_document.get_permission_query_conditions",
+}
+
+has_permission = {
+    "GMP Document": "dms.dms.doctype.gmp_document.gmp_document.has_permission",
+}
 
 # ------------------------------------------------------------------------- #
 #  Scheduled tasks                                                          #

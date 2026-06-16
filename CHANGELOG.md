@@ -4,6 +4,20 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-06-16
+
+### Added
+- **Department-scoped, role-based access control.** A new permission model on `GMP Document`:
+  - **Read-only department members** (`Employee` role) now see only the **approved, active** controlled copies of the department(s) they belong to — resolved from their linked **Employee** record (`Employee.user_id` → `department`) — plus any document on which they are personally named. They can open those documents and download the watermarked **Controlled Copy PDF**, but cannot edit/create/cancel.
+  - **New `DMS Manager` role** (module owner / admin): full create / edit / cancel / delete / amend access to every document in every department, regardless of creator. Seeded on install and migrate (and via a `v1_2_0` pre-model-sync patch on existing sites).
+  - `QA Manager` (workflow actors) and `System Manager` continue to see and manage everything.
+  - Enforced by `permission_query_conditions` (lists/reports/search) and `has_permission` (single doc + download endpoints) hooks; the **GMP Document Tree** applies the same scope.
+- **Controlled-copy PDF download for members.** The in-form *Get PDF → Download PDF (Controlled Copy)* action is now available to any reader of an approved document (server-enforced); the clean **Word** download remains a manager-only control-distribution action.
+- **Permissions guide** — `docs/permissions-guide.md` documents the model and how to configure roles, Employee links, and department scoping from the panel.
+
+### Upgrade notes
+- Run `bench --site <site> migrate`, then `bench restart`. Assign the `DMS Manager` role to module owners and ensure read-only consumers have the `Employee` role **and** an Employee record with `User ID` + `Department` set.
+
 ## [1.1.2] - 2026-06-16
 
 ### Fixed
@@ -91,6 +105,7 @@ First stable release.
 ### Added
 - Initial release of the GMP Document DocType: versioning, autonaming, file integrity hashing, Word template rendering, and PDF watermarking.
 
+[1.2.0]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.0
 [1.1.2]: https://github.com/erenaydin-t/dms/releases/tag/v1.1.2
 [1.1.1]: https://github.com/erenaydin-t/dms/releases/tag/v1.1.1
 [1.1.0]: https://github.com/erenaydin-t/dms/releases/tag/v1.1.0
