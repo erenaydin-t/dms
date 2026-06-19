@@ -4,6 +4,19 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-06-20
+
+### Fixed
+Hardening of the 1.2.0 access-control model (from a recall-biased review):
+- **`DMS Manager` could not actually edit documents.** The active Workflow gates editing by each state's single `allow_edit` role, which listed only `QA Manager` / `System Manager` — so the new admin role got a read-only form despite its DocType write perm. `DMS Manager` now owns `allow_edit` for the in-pipeline/submitted states (Under Review, Pending QA Approval, Approved, Obsolete); Draft / Revision Requested stay with `QA Manager` for authors. `_sync_gmp_workflow` re-asserts this on existing installs. (A module owner who also authors drafts should hold both roles — see the guide.)
+- **Reference tree leaked across departments.** `get_document_reference_tree` only ran a doctype-level read check, letting a scoped member pass any docname and read names/status of other departments' documents. It now checks read permission on the root document and omits any referenced document the caller cannot read.
+- **Tree endpoint missing a read check.** `get_dms_tree_children` now calls `frappe.has_permission("GMP Document", "read", throw=True)`, so a user linked to a department but lacking the GMP read role can no longer enumerate document names/counts.
+- **Read-only members could trigger writes.** Downloading a controlled PDF whose base file was missing ran `_render_and_generate_pdf` (which mutates the document and File records) from a read-only session. Regeneration is now restricted to manager/admin roles; members get a "temporarily unavailable" message.
+- **Redundant Employee lookups.** `_user_departments` is now memoised per request (`frappe.flags`), so the repeated `has_permission` checks in one request no longer issue duplicate Employee queries.
+
+### Upgrade notes
+- Run `bench --site <site> migrate`, then `bench restart`.
+
 ## [1.2.0] - 2026-06-16
 
 ### Added
@@ -105,6 +118,7 @@ First stable release.
 ### Added
 - Initial release of the GMP Document DocType: versioning, autonaming, file integrity hashing, Word template rendering, and PDF watermarking.
 
+[1.2.1]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.1
 [1.2.0]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.0
 [1.1.2]: https://github.com/erenaydin-t/dms/releases/tag/v1.1.2
 [1.1.1]: https://github.com/erenaydin-t/dms/releases/tag/v1.1.1

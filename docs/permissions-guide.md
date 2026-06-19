@@ -57,12 +57,19 @@ only sees their own department branches and only active, approved leaves.
    document in every department, and can download both the PDF and the clean
    Word file.
 
+> **Editing across the lifecycle.** Frappe Workflow allows exactly one editor
+> role per state. The DMS Manager owns editing of the in-pipeline and
+> submitted states — **Under Review**, **Pending QA Approval**, **Approved**,
+> **Obsolete** — so an owner can correct or override a document anywhere in the
+> controlled lifecycle. The **Draft** and **Revision Requested** states are
+> reserved for the author (`QA Manager`). A module owner who also authors or
+> corrects drafts should therefore hold **both** `DMS Manager` and `QA Manager`.
+>
 > **To also drive the review/approval workflow** (the *Actions* menu:
 > Submit for Review → Approve as Reviewer → Approve as QA), the user must hold
 > the **`QA Manager`** role and be the assigned `reviewer` / `qa_approver` on
 > the document. The workflow steps are deliberately actor-specific for GMP
-> segregation of duties. Assign a module owner **both** `DMS Manager` and
-> `QA Manager` if they need to administer *and* approve.
+> segregation of duties.
 
 ### 2.3 Department abbreviation (unrelated to access, but required)
 

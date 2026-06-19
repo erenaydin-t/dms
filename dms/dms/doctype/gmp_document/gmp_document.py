@@ -972,6 +972,16 @@ def _resolve_base_pdf_path(doc):
         return path
 
     # Missing base PDF — regenerate from the controlled .docx attachment.
+    # Regeneration mutates the document (db_set of the integrity hash) and
+    # rewrites File records, so it must not be reachable by a read-only member
+    # downloading a controlled copy. Restrict it to the manager/admin roles.
+    if not _is_unrestricted(frappe.session.user):
+        frappe.throw(
+            _(
+                "The controlled PDF for {0} is temporarily unavailable. "
+                "Please ask a DMS/QA manager to regenerate it."
+            ).format(doc.name)
+        )
     if not doc.attachment_file:
         frappe.throw(
             _(
@@ -1080,16 +1090,23 @@ def _close_open_todos(doc, allocated_to):
 
 def _user_departments(user):
     """Departments the user belongs to, resolved via their Employee record(s)
-    (Employee.user_id == user). A user with no Employee link has none."""
+    (Employee.user_id == user). A user with no Employee link has none.
+
+    Memoised per request (frappe.flags is request-local) because has_permission
+    can fire several times per document per request — without this each call
+    would issue a fresh Employee query."""
     if not user or user == "Guest":
         return []
-    return [
-        d
-        for d in frappe.get_all(
-            "Employee", filters={"user_id": user}, pluck="department"
-        )
-        if d
-    ]
+    memo = frappe.flags.setdefault("dms_user_departments", {})
+    if user not in memo:
+        memo[user] = [
+            d
+            for d in frappe.get_all(
+                "Employee", filters={"user_id": user}, pluck="department"
+            )
+            if d
+        ]
+    return memo[user]
 
 
 def _is_unrestricted(user):
@@ -1184,6 +1201,11 @@ def get_dms_tree_children(parent=None):
     Honours the same department scope as the list view (see _visibility_scope):
     restricted members only see their department's approved, active documents;
     unrestricted roles see everything submitted."""
+    # The endpoint is whitelisted; gate it on the GMP Document read role so a
+    # user who happens to be linked to an Employee/department but has no GMP
+    # read permission can't enumerate document names/counts via the tree.
+    frappe.has_permission("GMP Document", "read", throw=True)
+
     parent = (parent or "").strip()
     allowed_depts, active_only = _visibility_scope()
 
@@ -1318,8 +1340,17 @@ def get_document_reference_tree(docname, depth=3):
 
     Each node: {"name": str, "label": str, "reference_type": str, "children": [...]}
     depth limits recursion depth to avoid runaway queries on large graphs.
+
+    Department-scoped: the root must be readable by the caller, and any
+    referenced document the caller cannot read (e.g. another department's, for a
+    plain member) is omitted from the tree so names/status don't leak across the
+    permission boundary.
     """
-    frappe.has_permission("GMP Document", "read", throw=True)
+    if not frappe.has_permission("GMP Document", "read", doc=docname):
+        frappe.throw(
+            _("You do not have permission to read {0}.").format(docname),
+            frappe.PermissionError,
+        )
 
     def _get_label(name):
         row = frappe.db.get_value(
@@ -1348,6 +1379,10 @@ def get_document_reference_tree(docname, depth=3):
             fields=["referenced_document", "reference_type"],
         )
         for r in refs:
+            # Skip references the caller cannot read so the tree never discloses
+            # documents outside their permission scope (e.g. other departments).
+            if not frappe.has_permission("GMP Document", "read", doc=r.referenced_document):
+                continue
             child = _build(r.referenced_document, current_depth - 1, visited)
             child["reference_type"] = r.reference_type or ""
             node["children"].append(child)

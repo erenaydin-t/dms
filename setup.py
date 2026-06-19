@@ -5,7 +5,7 @@ with open("requirements.txt") as f:
 
 setup(
     name="dms",
-    version="1.2.0",
+    version="1.2.1",
     description="GMP / 21 CFR Part 11 compliant Document Management System for ERPNext v16",
     author="ErenAydin",
     author_email="aydineren1986@gmail.com",

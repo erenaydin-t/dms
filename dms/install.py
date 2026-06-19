@@ -73,16 +73,23 @@ GMP_WORKFLOW_NAME = "GMP Document Workflow"
 # Transitioning into a state with doc_status=1 makes apply_workflow()
 # automatically submit the document — that's how 'Approved' becomes the
 # trigger for on_submit (PDF render etc.).
+# `allow_edit` is the single role permitted to edit a document while it sits in
+# that state (Frappe Workflow allows exactly one role per state). The preparer
+# states (Draft / Revision Requested) stay with "QA Manager" so authors edit
+# their own drafts; the in-pipeline and submitted states are owned by
+# "DMS Manager" (the module-owner/admin role) so an owner can correct or
+# override a document anywhere in the controlled lifecycle. A module owner who
+# also authors drafts should additionally hold "QA Manager".
 GMP_WORKFLOW_STATES = [
-    {"state": "Draft",                "doc_status": 0, "allow_edit": "QA Manager",     "style": "Warning"},
-    {"state": "Under Review",         "doc_status": 0, "allow_edit": "System Manager", "style": "Primary"},
-    {"state": "Pending QA Approval",  "doc_status": 0, "allow_edit": "System Manager", "style": "Primary"},
-    {"state": "Approved",             "doc_status": 1, "allow_edit": "System Manager", "style": "Success"},
-    {"state": "Revision Requested",   "doc_status": 0, "allow_edit": "QA Manager",     "style": "Danger"},
+    {"state": "Draft",                "doc_status": 0, "allow_edit": "QA Manager",  "style": "Warning"},
+    {"state": "Under Review",         "doc_status": 0, "allow_edit": "DMS Manager", "style": "Primary"},
+    {"state": "Pending QA Approval",  "doc_status": 0, "allow_edit": "DMS Manager", "style": "Primary"},
+    {"state": "Approved",             "doc_status": 1, "allow_edit": "DMS Manager", "style": "Success"},
+    {"state": "Revision Requested",   "doc_status": 0, "allow_edit": "QA Manager",  "style": "Danger"},
     # Terminal state for cancelled (obsolete) documents. on_cancel() sets
     # workflow_status to this directly (doc_status 2 = cancelled) so the
     # native badge stops reading "Approved".
-    {"state": "Obsolete",             "doc_status": 2, "allow_edit": "System Manager", "style": "Danger"},
+    {"state": "Obsolete",             "doc_status": 2, "allow_edit": "DMS Manager", "style": "Danger"},
 ]
 
 # Each transition is gated by role (QA Manager) AND a per-actor `condition`:
@@ -232,6 +239,15 @@ def _sync_gmp_workflow():
         desired = cond_by_action.get(tr.action)
         if desired and tr.condition != desired:
             tr.condition = desired
+            changed = True
+
+    # Re-assert allow_edit so existing installs pick up the DMS Manager
+    # (module-owner) editing rights on the in-pipeline / submitted states.
+    edit_by_state = {st["state"]: st["allow_edit"] for st in GMP_WORKFLOW_STATES}
+    for s in wf.states:
+        desired_edit = edit_by_state.get(s.state)
+        if desired_edit and s.allow_edit != desired_edit:
+            s.allow_edit = desired_edit
             changed = True
 
     if changed:
