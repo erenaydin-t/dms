@@ -4,6 +4,20 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4] - 2026-06-20
+
+### Added
+- **End-to-end PDF / template / role / regression validation suite (`test_e2e_pdf.py`).** Real documents are created, driven through the workflow to Approved (rendering the Word template and converting to PDF via LibreOffice), and the generated PDF bytes/text are extracted and compared:
+  - **Template differentiation** — two documents on different templates produce non-identical PDFs with the correct, non-cross-contaminated content.
+  - **Multi-version** — a document revised through v0…v4; every PDF carries its own version number with no stale content, and all five differ pairwise.
+  - **Independent documents** — unique PDFs and isolated reference trees.
+  - **Role-based access** — Owner / DMS Manager / QA Manager / Employee / outsider against a real approved document and its PDF download; cross-department denial; clean-Word manager-only.
+  - **Regression hunts** — direct-submit workflow bypass is blocked; an approver signature is embedded in the rendered PDF.
+- **CI now provisions Python 3.14** (matching Frappe's current `version-16` requirement) so `bench init` and the test run succeed in CI.
+
+### Notes
+- No product code changes vs 1.2.3 — this release bundles the runtime-validated test suite and the working CI test job. The full DMS suite is **67 tests, green on a live ERPNext + HRMS + DMS site**. The deep audit found no defects in the shipped behaviour; the only fixes were to the test harness itself (mandatory fields, content-hash dedup of dummy uploads, `copy_doc` docstatus, and unique per-version document content).
+
 ## [1.2.3] - 2026-06-20
 
 ### Added
@@ -144,6 +158,7 @@ First stable release.
 ### Added
 - Initial release of the GMP Document DocType: versioning, autonaming, file integrity hashing, Word template rendering, and PDF watermarking.
 
+[1.2.4]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.4
 [1.2.3]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.3
 [1.2.2]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.2
 [1.2.1]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.1
