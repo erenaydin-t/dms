@@ -127,13 +127,19 @@ class TestGMPDocument(FrappeTestCase):
     def _dummy_attachment(self, en):
         """A minimal .docx-named private File with arbitrary bytes. Valid for
         save/hash/rename; only actual rendering (on_submit) needs a real .docx,
-        which the LibreOffice end-to-end tests supply via _make_docx_file()."""
+        which the LibreOffice end-to-end tests supply via _make_docx_file().
+
+        Content must be unique per file: Frappe deduplicates File records by
+        content hash, so identical bytes would collapse distinct uploads onto a
+        single File/URL and break tests that depend on a genuinely fresh file
+        (e.g. the amend "keeps freshly uploaded file" case)."""
+        nonce = frappe.generate_hash(length=16)
         fname = f"{en}-{frappe.generate_hash(length=6)}.docx"
         return frappe.get_doc({
             "doctype": "File",
             "file_name": fname,
             "is_private": 1,
-            "content": b"PK\x03\x04 dummy docx for tests",
+            "content": b"PK\x03\x04 dummy docx for tests " + nonce.encode(),
         }).insert(ignore_permissions=True)
 
     def _build_doc(self, **overrides):
@@ -146,6 +152,10 @@ class TestGMPDocument(FrappeTestCase):
             "gmp_impact": "Major",
             "validity_period": "3 Years",
             "version_number": 0,
+            # reviewer and qa_approver are mandatory; default to Administrator
+            # so tests that don't exercise the workflow can still insert.
+            "reviewer": "Administrator",
+            "qa_approver": "Administrator",
         }
         defaults.update(overrides)
         doc = frappe.new_doc("GMP Document")
@@ -518,6 +528,7 @@ class TestGMPDocument(FrappeTestCase):
         frappe.db.set_value("GMP Document", original.name, "docstatus", 2)
 
         amended = frappe.copy_doc(original)
+        amended.docstatus = 0  # amend starts a fresh draft; copy_doc may carry the source docstatus
         amended.amended_from = original.name
         amended.reason_for_change = "CAPA-2026-002 procedural fix"
         # attachment_file is no_copy (not carried by the amend copy) and is now
@@ -570,6 +581,7 @@ class TestGMPDocument(FrappeTestCase):
         # Cancel + amend the target — link validation must not block this.
         target.cancel()
         amended = frappe.copy_doc(target)
+        amended.docstatus = 0  # amend starts a fresh draft; copy_doc may carry the source docstatus
         amended.amended_from = target.name
         amended.reason_for_change = "Revised per change control"
         amended.attachment_file = self._make_docx_file(fname="GMP-Test-RefTarget-v1.docx").file_url

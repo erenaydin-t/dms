@@ -33,6 +33,12 @@ from docxtpl import DocxTemplate, InlineImage
 # get_permission_query_conditions() / has_permission().
 UNRESTRICTED_ROLES = frozenset({"System Manager", "QA Manager", "DMS Manager"})
 
+# Upper bound on get_document_reference_tree recursion, so a hand-crafted depth
+# argument over the whitelisted endpoint can't drive runaway traversal of a
+# large/dense reference graph. Per-path cycle detection prevents loops; this
+# caps how deep any single path is expanded.
+MAX_REFERENCE_TREE_DEPTH = 10
+
 VALIDITY_YEARS_MAP = {"2 Years": 2, "3 Years": 3, "5 Years": 5}
 ALLOWED_EXTENSIONS = (".docx",)
 SIGNATURE_WIDTH_MM = 40  # rendered signature width in PDF
@@ -1346,6 +1352,14 @@ def get_document_reference_tree(docname, depth=3):
     plain member) is omitted from the tree so names/status don't leak across the
     permission boundary.
     """
+    # depth arrives from a whitelisted call (string over HTTP). Coerce safely
+    # and clamp so a bad or huge value can't crash or drive runaway recursion.
+    try:
+        depth = int(depth)
+    except (TypeError, ValueError):
+        depth = 3
+    depth = max(0, min(depth, MAX_REFERENCE_TREE_DEPTH))
+
     if not frappe.db.exists("GMP Document", docname):
         frappe.throw(_("GMP Document {0} not found.").format(docname), frappe.DoesNotExistError)
 
@@ -1392,7 +1406,7 @@ def get_document_reference_tree(docname, depth=3):
             node["children"].append(child)
         return node
 
-    return _build(root, int(depth), set())
+    return _build(root, depth, set())
 
 
 def _resolve_watermark_text(doc):

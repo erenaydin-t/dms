@@ -4,6 +4,18 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.3] - 2026-06-20
+
+### Added
+- **Runtime test coverage + CI execution (release-readiness audit).** A new `test_permissions.py` suite plus CI that actually runs the tests on a real ERPNext + HRMS + DMS site (previously CI only did static checks, so the suite had never executed). Coverage: `has_permission`, `get_permission_query_conditions`, `_visibility_scope`, `_user_departments`, department-scoped vs. unrestricted access, named-participant access, the reference tree (existing/deleted/missing-root/cross-department/nesting/circular/large-graph/depth), `get_dms_tree_children` scoping, and the workflow `allow_edit` configuration. The DOCX→PDF end-to-end tests run under LibreOffice in CI. Full suite: 59 tests green on a live site.
+
+### Fixed
+- **Reference-tree recursion depth hardening.** `get_document_reference_tree` now coerces the whitelisted `depth` argument safely and clamps it to `MAX_REFERENCE_TREE_DEPTH` (10), so a malformed or oversized `depth` can neither crash nor drive runaway traversal of a dense graph.
+- **Test suite was unrunnable (pre-existing, surfaced by the first real run).** The legacy `GMP Document` tests had drifted: the build helper never set the now-mandatory `reviewer`/`qa_approver`, the dummy-attachment helper wrote identical bytes (Frappe content-dedup collapsed "distinct" uploads), and the amend tests didn't reset `docstatus` after `copy_doc`. Fixed so the suite passes end-to-end.
+
+### Upgrade notes
+- Run `bench --site <site> migrate`, then `bench restart`. (No schema change beyond 1.2.2; the depth clamp is internal.)
+
 ## [1.2.2] - 2026-06-20
 
 ### Fixed
@@ -132,6 +144,7 @@ First stable release.
 ### Added
 - Initial release of the GMP Document DocType: versioning, autonaming, file integrity hashing, Word template rendering, and PDF watermarking.
 
+[1.2.3]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.3
 [1.2.2]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.2
 [1.2.1]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.1
 [1.2.0]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.0

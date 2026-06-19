@@ -30,3 +30,86 @@ jobs:
       - name: Verify __version__ is set
         run: |
           python3 -c "import re; v=re.search(r'__version__\s*=\s*[\"\']([^\"\']+)', open('dms/__init__.py').read()); assert v, 'missing __version__'; print('Version:', v.group(1))"
+
+  test:
+    name: Runtime tests (ERPNext + HRMS + DMS)
+    runs-on: ubuntu-22.04
+    services:
+      mariadb:
+        image: mariadb:10.6
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=15
+      redis:
+        image: redis:6.2-alpine
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout dms
+        uses: actions/checkout@v4
+        with:
+          path: dms
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          # LibreOffice provides `soffice` so the DOCX->PDF end-to-end tests run
+          # instead of being skipped.
+          sudo apt-get install -y --no-install-recommends libreoffice-writer
+
+      - name: Install bench
+        run: pip install frappe-bench
+
+      - name: Initialise bench (Frappe v16)
+        run: bench init --skip-redis-config-generation --frappe-branch version-16 frappe-bench
+
+      - name: Point bench at CI services
+        working-directory: frappe-bench
+        run: |
+          bench set-config -g redis_cache "redis://localhost:6379"
+          bench set-config -g redis_queue "redis://localhost:6379"
+          bench set-config -g redis_socketio "redis://localhost:6379"
+          bench set-config -gp db_host 127.0.0.1
+          bench set-config -gp db_port 3306
+
+      - name: Fetch apps (ERPNext, HRMS, DMS)
+        working-directory: frappe-bench
+        run: |
+          bench get-app erpnext --branch version-16
+          bench get-app hrms --branch version-16
+          bench get-app dms "${GITHUB_WORKSPACE}/dms"
+
+      - name: Create site and install apps
+        working-directory: frappe-bench
+        run: |
+          bench new-site test_site \
+            --no-mariadb-socket \
+            --db-root-password root \
+            --admin-password admin \
+            --install-app erpnext \
+            --install-app hrms \
+            --install-app dms
+          bench --site test_site set-config allow_tests true
+
+      - name: Run DMS test suite
+        working-directory: frappe-bench
+        run: |
+          # --skip-before-tests avoids ERPNext's setup-wizard bootstrap (not
+          # needed by the DMS suite). Covers the GMP Document controller, the
+          # permission/visibility model, and the reference tree.
+          bench --site test_site run-tests --app dms --skip-before-tests
