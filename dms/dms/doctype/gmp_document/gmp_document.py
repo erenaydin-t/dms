@@ -1346,49 +1346,53 @@ def get_document_reference_tree(docname, depth=3):
     plain member) is omitted from the tree so names/status don't leak across the
     permission boundary.
     """
-    if not frappe.has_permission("GMP Document", "read", doc=docname):
+    if not frappe.db.exists("GMP Document", docname):
+        frappe.throw(_("GMP Document {0} not found.").format(docname), frappe.DoesNotExistError)
+
+    root = frappe.get_doc("GMP Document", docname)
+    if not frappe.has_permission("GMP Document", "read", doc=root):
         frappe.throw(
             _("You do not have permission to read {0}.").format(docname),
             frappe.PermissionError,
         )
 
-    def _get_label(name):
-        row = frappe.db.get_value(
-            "GMP Document", name, ["document_name_en", "workflow_status", "is_active"], as_dict=True
-        )
-        if not row:
-            return name
-        label = name
-        if row.document_name_en:
-            label += f" — {row.document_name_en}"
+    def _label(doc):
+        label = doc.name
+        if doc.document_name_en:
+            label += f" — {doc.document_name_en}"
         return label
 
-    def _build(name, current_depth, visited):
+    def _build(doc, current_depth, visited):
         node = {
-            "name": name,
-            "label": _get_label(name),
+            "name": doc.name,
+            "label": _label(doc),
             "reference_type": "",
             "children": [],
         }
-        if current_depth <= 0 or name in visited:
+        if current_depth <= 0 or doc.name in visited:
             return node
-        visited = visited | {name}
-        refs = frappe.get_all(
-            "GMP Document Reference",
-            filters={"parent": name},
-            fields=["referenced_document", "reference_type"],
-        )
-        for r in refs:
-            # Skip references the caller cannot read so the tree never discloses
-            # documents outside their permission scope (e.g. other departments).
-            if not frappe.has_permission("GMP Document", "read", doc=r.referenced_document):
+        visited = visited | {doc.name}
+        # doc.references is the already-loaded child table, so no extra query.
+        for r in (doc.references or []):
+            target = r.referenced_document
+            # Skip dangling references (target deleted) so a missing document
+            # degrades gracefully instead of raising DoesNotExistError, and skip
+            # any the caller cannot read so the tree never discloses documents
+            # outside their permission scope (e.g. another department's). The
+            # exists check guards against loading a non-existent doc; the target
+            # is then loaded once and reused for both the permission check and
+            # the recursion, so there is no redundant document load.
+            if not target or not frappe.db.exists("GMP Document", target):
                 continue
-            child = _build(r.referenced_document, current_depth - 1, visited)
+            child_doc = frappe.get_doc("GMP Document", target)
+            if not frappe.has_permission("GMP Document", "read", doc=child_doc):
+                continue
+            child = _build(child_doc, current_depth - 1, visited)
             child["reference_type"] = r.reference_type or ""
             node["children"].append(child)
         return node
 
-    return _build(docname, int(depth), set())
+    return _build(root, int(depth), set())
 
 
 def _resolve_watermark_text(doc):

@@ -4,6 +4,20 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-06-20
+
+### Fixed
+- **Reference tree crashed on a dangling reference (regression from 1.2.1).** The per-document permission check added in 1.2.1 (`frappe.has_permission(..., doc=name)`) loads the document via `frappe.get_doc`, which raised `DoesNotExistError` when a referenced GMP Document had been deleted (now possible since 1.2.0 gave `DMS Manager` delete rights) — taking down the whole reference-tree render. `get_document_reference_tree` now guards the root and every reference with `frappe.db.exists` and silently omits missing targets, restoring the pre-1.2.1 graceful degradation. A missing root yields a clean `DoesNotExistError` instead of an uncaught crash.
+
+### Changed
+- **Reference-tree performance.** Each node is now loaded once with `frappe.get_doc` and reused for the permission check, the label, and child enumeration (via the already-loaded `references` child table), removing the redundant `get_value` label lookup and the separate reference query that 1.2.1 incurred per node.
+
+### Tests
+- Added regression coverage: a document referencing a deleted target renders without a 500 and omits the deleted node; a non-existent root raises a clean `DoesNotExistError`.
+
+### Upgrade notes
+- Run `bench --site <site> migrate`, then `bench restart`.
+
 ## [1.2.1] - 2026-06-20
 
 ### Fixed
@@ -118,6 +132,7 @@ First stable release.
 ### Added
 - Initial release of the GMP Document DocType: versioning, autonaming, file integrity hashing, Word template rendering, and PDF watermarking.
 
+[1.2.2]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.2
 [1.2.1]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.1
 [1.2.0]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.0
 [1.1.2]: https://github.com/erenaydin-t/dms/releases/tag/v1.1.2

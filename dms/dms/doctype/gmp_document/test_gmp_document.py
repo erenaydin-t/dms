@@ -586,6 +586,50 @@ class TestGMPDocument(FrappeTestCase):
         self.assertNotIn(target.name, repointed)
 
     # ------------------------------------------------------------------ #
+    #  Reference tree — dangling reference (deleted target) is handled    #
+    # ------------------------------------------------------------------ #
+
+    def test_reference_tree_handles_deleted_target(self):
+        """Regression (v1.2.2): a reference whose target has been deleted must
+        not crash the reference tree. Before the fix the per-document permission
+        check loaded the target via frappe.get_doc and raised DoesNotExistError
+        on a dangling reference; now missing targets are skipped and the rest of
+        the tree still renders. Hermetic — no LibreOffice/submit needed."""
+        from dms.dms.doctype.gmp_document.gmp_document import get_document_reference_tree
+
+        survivor = self._build_doc(document_name_en="GMP-Test-RefTree-Survivor")
+        survivor.insert(ignore_permissions=True)
+        doomed = self._build_doc(document_name_en="GMP-Test-RefTree-Doomed")
+        doomed.insert(ignore_permissions=True)
+
+        root = self._build_doc(document_name_en="GMP-Test-RefTree-Root")
+        root.append("references", {"referenced_document": survivor.name, "reference_type": "References"})
+        root.append("references", {"referenced_document": doomed.name, "reference_type": "References"})
+        root.insert(ignore_permissions=True)
+
+        # Hard-delete the target to leave a dangling reference row on root
+        # (force bypasses the back-link guard, as a manual delete would).
+        frappe.delete_doc("GMP Document", doomed.name, ignore_permissions=True, force=True)
+        self.assertFalse(frappe.db.exists("GMP Document", doomed.name))
+
+        # Must render without raising (previously DoesNotExistError -> 500).
+        tree = get_document_reference_tree(root.name)
+
+        self.assertEqual(tree["name"], root.name)
+        child_names = [c["name"] for c in tree["children"]]
+        # The deleted target is omitted; the surviving reference still renders.
+        self.assertNotIn(doomed.name, child_names)
+        self.assertIn(survivor.name, child_names)
+
+    def test_reference_tree_missing_root_raises_not_found(self):
+        """A non-existent root docname yields a clean DoesNotExistError, not an
+        uncaught crash from frappe.get_doc inside the permission check."""
+        from dms.dms.doctype.gmp_document.gmp_document import get_document_reference_tree
+
+        with self.assertRaises(frappe.DoesNotExistError):
+            get_document_reference_tree("SOP-NOPE-99-v0")
+
+    # ------------------------------------------------------------------ #
     #  Issue #1 — base PDF regenerates when the File record is missing   #
     # ------------------------------------------------------------------ #
 
