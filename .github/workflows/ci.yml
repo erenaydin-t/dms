@@ -76,7 +76,9 @@ jobs:
         run: pip install frappe-bench
 
       - name: Initialise bench (Frappe v16)
-        run: bench init --skip-redis-config-generation --frappe-branch version-16 frappe-bench
+        # --skip-assets: backend tests don't need the JS bundle, and skipping
+        # the yarn/esbuild build keeps CI fast and avoids node-toolchain flakiness.
+        run: bench init --skip-redis-config-generation --skip-assets --frappe-branch version-16 frappe-bench
 
       - name: Point bench at CI services
         working-directory: frappe-bench
