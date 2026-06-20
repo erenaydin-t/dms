@@ -32,7 +32,7 @@ jobs:
           python3 -c "import re; v=re.search(r'__version__\s*=\s*[\"\']([^\"\']+)', open('dms/__init__.py').read()); assert v, 'missing __version__'; print('Version:', v.group(1))"
 
   test:
-    name: Runtime tests (Docker: ERPNext + HRMS + DMS)
+    name: "Runtime tests (Docker: ERPNext + HRMS + DMS)"
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
