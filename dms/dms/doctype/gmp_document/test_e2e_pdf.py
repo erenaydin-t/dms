@@ -399,6 +399,56 @@ class TestE2EPDF(FrappeTestCase):
 
     # --------------------------- 10: regressions ----------------------- #
 
+    def test_10_amend_available_after_cancel_for_qa_manager(self):
+        """Regression (v1.2.5): after an approved document is cancelled, a plain
+        QA Manager must be able to create a new version. The Amend button is
+        gated by Frappe's can_amend(): docstatus == 2, amend permission, and the
+        form is NOT workflow-read-only (the user shares a role with the current
+        state's allow_edit). Cancelling puts the doc in the Obsolete state, so a
+        QA Manager who lacks Obsolete's allow_edit role would see no Amend
+        button. This verifies the full gate end-to-end and then performs the
+        amend to confirm a new version is produced."""
+        doc = self._create_approved(
+            "GMP-E2E-AmendAfterCancel", TPL_ALPHA, ["AMEND_DOC", "{{ my_title }}"]
+        )
+        doc.cancel()
+        doc.reload()
+        self.assertEqual(doc.docstatus, 2)
+        self.assertEqual(doc.workflow_status, "Obsolete")
+
+        # 1) Amend-button visibility gate — mirror frappe.workflow.is_read_only:
+        #    the form (and the Amend action) is read-only unless the user shares
+        #    a role with the current workflow state's allow_edit roles.
+        obsolete_roles = [
+            s.allow_edit
+            for s in frappe.get_doc("Workflow", "GMP Document Workflow").states
+            if s.state == "Obsolete"
+        ]
+        qa_roles = set(frappe.get_roles(QA_MGR))
+        workflow_read_only = not qa_roles.intersection(obsolete_roles)
+        self.assertFalse(
+            workflow_read_only,
+            "QA Manager is workflow-read-only on a cancelled doc -> Amend button hidden",
+        )
+        # 2) amend permission (the other half of can_amend()).
+        self.assertTrue(
+            frappe.has_permission("GMP Document", "amend", doc=doc.name, user=QA_MGR),
+            "QA Manager lacks amend permission",
+        )
+
+        # 3) The amend (what the button triggers) produces a new draft version.
+        amended = frappe.copy_doc(doc)
+        amended.docstatus = 0
+        amended.amended_from = doc.name
+        amended.reason_for_change = "Revised after cancellation"
+        amended.attachment_file = self._docx(
+            "GMP-E2E-AmendAfterCancel-v1.docx", ["AMEND_DOC_V1", "{{ my_title }}"]
+        ).file_url
+        amended.insert(ignore_permissions=True)
+        self.assertEqual(amended.version_number, (doc.version_number or 0) + 1)
+        self.assertEqual(amended.docstatus, 0)
+        self.assertEqual(amended.amended_from, doc.name)
+
     def test_10_direct_submit_bypass_blocked(self):
         # A QA Manager must not be able to skip the workflow by calling submit()
         # directly; before_submit enforces workflow_status == Approved.
