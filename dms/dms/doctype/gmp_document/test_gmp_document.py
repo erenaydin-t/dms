@@ -39,6 +39,16 @@ TEST_DEPT = "GMP-Test-QA Department"
 TEST_DEPT_ABBR = "QA"
 SOFFICE_AVAILABLE = bool(shutil.which("soffice") or shutil.which("libreoffice"))
 
+# Stop Frappe's test-record generator from recursing into GMP Document's link
+# dependencies that reach ERPNext's Company doctype. Importing ERPNext's company
+# test module runs erpnext.tests.utils at import time (BootStrapTestData -> Item
+# opening stock -> Stock Entry submit), which fails on a version-mismatched
+# bench. Company is reached two ways: directly via Department/Employee, and
+# transitively via User -> Email Account -> Company. None of these test records
+# are needed here — every test builds the Department/Employee/User fixtures it
+# uses explicitly (or uses Administrator).
+IGNORE_TEST_RECORD_DEPENDENCIES = ["Employee", "Department", "Company", "User"]
+
 
 def _ensure_test_department():
     """Create a Department fixture with a known custom_abbr."""
