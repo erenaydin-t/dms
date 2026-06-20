@@ -87,8 +87,17 @@ jobs:
       - name: Run DMS test suite
         working-directory: docker
         run: |
-          # --skip-before-tests avoids ERPNext's setup-wizard bootstrap (not
-          # needed by the DMS suite). Covers the GMP Document controller, the
-          # permission/visibility model, the reference tree, and the LibreOffice
-          # DOCX->PDF end-to-end pipeline.
-          docker compose exec -T backend bench --site test_site run-tests --app dms --skip-before-tests
+          # Run each DMS test module explicitly rather than `--app dms`:
+          # the app-wide run triggers ERPNext's test-record generation for
+          # unrelated doctypes, which submits a Stock Ledger Entry and fails on
+          # the version-mismatched base image (frappe 17-dev + erpnext 16). The
+          # per-module runs cover the whole DMS suite (controller, permission/
+          # visibility model, reference tree, and the LibreOffice DOCX->PDF
+          # end-to-end pipeline). --skip-before-tests skips ERPNext's
+          # setup-wizard bootstrap, which the DMS suite does not need.
+          for m in test_gmp_document test_permissions test_e2e_pdf; do
+            echo "::group::run-tests $m"
+            docker compose exec -T backend bench --site test_site \
+              run-tests --module "dms.dms.doctype.gmp_document.$m" --skip-before-tests
+            echo "::endgroup::"
+          done
