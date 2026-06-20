@@ -4,6 +4,14 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.5] - 2026-06-20
+
+### Fixed
+- **No "Amend" button after cancelling an approved document (couldn't create a new version).** Cancelling moves the document into the **Obsolete** workflow state, and Frappe hides the Amend action whenever the current workflow state makes the form read-only for the user. Obsolete's `allow_edit` was `DMS Manager`, so a plain **QA Manager** (the approver who cancels) was treated as read-only and never saw Amend. Obsolete is now editable by **QA Manager**, so preparers/approvers can revise a cancelled document into a new version. (Administrator and module owners who also hold `QA Manager` were unaffected; the underlying amend/versioning logic was already correct — this was purely the button-visibility gate.) `_sync_gmp_workflow` re-asserts this on existing installs. Added a regression test.
+
+### Upgrade notes
+- Run `bench --site <site> migrate`, then `bench restart`.
+
 ## [1.2.4] - 2026-06-20
 
 ### Added
@@ -158,6 +166,7 @@ First stable release.
 ### Added
 - Initial release of the GMP Document DocType: versioning, autonaming, file integrity hashing, Word template rendering, and PDF watermarking.
 
+[1.2.5]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.5
 [1.2.4]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.4
 [1.2.3]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.3
 [1.2.2]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.2

@@ -88,8 +88,14 @@ GMP_WORKFLOW_STATES = [
     {"state": "Revision Requested",   "doc_status": 0, "allow_edit": "QA Manager",  "style": "Danger"},
     # Terminal state for cancelled (obsolete) documents. on_cancel() sets
     # workflow_status to this directly (doc_status 2 = cancelled) so the
-    # native badge stops reading "Approved".
-    {"state": "Obsolete",             "doc_status": 2, "allow_edit": "DMS Manager", "style": "Danger"},
+    # native badge stops reading "Approved". allow_edit is "QA Manager" here so
+    # that the workflow does NOT mark a cancelled document read-only for the
+    # preparer/approver: Frappe hides the "Amend" (create new version) action
+    # when the current workflow state makes the form read-only, so a plain
+    # QA Manager must be in this state's allowed-edit roles to revise an
+    # obsolete document. (Administrator and module owners who also hold
+    # QA Manager are unaffected.)
+    {"state": "Obsolete",             "doc_status": 2, "allow_edit": "QA Manager",  "style": "Danger"},
 ]
 
 # Each transition is gated by role (QA Manager) AND a per-actor `condition`:

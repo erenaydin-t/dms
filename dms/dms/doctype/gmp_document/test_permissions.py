@@ -505,3 +505,23 @@ class TestGMPPermissions(FrappeTestCase):
         self.assertEqual(allow.get("Under Review"), "DMS Manager")
         self.assertEqual(allow.get("Pending QA Approval"), "DMS Manager")
         self.assertEqual(allow.get("Approved"), "DMS Manager")
+
+    def test_obsolete_state_allows_qa_manager_amend(self):
+        """Regression: after a document is cancelled (workflow state Obsolete),
+        a plain QA Manager must be able to amend it into a new version. Frappe
+        hides the Amend action when the current workflow state makes the form
+        read-only (i.e. the user lacks the state's allow_edit role), so the
+        Obsolete state must allow QA Manager *and* QA Manager must hold amend
+        permission — together that's exactly Frappe's can_amend() condition
+        (docstatus == 2 and perm.amend and not workflow-read-only)."""
+        _sync_gmp_workflow()
+        wf = frappe.get_doc("Workflow", "GMP Document Workflow")
+        obsolete_roles = [s.allow_edit for s in wf.states if s.state == "Obsolete"]
+        self.assertIn(
+            "QA Manager",
+            obsolete_roles,
+            "Obsolete must be editable by QA Manager or the Amend button is hidden after cancel",
+        )
+        self.assertTrue(
+            frappe.permissions.has_permission("GMP Document", "amend", user=QA_MGR)
+        )

@@ -59,11 +59,20 @@ only sees their own department branches and only active, approved leaves.
 
 > **Editing across the lifecycle.** Frappe Workflow allows exactly one editor
 > role per state. The DMS Manager owns editing of the in-pipeline and
-> submitted states — **Under Review**, **Pending QA Approval**, **Approved**,
-> **Obsolete** — so an owner can correct or override a document anywhere in the
-> controlled lifecycle. The **Draft** and **Revision Requested** states are
-> reserved for the author (`QA Manager`). A module owner who also authors or
-> corrects drafts should therefore hold **both** `DMS Manager` and `QA Manager`.
+> submitted states — **Under Review**, **Pending QA Approval**, **Approved** —
+> so an owner can correct or override a document there. The **Draft** and
+> **Revision Requested** states are reserved for the author (`QA Manager`). A
+> module owner who also authors or corrects drafts should therefore hold
+> **both** `DMS Manager` and `QA Manager`.
+>
+> **Amending a cancelled document (creating a new version).** When an approved
+> document is cancelled it enters the **Obsolete** state, and Frappe hides the
+> **Amend** action whenever the current workflow state makes the form read-only
+> for the user. The Obsolete state is therefore editable by **`QA Manager`**, so
+> the preparer/approver who cancels a document can immediately revise it into a
+> new version. A user who needs to amend a cancelled document must hold the
+> `QA Manager` role (Administrator and module owners who also hold `QA Manager`
+> are unaffected).
 >
 > **To also drive the review/approval workflow** (the *Actions* menu:
 > Submit for Review → Approve as Reviewer → Approve as QA), the user must hold
