@@ -32,88 +32,63 @@ jobs:
           python3 -c "import re; v=re.search(r'__version__\s*=\s*[\"\']([^\"\']+)', open('dms/__init__.py').read()); assert v, 'missing __version__'; print('Version:', v.group(1))"
 
   test:
-    name: Runtime tests (ERPNext + HRMS + DMS)
+    name: Runtime tests (Docker: ERPNext + HRMS + DMS)
     runs-on: ubuntu-22.04
-    services:
-      mariadb:
-        image: mariadb:10.6
-        env:
-          MARIADB_ROOT_PASSWORD: root
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="healthcheck.sh --connect --innodb_initialized"
-          --health-interval=5s --health-timeout=5s --health-retries=15
-      redis:
-        image: redis:6.2-alpine
-        ports:
-          - 6379:6379
-
     steps:
-      - name: Checkout dms
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          path: dms
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          # Frappe's version-16 branch currently requires Python >=3.14,<3.15
-          # (the base image ships 3.14); a lower version fails `bench init`.
-          python-version: '3.14'
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install system dependencies
+      - name: Free up disk space
         run: |
-          sudo apt-get update
-          # LibreOffice provides `soffice` so the DOCX->PDF end-to-end tests run
-          # instead of being skipped.
-          sudo apt-get install -y --no-install-recommends libreoffice-writer
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL "/usr/local/share/boost" || true
+          docker system prune -af >/dev/null 2>&1 || true
+          df -h /
 
-      - name: Install bench
-        run: pip install frappe-bench
-
-      - name: Initialise bench (Frappe v16)
-        # --skip-assets: backend tests don't need the JS bundle, and skipping
-        # the yarn/esbuild build keeps CI fast and avoids node-toolchain flakiness.
-        run: bench init --skip-redis-config-generation --skip-assets --frappe-branch version-16 frappe-bench
-
-      - name: Point bench at CI services
-        working-directory: frappe-bench
+      - name: Build DMS image (Frappe v16 + ERPNext + HRMS + DMS + LibreOffice)
+        working-directory: docker
         run: |
-          bench set-config -g redis_cache "redis://localhost:6379"
-          bench set-config -g redis_queue "redis://localhost:6379"
-          bench set-config -g redis_socketio "redis://localhost:6379"
-          bench set-config -gp db_host 127.0.0.1
-          bench set-config -gp db_port 3306
+          DOCKER_BUILDKIT=1 docker build \
+            --secret id=apps_json,src=apps.json \
+            --build-arg CACHEBUST="$(date +%s)" \
+            -t custom-erpnext:latest -f Dockerfile .
 
-      - name: Fetch apps (ERPNext, HRMS, DMS)
-        working-directory: frappe-bench
+      - name: Start stack
+        working-directory: docker
         run: |
-          bench get-app erpnext --branch version-16
-          bench get-app hrms --branch version-16
-          bench get-app dms "${GITHUB_WORKSPACE}/dms"
+          cp .env.example .env
+          docker compose up -d --remove-orphans
+          for i in $(seq 1 90); do
+            docker compose exec -T backend bench --version >/dev/null 2>&1 && break
+            sleep 3
+          done
+          docker compose exec -T backend bench --version
 
-      - name: Create site and install apps
-        working-directory: frappe-bench
+      - name: Create site with ERPNext + HRMS + DMS
+        working-directory: docker
         run: |
-          bench new-site test_site \
+          docker compose exec -T backend bench new-site test_site \
             --no-mariadb-socket \
-            --db-root-password root \
             --admin-password admin \
+            --db-root-password admin \
             --install-app erpnext \
             --install-app hrms \
             --install-app dms
-          bench --site test_site set-config allow_tests true
+
+      - name: Overlay the checked-out DMS code and migrate
+        working-directory: docker
+        run: |
+          # The image cloned dms@main; overlay this checkout so the exact commit
+          # under test is what runs (important for pull requests).
+          docker compose cp ../dms/. backend:/home/frappe/frappe-bench/apps/dms/dms/
+          docker compose exec -T backend bench --site test_site migrate
+          docker compose exec -T backend bench --site test_site set-config allow_tests true
 
       - name: Run DMS test suite
-        working-directory: frappe-bench
+        working-directory: docker
         run: |
           # --skip-before-tests avoids ERPNext's setup-wizard bootstrap (not
           # needed by the DMS suite). Covers the GMP Document controller, the
-          # permission/visibility model, and the reference tree.
-          bench --site test_site run-tests --app dms --skip-before-tests
+          # permission/visibility model, the reference tree, and the LibreOffice
+          # DOCX->PDF end-to-end pipeline.
+          docker compose exec -T backend bench --site test_site run-tests --app dms --skip-before-tests
