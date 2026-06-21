@@ -207,6 +207,93 @@ class TestE2EPDF(FrappeTestCase):
         doc.insert(ignore_permissions=True)
         return self._approve(doc)
 
+    def _docx_exact(self, fname, paragraphs):
+        """Like _docx but WITHOUT a uniqueness nonce, so two documents with the
+        same paragraphs produce byte-identical files — exercising Frappe's
+        content-hash deduplication (the real-world trigger for the content
+        mixup, e.g. users starting each version from the same base file)."""
+        from docx import Document as DocxDocument
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, fname)
+            d = DocxDocument()
+            for p in paragraphs:
+                d.add_paragraph(p)
+            d.save(path)
+            with open(path, "rb") as fh:
+                return frappe.get_doc(
+                    {"doctype": "File", "file_name": fname, "is_private": 1, "content": fh.read()}
+                ).insert(ignore_permissions=True)
+
+    def _create_approved_exact(self, en, template, paragraphs, dept=DEPT_QA):
+        docx = self._docx_exact(f"{en}.docx", paragraphs)
+        doc = frappe.new_doc("GMP Document")
+        doc.update(
+            {
+                "document_name_fa": "تست",
+                "document_name_en": en,
+                "document_type": "SOP",
+                "department": dept,
+                "gmp_impact": "Major",
+                "validity_period": "3 Years",
+                "version_number": 0,
+                "word_template": template,
+                "reviewer": "Administrator",
+                "qa_approver": "Administrator",
+                "prepared_by": OWNER,
+            }
+        )
+        doc.attachment_file = docx.file_url
+        doc.insert(ignore_permissions=True)
+        return self._approve(doc)
+
+    def test_identical_uploads_render_independently(self):
+        """Two documents whose uploaded .docx are byte-identical (so Frappe
+        deduplicates them onto one physical file) must each render their OWN
+        content. Regression for the content mixup where the clean-render
+        overwrite left File.content_hash stale, poisoning dedup so a later
+        upload was pointed at an already-rendered file and one document's PDF
+        contained another's content."""
+        body = ["CONTROLLED_BODY_TEXT", "Title: {{ my_title }}"]
+        a = self._create_approved_exact("GMP-E2E-Dup-A", TPL_ALPHA, body)
+        b = self._create_approved_exact("GMP-E2E-Dup-B", TPL_ALPHA, body)
+
+        ta = self._pdf_text(a.name)
+        tb = self._pdf_text(b.name)
+        # Each PDF must carry its own mapped title (my_title -> document_name_en).
+        self.assertIn("GMP-E2E-Dup-A", ta, "A's PDF lost its own content")
+        self.assertIn("GMP-E2E-Dup-B", tb, "B's PDF lost its own content")
+        # And must NOT carry the other document's content.
+        self.assertNotIn("GMP-E2E-Dup-B", ta, "A's PDF leaked B's content")
+        self.assertNotIn("GMP-E2E-Dup-A", tb, "B's PDF leaked A's content (dedup mixup)")
+
+    def test_amend_with_derived_upload_renders_new_version(self):
+        """User's reported scenario: amend an approved document by re-uploading
+        a .docx identical to the original (e.g. started from the same base
+        file, which Frappe deduplicates). The new version's PDF must render the
+        NEW version's data, not the predecessor's content."""
+        body = ["AMEND_BODY_TEXT", "Version: {{ rev }}"]  # rev -> version_number
+        v0 = self._create_approved_exact("GMP-E2E-AmendDup", TPL_ALPHA, body)
+        self.assertIn("Version: 0", self._pdf_text(v0.name))
+
+        v0.cancel()
+        amended = frappe.copy_doc(v0)
+        amended.docstatus = 0
+        amended.amended_from = v0.name
+        amended.reason_for_change = "Revision started from the same base file"
+        # Byte-identical to v0's original upload -> exercises dedup.
+        amended.attachment_file = self._docx_exact("GMP-E2E-AmendDup-v1.docx", body).file_url
+        amended.insert(ignore_permissions=True)
+        amended = self._approve(amended)
+
+        text = self._pdf_text(amended.name)
+        self.assertIn("Version: 1", text, "amended PDF did not render the new version")
+        self.assertNotIn("Version: 0", text, "amended PDF leaked the predecessor's content")
+        # The predecessor's controlled file must be intact and independent.
+        self.assertIn("Version: 0", self._pdf_text(v0.name), "predecessor PDF was corrupted")
+
     def _add_reference(self, parent_name, target_name):
         frappe.get_doc(
             {

@@ -4,6 +4,14 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.6] - 2026-06-21
+
+### Fixed
+- **Generated PDF could contain a different document's content (critical).** A document's PDF — especially on amendment — could render the wrong content, including content from a completely different document. Root cause: Frappe deduplicates uploaded files by content hash, so two byte-identical uploads (e.g. each version started from the same base file) are pointed at a single shared physical file; meanwhile the clean-render step overwrote the controlled `.docx` **in place without updating its `File.content_hash`**, leaving the hash stale and poisoning dedup. A subsequent upload then resolved to an already-rendered file, and the in-place rename/overwrite bled one document's content into another's render (and corrupted the other document's controlled file). Each GMP Document now writes its **own independent controlled `.docx`** (bytes written directly, bypassing dedup) and keeps that File's `content_hash` in sync on every render, so uploads and renders are fully isolated per document. Added end-to-end regression tests (identical-content uploads across two documents, and an amendment re-uploading content derived from the original).
+
+### Upgrade notes
+- Run `bench --site <site> migrate`, then `bench restart`. Documents approved before this fix that were affected should be re-amended/re-approved to regenerate a correct controlled file and PDF.
+
 ## [1.2.5] - 2026-06-20
 
 ### Fixed
@@ -166,6 +174,7 @@ First stable release.
 ### Added
 - Initial release of the GMP Document DocType: versioning, autonaming, file integrity hashing, Word template rendering, and PDF watermarking.
 
+[1.2.6]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.6
 [1.2.5]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.5
 [1.2.4]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.4
 [1.2.3]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.3

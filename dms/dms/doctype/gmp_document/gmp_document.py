@@ -17,9 +17,10 @@ from io import BytesIO
 
 import frappe
 from frappe import _
-from frappe.utils import add_months, add_years, cint, cstr, getdate, now_datetime, today
+from frappe.utils import add_months, add_years, cint, cstr, get_files_path, getdate, now_datetime, today
 from frappe.utils.file_manager import save_file
 from frappe.utils.nestedset import NestedSet
+from frappe.core.doctype.file.utils import get_content_hash
 
 from docx.shared import Mm
 from docxtpl import DocxTemplate, InlineImage
@@ -395,54 +396,113 @@ class GMPDocument(NestedSet):
         if not self.attachment_file.lower().endswith(ALLOWED_EXTENSIONS):
             frappe.throw(_("Only .docx files are allowed for GMP Documents."))
 
-        file_doc = self._get_file_doc(self.attachment_file)
-        physical_path = file_doc.get_full_path()
+        controlled_url = f"/private/files/{self.name}.docx"
+        if self.attachment_file == controlled_url:
+            # Already this document's own controlled file (e.g. a re-save with no
+            # new upload) — just keep the integrity hash current.
+            controlled = self._get_file_doc(self.attachment_file)
+            path = controlled.get_full_path()
+            if not os.path.exists(path):
+                frappe.throw(_("Attached file is missing on disk: {0}").format(self.attachment_file))
+            self.file_integrity_hash = _compute_sha256(path)
+            return
 
-        if not os.path.exists(physical_path):
+        src = self._get_file_doc(self.attachment_file)
+        src_path = src.get_full_path()
+        if not os.path.exists(src_path):
             frappe.throw(_("Attached file is missing on disk: {0}").format(self.attachment_file))
+        with open(src_path, "rb") as fh:
+            content = fh.read()
 
-        self.file_integrity_hash = _compute_sha256(physical_path)
+        # Promote the upload to this document's OWN controlled .docx. We copy the
+        # bytes into a per-document physical file and own its File record rather
+        # than renaming the uploaded file in place, because Frappe deduplicates
+        # uploads by content hash: identical or derived uploads (e.g. each
+        # version started from the same base file) are pointed at a single shared
+        # physical file, and renaming / overwriting it then bleeds one document's
+        # content into another document's render. Owning an independent file
+        # decouples this document from that sharing.
+        controlled = self._set_controlled_file(content)
+        self.attachment_file = controlled.file_url
+        self.file_integrity_hash = _compute_sha256(controlled.get_full_path())
 
-        # Rename the physical file to mirror the document ID for traceability.
-        # The controlled name is deterministic ({docname}.docx), so a re-upload
-        # for the same version always resolves to the same path/URL.
-        target_filename = f"{self.name}.docx"
-        if file_doc.file_name != target_filename:
-            new_dir = os.path.dirname(physical_path)
-            new_path = os.path.join(new_dir, target_filename)
-            if os.path.exists(new_path) and os.path.abspath(new_path) != os.path.abspath(physical_path):
-                os.remove(new_path)
-
-            os.rename(physical_path, new_path)
-            new_url = ("/private/files/" if file_doc.is_private else "/files/") + target_filename
-            file_doc.file_name = target_filename
-            file_doc.file_url = new_url
-            file_doc.save(ignore_permissions=True)
-            self.attachment_file = new_url
-
-        # Issue #3: replacing the attachment otherwise leaves the previous File
-        # row in place. Because the controlled URL is deterministic, that stale
-        # row ends up sharing a file_url with the new one, so _get_file_doc()
-        # (a get_value by file_url) can resolve to it and serve the *old* .docx;
-        # the unchanged URL also lets the browser/file cache return stale bytes.
-        # Purge every superseded File row, then drop the cached document so the
-        # next read re-resolves the fresh file.
-        self._purge_superseded_attachments(keep=file_doc.name, previous_url=previous_url)
+        self._purge_superseded_attachments(
+            keep=controlled.name, previous_url=previous_url, also_remove=[src.name]
+        )
         frappe.clear_document_cache(self.doctype, self.name)
 
-    def _purge_superseded_attachments(self, keep, previous_url):
-        """Delete File rows left behind by an attachment replacement.
+    def _set_controlled_file(self, content):
+        """Persist ``content`` as this document's controlled .docx in a physical
+        file owned solely by this document, with a File record whose
+        ``content_hash`` is kept in sync. Returns the File doc.
 
-        Targets the previous attachment's File row, any duplicate sharing the
-        current controlled URL, and any other .docx still attached to this
-        document — keeping only the File we just promoted. Frappe guards the
-        physical delete when another row references the same path, so the
-        retained file's bytes are never removed."""
-        stale = set()
+        Deliberately bypasses Frappe's content-hash deduplication (it writes the
+        file directly and inserts/updates the File row without going through
+        File.save): dedup can otherwise point several documents at one physical
+        file which — combined with the in-place clean-render overwrite that left
+        File.content_hash stale — caused one document's PDF to contain another
+        document's content."""
+        fname = f"{self.name}.docx"
+        url = f"/private/files/{fname}"
+        path = get_files_path(fname, is_private=1)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(content)
+        chash = get_content_hash(content)
+
+        rows = frappe.get_all(
+            "File",
+            filters={
+                "attached_to_doctype": self.doctype,
+                "attached_to_name": self.name,
+                "file_name": fname,
+            },
+            pluck="name",
+        )
+        if rows:
+            keep = rows[0]
+            for extra in rows[1:]:
+                frappe.delete_doc("File", extra, force=True, ignore_permissions=True)
+            frappe.db.set_value(
+                "File",
+                keep,
+                {
+                    "file_url": url,
+                    "is_private": 1,
+                    "file_size": len(content),
+                    "content_hash": chash,
+                },
+                update_modified=False,
+            )
+            return frappe.get_doc("File", keep)
+
+        f = frappe.new_doc("File")
+        f.name = frappe.generate_hash(length=10)
+        f.update(
+            {
+                "file_name": fname,
+                "file_url": url,
+                "is_private": 1,
+                "attached_to_doctype": self.doctype,
+                "attached_to_name": self.name,
+                "file_size": len(content),
+                "content_hash": chash,
+            }
+        )
+        # db_insert bypasses File.save -> no dedup, no filesystem rewrite; we own
+        # both the physical file (written above) and the row.
+        f.db_insert()
+        return f
+
+    def _purge_superseded_attachments(self, keep, previous_url, also_remove=None):
+        """Delete File rows left behind by an attachment change — the original
+        upload, the previous controlled file, and any other .docx attached to
+        this document — keeping only the File we just promoted. Frappe guards the
+        physical delete when another File row references the same path, so a
+        shared (deduplicated) upload never removes another document's bytes."""
+        stale = set(also_remove or [])
         if previous_url:
             stale.update(frappe.get_all("File", filters={"file_url": previous_url}, pluck="name"))
-        if self.attachment_file:
-            stale.update(frappe.get_all("File", filters={"file_url": self.attachment_file}, pluck="name"))
         stale.update(
             frappe.get_all(
                 "File",
@@ -543,10 +603,11 @@ class GMPDocument(NestedSet):
             with open(clean_path, "rb") as fh:
                 clean_bytes = fh.read()
 
-            # 4. Overwrite the user's uploaded .docx in place with the clean
-            # render — this becomes the controlled deliverable Word file.
-            with open(source_path, "wb") as fh:
-                fh.write(clean_bytes)
+        # 4. Replace the controlled .docx with the clean render (the deliverable
+        # Word file). Routed through _set_controlled_file so the File's
+        # content_hash is updated too — an in-place overwrite would leave it
+        # stale and poison Frappe's dedup for later uploads.
+        self._set_controlled_file(clean_bytes)
 
         # 5. SHA-256 reflects the deliverable (clean) bytes, not the signed PDF.
         self.db_set(
