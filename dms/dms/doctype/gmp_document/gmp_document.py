@@ -766,9 +766,16 @@ class GMPDocument(NestedSet):
         }
 
         if template_for_images is not None:
+            # Resolve the actual signer's signature first, then fall back to the
+            # assigned reviewer / QA approver. The two are usually the same, but
+            # when a workflow step is performed by someone else (e.g. an admin
+            # via the escape-hatch) the actor (reviewed_by/approved_by) may have
+            # no signature — so without the fallback no signature would render at
+            # all. _validate_signatures guarantees the assigned reviewer/
+            # qa_approver have a signature, so this fallback always resolves.
             preparer_path = _resolve_signature_path(self.prepared_by)
-            reviewer_path = _resolve_signature_path(self.reviewed_by or self.reviewer)
-            qa_path = _resolve_signature_path(self.approved_by or self.qa_approver)
+            reviewer_path = _resolve_signature_path(self.reviewed_by) or _resolve_signature_path(self.reviewer)
+            qa_path = _resolve_signature_path(self.approved_by) or _resolve_signature_path(self.qa_approver)
             if preparer_path:
                 context["preparer_signature"] = InlineImage(
                     template_for_images, preparer_path, width=Mm(SIGNATURE_WIDTH_MM)

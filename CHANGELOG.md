@@ -4,6 +4,14 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-06-21
+
+### Fixed
+- **Reviewer/QA signature not rendered when the workflow step was performed by someone else.** The PDF resolved the signature only from the *actual* actor (`reviewed_by` / `approved_by`); if a step was done via the Administrator escape-hatch (or by any account without a signature), no signature rendered — even though the assigned Reviewer/QA had one (and the 1.3.0 validation passed, since it checks the assigned users). Rendering now resolves the actual signer's signature **and falls back to the assigned `reviewer` / `qa_approver`**, whose signature 1.3.0 validation guarantees — so a reviewer/QA signature is always present on an approved document. Added a regression test.
+
+### Upgrade notes
+- Run `bench --site <site> migrate`, then `bench restart`. **Note:** `bench migrate` does *not* update app code — make sure the `dms` app is actually on this version (`bench version` should show dms 1.3.1) by pulling it (`bench update --pull`, or `cd apps/dms && git fetch --tags && git checkout v1.3.1 && cd ../.. && bench build`) before migrating.
+
 ## [1.3.0] - 2026-06-21
 
 ### Added
@@ -182,6 +190,7 @@ First stable release.
 ### Added
 - Initial release of the GMP Document DocType: versioning, autonaming, file integrity hashing, Word template rendering, and PDF watermarking.
 
+[1.3.1]: https://github.com/erenaydin-t/dms/releases/tag/v1.3.1
 [1.3.0]: https://github.com/erenaydin-t/dms/releases/tag/v1.3.0
 [1.2.6]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.6
 [1.2.5]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.5

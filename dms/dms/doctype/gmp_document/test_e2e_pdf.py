@@ -594,3 +594,37 @@ class TestE2EPDF(FrappeTestCase):
         path = self._base_pdf_path(signed.name)
         imgs = sum(len(getattr(p, "images", []) or []) for p in PdfReader(path).pages)
         self.assertGreaterEqual(imgs, 1, "approver signature image was not embedded in the PDF")
+
+    def test_signature_falls_back_to_assigned_when_actor_has_none(self):
+        """Regression (v1.3.1): when the actual reviewer/approver
+        (reviewed_by/approved_by) has no signature — e.g. a step performed by an
+        admin via the escape-hatch — the rendered signature must fall back to the
+        assigned reviewer/qa_approver (whose signature validation guarantees).
+        Verified at the render-context level, where each *_signature is an
+        InlineImage when resolved and an empty string when not."""
+        from docxtpl import DocxTemplate
+
+        nosig = "gmp-e2e-nosig-actor@example.com"
+        if not frappe.db.exists("User", nosig):
+            u = frappe.new_doc("User"); u.email = nosig; u.first_name = "nosig"
+            u.user_type = "System User"; u.send_welcome_email = 0; u.insert(ignore_permissions=True)
+        e = frappe.db.get_value("Employee", {"user_id": nosig}, "name")
+        if e:
+            frappe.db.set_value("Employee", e, "custom_signature_image", "")
+        frappe.db.commit()
+
+        doc = frappe.new_doc("GMP Document")
+        doc.update({
+            "document_name_en": "GMP-E2E-SigCtx", "department": DEPT_QA,
+            # actual actors have NO signature ...
+            "reviewed_by": nosig, "approved_by": nosig,
+            # ... but the assigned reviewer/qa (Administrator) DO.
+            "reviewer": "Administrator", "qa_approver": "Administrator",
+            "prepared_by": "Administrator",
+        })
+        tpl = DocxTemplate(frappe.get_doc("File", self._docx("sigctx.docx", ["x"]).name).get_full_path())
+        ctx = doc._build_template_context(template_for_images=tpl)
+
+        # Empty string means "no signature"; an InlineImage means it resolved.
+        self.assertNotEqual(ctx["qa_signature"], "", "qa signature did not fall back to assigned QA approver")
+        self.assertNotEqual(ctx["reviewer_signature"], "", "reviewer signature did not fall back to assigned reviewer")
