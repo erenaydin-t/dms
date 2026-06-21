@@ -20,7 +20,42 @@ frappe.ui.form.on("GMP Document", {
     amended_from(frm) {
         toggle_reason_for_change(frm);
     },
+
+    reviewer(frm) {
+        warn_if_no_signature(frm, "reviewer", __("Reviewer"));
+    },
+
+    qa_approver(frm) {
+        warn_if_no_signature(frm, "qa_approver", __("QA Approver"));
+    },
 });
+
+
+/**
+ * Immediate feedback when a Reviewer / QA Approver is selected: if that user has
+ * no usable signature image, warn the preparer right away. The hard enforcement
+ * is server-side in GMPDocument._validate_signatures (blocks save/submit).
+ */
+function warn_if_no_signature(frm, fieldname, label) {
+    const user = frm.doc[fieldname];
+    if (!user) return;
+    frappe.call({
+        method: "dms.dms.doctype.gmp_document.gmp_document.check_signature",
+        args: { user },
+        callback(r) {
+            if (r.message && r.message.ok === false) {
+                frappe.msgprint({
+                    title: __("Missing Signature"),
+                    indicator: "red",
+                    message: __(
+                        "{0}: {1} Upload a PNG/JPG/JPEG signature on their Employee record before saving.",
+                        [label, r.message.message]
+                    ),
+                });
+            }
+        },
+    });
+}
 
 
 /**

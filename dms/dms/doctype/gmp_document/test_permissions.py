@@ -137,6 +137,26 @@ def _ensure_employee(email, dept):
     return e.name
 
 
+_SIG_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\xf8\x0f\x00"
+    b"\x01\x01\x01\x00\x18\xdd\x8d\xb0\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
+def _ensure_signature(user, dept):
+    """Give `user` a linked Employee + PNG signature so the Reviewer/QA
+    signature validation passes for docs assigning this user."""
+    emp = _ensure_employee(user, dept)
+    if not frappe.db.get_value("Employee", emp, "custom_signature_image"):
+        f = frappe.get_doc(
+            {"doctype": "File", "file_name": f"sig-{frappe.generate_hash(length=6)}.png",
+             "is_private": 1, "content": _SIG_PNG}
+        ).insert(ignore_permissions=True)
+        frappe.db.set_value("Employee", emp, "custom_signature_image", f.file_url)
+    frappe.db.commit()
+
+
 def _hard_delete(name):
     """Delete a test GMP Document regardless of its (fabricated) docstatus.
     force bypasses link checks but not the submitted-record guard, so reset
@@ -185,6 +205,9 @@ class TestGMPPermissions(FrappeTestCase):
         _ensure_user(NO_ROLE, [])
         _ensure_employee(MEMBER_QA, QA_DEPT)
         _ensure_employee(MEMBER_PROD, PROD_DEPT)
+        # _make_doc assigns QA_MGR as reviewer & qa_approver; the signature
+        # validation requires that user to have a signature image.
+        _ensure_signature(QA_MGR, QA_DEPT)
         _purge_docs()
 
     @classmethod

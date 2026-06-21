@@ -110,6 +110,22 @@ def get_template_field_catalog():
     keeping it in lockstep with _build_template_context()."""
     return [{"value": key, "label": label} for key, label in TEMPLATE_FIELDS]
 
+
+@frappe.whitelist()
+def check_signature(user):
+    """Client-side pre-check for the Reviewer / QA Approver fields: report
+    whether ``user`` has a usable signature image. Returns
+    {"ok": bool, "message": str}. The authoritative enforcement is
+    GMPDocument._validate_signatures() on save/submit."""
+    if not user:
+        return {"ok": True, "message": ""}
+    issue = _signature_issue(user)
+    if not issue:
+        return {"ok": True, "message": ""}
+    full_name = frappe.db.get_value("User", user, "full_name") or user
+    return {"ok": False, "message": _("{0} has no usable signature: {1}.").format(full_name, issue)}
+
+
 # Workflow states ----------------------------------------------------------- #
 WF_DRAFT = "Draft"
 WF_UNDER_REVIEW = "Under Review"
@@ -240,6 +256,29 @@ class GMPDocument(NestedSet):
         if self.amended_from and not (self.reason_for_change and self.reason_for_change.strip()):
             frappe.throw(_("Reason for Change is mandatory when amending a GMP Document."))
         self._check_circular_references()
+        self._validate_signatures()
+
+    def _validate_signatures(self):
+        """Block save/submit unless the assigned Reviewer and QA Approver each
+        have a usable signature image, so an approved document can never be
+        rendered with a missing reviewer/QA signature. Resolution mirrors
+        _resolve_signature_path (Employee.user_id -> custom_signature_image ->
+        a PNG/JPG/JPEG File on disk)."""
+        for fieldname, label in (("reviewer", _("Reviewer")), ("qa_approver", _("QA Approver"))):
+            user = self.get(fieldname)
+            if not user:
+                continue
+            issue = _signature_issue(user)
+            if issue:
+                full_name = frappe.db.get_value("User", user, "full_name") or user
+                frappe.throw(
+                    _(
+                        "{0} {1} cannot be used until a signature is configured: {2}. "
+                        "Upload a PNG/JPG/JPEG signature image on their Employee record "
+                        "(Employee → Signature) before saving."
+                    ).format(label, frappe.bold(full_name), issue),
+                    title=_("Missing Signature"),
+                )
 
     def _check_circular_references(self):
         """Prevent circular reference chains (A → B → A)."""
@@ -882,6 +921,48 @@ def _compute_sha256(path):
         for chunk in iter(lambda: fh.read(8192), b""):
             sha.update(chunk)
     return sha.hexdigest()
+
+
+def _signature_issue(user_email):
+    """Return a short, human-readable reason ``user_email`` has no usable
+    signature image, or None if the user has a valid one.
+
+    Mirrors _resolve_signature_path's resolution (Employee.user_id ->
+    custom_signature_image -> a PNG/JPG/JPEG File on disk) but returns a message
+    instead of logging, so it can drive save-time validation and the client-side
+    pre-check. Used by GMPDocument._validate_signatures and check_signature."""
+    if not user_email:
+        return _("no user is selected")
+
+    employees = frappe.get_all(
+        "Employee",
+        filters={"user_id": user_email},
+        fields=["name", "status", "custom_signature_image"],
+        order_by="modified desc",
+    )
+    if not employees:
+        return _("no Employee record is linked to this user")
+
+    def _rank(emp):
+        has_sig = 1 if (emp.custom_signature_image or "").strip() else 0
+        is_active = 1 if (emp.status or "") == "Active" else 0
+        return (has_sig, is_active)
+
+    employees.sort(key=_rank, reverse=True)
+    sig_url = (employees[0].custom_signature_image or "").strip()
+    if not sig_url:
+        return _("the linked Employee has no signature image uploaded")
+
+    file_name = frappe.db.get_value("File", {"file_url": sig_url}, "name")
+    if not file_name:
+        return _("the signature file record is missing")
+
+    physical_path = frappe.get_doc("File", file_name).get_full_path()
+    if not os.path.exists(physical_path):
+        return _("the signature image is missing on disk")
+    if not physical_path.lower().endswith(ALLOWED_SIGNATURE_EXTENSIONS):
+        return _("the signature must be a PNG, JPG or JPEG image")
+    return None
 
 
 def _resolve_signature_path(user_email):

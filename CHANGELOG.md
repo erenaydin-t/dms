@@ -4,6 +4,14 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-06-21
+
+### Added
+- **Reviewer / QA Approver signature validation.** Saving or submitting a GMP Document now requires the assigned **Reviewer** and **QA Approver** to each have a usable signature image — a linked Employee (`Employee.user_id`) with `custom_signature_image` uploaded in PNG/JPG/JPEG. If a selected user lacks one, the save is blocked with a clear message naming the user and the reason (no Employee linked / no signature uploaded / file missing / wrong format), so a document can never reach approval and render with a missing reviewer/QA signature. Enforced server-side in `validate()` (`_validate_signatures`); the Reviewer/QA fields also pre-check on the form via a new `check_signature` endpoint and warn immediately on selection.
+
+### Upgrade notes
+- Run `bench --site <site> migrate`, then `bench restart`. Ensure the users assigned as Reviewer and QA Approver have a signature image on their Employee record, or those documents can no longer be saved. (The signature still renders from the *actual* reviewer/approver — `reviewed_by`/`approved_by` — so those should be the signature-bearing users.)
+
 ## [1.2.6] - 2026-06-21
 
 ### Fixed
@@ -174,6 +182,7 @@ First stable release.
 ### Added
 - Initial release of the GMP Document DocType: versioning, autonaming, file integrity hashing, Word template rendering, and PDF watermarking.
 
+[1.3.0]: https://github.com/erenaydin-t/dms/releases/tag/v1.3.0
 [1.2.6]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.6
 [1.2.5]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.5
 [1.2.4]: https://github.com/erenaydin-t/dms/releases/tag/v1.2.4

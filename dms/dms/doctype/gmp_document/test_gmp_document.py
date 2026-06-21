@@ -96,6 +96,44 @@ def _ensure_test_word_template():
     return TEST_WORD_TEMPLATE
 
 
+# Minimal valid PNG (1x1) — enough for the signature validation, which checks
+# the file exists and is a PNG/JPG/JPEG, not that it is a real image.
+_SIG_PNG = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\xf8\x0f\x00"
+    b"\x01\x01\x01\x00\x18\xdd\x8d\xb0\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
+def _ensure_signature(user, dept):
+    """Give `user` a linked Employee with a valid PNG signature so the
+    Reviewer/QA signature validation (GMPDocument._validate_signatures) passes
+    for documents that assign this user as reviewer/qa_approver."""
+    emp = frappe.db.get_value("Employee", {"user_id": user}, "name")
+    if not emp:
+        e = frappe.new_doc("Employee")
+        e.name = f"GMP-SIG-EMP-{frappe.generate_hash(length=8)}"
+        e.first_name = user.split("@")[0] if "@" in user else user
+        e.employee_name = e.first_name
+        e.user_id = user
+        e.department = dept
+        e.status = "Active"
+        e.flags.ignore_mandatory = True
+        e.db_insert()
+        emp = e.name
+    if not frappe.db.get_value("Employee", emp, "custom_signature_image"):
+        f = frappe.get_doc(
+            {
+                "doctype": "File",
+                "file_name": f"sig-{frappe.generate_hash(length=6)}.png",
+                "is_private": 1,
+                "content": _SIG_PNG,
+            }
+        ).insert(ignore_permissions=True)
+        frappe.db.set_value("Employee", emp, "custom_signature_image", f.file_url)
+    frappe.db.commit()
+
+
 def _purge_test_documents():
     for name in frappe.get_all(
         "GMP Document",
@@ -120,6 +158,9 @@ class TestGMPDocument(FrappeTestCase):
         _ensure_test_department()
         _ensure_test_document_types()
         _ensure_test_word_template()
+        # reviewer/qa_approver default to Administrator in _build_doc; the new
+        # signature validation requires them to have a signature image.
+        _ensure_signature("Administrator", TEST_DEPT)
         _purge_test_documents()
 
     @classmethod
@@ -328,6 +369,43 @@ class TestGMPDocument(FrappeTestCase):
 
         with self.assertRaises(frappe.ValidationError):
             amended.insert(ignore_permissions=True)
+
+    # ------------------------------------------------------------------ #
+    #  Reviewer / QA signature validation                                 #
+    # ------------------------------------------------------------------ #
+
+    def _user_without_signature(self, email):
+        if not frappe.db.exists("User", email):
+            u = frappe.new_doc("User")
+            u.email = email
+            u.first_name = email.split("@")[0]
+            u.user_type = "System User"
+            u.send_welcome_email = 0
+            u.insert(ignore_permissions=True)
+        # make sure any linked Employee has no signature
+        emp = frappe.db.get_value("Employee", {"user_id": email}, "name")
+        if emp:
+            frappe.db.set_value("Employee", emp, "custom_signature_image", "")
+        frappe.db.commit()
+        return email
+
+    def test_reviewer_without_signature_blocks_save(self):
+        bad = self._user_without_signature("gmp-test-nosig-reviewer@example.com")
+        doc = self._build_doc(document_name_en="GMP-Test-NoSigReviewer", reviewer=bad)
+        with self.assertRaises(frappe.ValidationError):
+            doc.insert(ignore_permissions=True)
+
+    def test_qa_approver_without_signature_blocks_save(self):
+        bad = self._user_without_signature("gmp-test-nosig-qa@example.com")
+        doc = self._build_doc(document_name_en="GMP-Test-NoSigQA", qa_approver=bad)
+        with self.assertRaises(frappe.ValidationError):
+            doc.insert(ignore_permissions=True)
+
+    def test_reviewer_and_qa_with_signature_save_ok(self):
+        # Administrator has a signature (ensured in setUpClass) -> save succeeds.
+        doc = self._build_doc(document_name_en="GMP-Test-SigOK")
+        doc.insert(ignore_permissions=True)
+        self.assertTrue(doc.name)
 
     # ------------------------------------------------------------------ #
     #  Word template field mapping                                        #
