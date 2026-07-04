@@ -400,7 +400,7 @@ class TestGMPPermissions(FrappeTestCase):
 
     def test_ref_tree_missing_root_raises(self):
         with self.assertRaises(frappe.DoesNotExistError):
-            get_document_reference_tree("SOP-NOPE-99-v0")
+            get_document_reference_tree("NOPE-SOP-9999-1")
 
     def test_ref_tree_cross_department_filtered_for_member(self):
         prod_child = self._make_doc("GMP-Perm-RT-ProdChild", dept=PROD_DEPT, active=True)

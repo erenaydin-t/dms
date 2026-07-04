@@ -169,8 +169,8 @@ def _ensure_employee_signature_field():
 
 
 def _ensure_amend_naming_rule():
-    """Issue #3: make amended GMP Documents run autoname() (…-v1) instead of
-    Frappe's default `-1` counter.
+    """Issue #3: make amended GMP Documents run autoname() (bumping the trailing
+    version segment, e.g. …-0001-2) instead of Frappe's default `-1` counter.
 
     Amend naming is governed by a per-doctype row in the Document Naming
     Settings single's `amend_naming_override` child table (falling back to the

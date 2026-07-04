@@ -59,18 +59,15 @@ function warn_if_no_signature(frm, fieldname, label) {
 
 
 /**
- * Hide `reason_for_change` for first-version docs (v0) and mark it
- * mandatory whenever the doc is an amendment. These two rules don't
- * conflict because amended docs always have version_number > 0.
+ * Show and require `reason_for_change` only for amendments; hide it on the
+ * initial version. Keyed off `amended_from`, not the version number: version
+ * numbering now starts at 1, so a version-based rule would wrongly show the
+ * field on every first-version document.
  */
 function toggle_reason_for_change(frm) {
-    const version = frm.doc.version_number || 0;
     const is_amended = Boolean(frm.doc.amended_from);
 
-    // Show whenever the field is (or could be) mandatory. version_number is
-    // bumped server-side in before_insert, so for a freshly-amended draft the
-    // client still sees version=0 even though it will become 1 on save.
-    frm.toggle_display("reason_for_change", version > 0 || is_amended);
+    frm.toggle_display("reason_for_change", is_amended);
     frm.toggle_reqd("reason_for_change", is_amended);
 }
 

@@ -185,37 +185,45 @@ class GMPDocument(NestedSet):
                 )
             )
 
-        version = self.version_number or 0
+        # Version numbering starts at 1 (never 0). before_insert enforces this on
+        # the model; the fallback keeps naming correct if autoname runs first.
+        version = self.version_number or 1
 
-        # On amendment, retain the same logical ID; only bump the -vN suffix.
+        # Strict ID structure: [Dept Abbr]-[Form Type]-[Number(4)]-[Version]
+        #   e.g. PR-FRM-0001-1
+        # No prefixes, suffixes, spaces or extra characters — exactly four
+        # dash-separated segments. On amendment, the logical ID (first three
+        # segments) is retained and only the trailing version segment changes.
         if self.amended_from:
-            base_name = self.amended_from.rsplit("-v", 1)[0]
-            self.name = f"{base_name}-v{version}"
+            base_name = self.amended_from.rsplit("-", 1)[0]
+            self.name = f"{base_name}-{version}"
             return
 
         # document_type links to GMP Document Type, whose record name *is* the
-        # short code (e.g. "BMR"), so it is already filesystem/name safe.
+        # short form-type code (e.g. "FRM"), so it is already name-safe.
         type_code = self.document_type
-        prefix = f"{type_code}-{dept_abbr}-"
+        prefix = f"{dept_abbr}-{type_code}-"
         existing = frappe.get_all(
             "GMP Document",
             filters=[["name", "like", f"{prefix}%"]],
             pluck="name",
         )
 
+        # The document number is the segment immediately after the prefix.
+        # Amended versions share their predecessor's number (only the version
+        # segment differs), so they never inflate the counter.
         max_increment = 0
         for existing_name in existing:
             try:
                 rest = existing_name[len(prefix):]
-                inc_str = rest.split("-v")[0]
-                inc = int(inc_str)
+                inc = int(rest.split("-")[0])
                 if inc > max_increment:
                     max_increment = inc
             except (ValueError, IndexError):
                 continue
 
-        next_inc = str(max_increment + 1).zfill(2)
-        self.name = f"{type_code}-{dept_abbr}-{next_inc}-v{version}"
+        next_inc = str(max_increment + 1).zfill(4)
+        self.name = f"{dept_abbr}-{type_code}-{next_inc}-{version}"
 
     def before_insert(self):
         if not self.prepared_by:
@@ -224,6 +232,10 @@ class GMPDocument(NestedSet):
             self.workflow_status = WF_DRAFT
 
         if not self.amended_from:
+            # A brand-new document is ALWAYS version 1 — version numbering starts
+            # at 1, never 0. Forced here (not merely defaulted) so a stray client
+            # value cannot produce a v0 document.
+            self.version_number = 1
             return
 
         predecessor = frappe.db.get_value(
@@ -232,7 +244,9 @@ class GMPDocument(NestedSet):
             ["version_number"],
             as_dict=True,
         ) or frappe._dict()
-        self.version_number = (predecessor.version_number or 0) + 1
+        # Amendments increment from the predecessor; since the chain starts at 1,
+        # the first amendment is version 2, the next 3, and so on.
+        self.version_number = (cint(predecessor.version_number) or 0) + 1
         # Change control: a revised document must re-acquire its own controlled
         # file, so clear an attachment that was carried over from the
         # predecessor by the amend — but never one the user uploaded for this
@@ -904,7 +918,7 @@ class GMPDocument(NestedSet):
             "expiry_date": cstr(self.expiry_date) if self.expiry_date else "",
             "next_revision_date": cstr(self.next_revision_date) if self.next_revision_date else "",
             # ----- versioning -----
-            "version_number": self.version_number or 0,
+            "version_number": self.version_number or 1,
             "is_active": int(bool(self.is_active)),
             "requires_training": int(bool(self.requires_training)),
             # ----- change control -----
@@ -1723,7 +1737,9 @@ def get_dms_tree_children(parent=None):
 
         latest = {}
         for d in docs:
-            base = d.name.rsplit("-v", 1)[0]
+            # Logical base = the ID without the trailing version segment
+            # ([Dept]-[Type]-[Number]), so every version collapses to one node.
+            base = d.name.rsplit("-", 1)[0]
             v = int(d.version_number or 0)
             if base not in latest or v > int(latest[base].version_number or 0):
                 latest[base] = d

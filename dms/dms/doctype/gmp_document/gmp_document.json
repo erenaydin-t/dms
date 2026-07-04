@@ -181,7 +181,7 @@
    "fieldname": "version_number",
    "fieldtype": "Int",
    "label": "Version Number",
-   "default": "0",
+   "default": "1",
    "read_only": 1,
    "in_list_view": 1
   },
@@ -267,13 +267,13 @@
    "fieldname": "section_change_control",
    "fieldtype": "Section Break",
    "label": "Change Control",
-   "depends_on": "eval:doc.version_number > 0 || doc.amended_from"
+   "depends_on": "eval:doc.amended_from"
   },
   {
    "fieldname": "reason_for_change",
    "fieldtype": "Small Text",
    "label": "Reason for Change",
-   "depends_on": "eval:doc.version_number > 0 || doc.amended_from",
+   "depends_on": "eval:doc.amended_from",
    "mandatory_depends_on": "eval:doc.amended_from"
   },
   {

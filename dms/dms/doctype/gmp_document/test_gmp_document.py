@@ -202,7 +202,7 @@ class TestGMPDocument(FrappeTestCase):
             "department": TEST_DEPT,
             "gmp_impact": "Major",
             "validity_period": "3 Years",
-            "version_number": 0,
+            "version_number": 1,
             # reviewer and qa_approver are mandatory; default to Administrator
             # so tests that don't exercise the workflow can still insert.
             "reviewer": "Administrator",
@@ -240,7 +240,7 @@ class TestGMPDocument(FrappeTestCase):
     def test_autoname_first_doc_in_pair(self):
         doc = self._build_doc(document_name_en="GMP-Test-First")
         doc.insert(ignore_permissions=True)
-        self.assertEqual(doc.name, f"SOP-{TEST_DEPT_ABBR}-01-v0")
+        self.assertEqual(doc.name, f"{TEST_DEPT_ABBR}-SOP-0001-1")
 
     def test_autoname_increments_per_type_dept_pair(self):
         d1 = self._build_doc(document_name_en="GMP-Test-Inc-1")
@@ -248,8 +248,8 @@ class TestGMPDocument(FrappeTestCase):
         d2 = self._build_doc(document_name_en="GMP-Test-Inc-2")
         d2.insert(ignore_permissions=True)
 
-        self.assertEqual(d1.name, f"SOP-{TEST_DEPT_ABBR}-01-v0")
-        self.assertEqual(d2.name, f"SOP-{TEST_DEPT_ABBR}-02-v0")
+        self.assertEqual(d1.name, f"{TEST_DEPT_ABBR}-SOP-0001-1")
+        self.assertEqual(d2.name, f"{TEST_DEPT_ABBR}-SOP-0002-1")
 
     def test_autoname_separate_increments_for_different_types(self):
         sop = self._build_doc(document_type="SOP", document_name_en="GMP-Test-SOP")
@@ -257,8 +257,8 @@ class TestGMPDocument(FrappeTestCase):
         wi = self._build_doc(document_type="WI", document_name_en="GMP-Test-WI")
         wi.insert(ignore_permissions=True)
 
-        self.assertEqual(sop.name, f"SOP-{TEST_DEPT_ABBR}-01-v0")
-        self.assertEqual(wi.name, f"WI-{TEST_DEPT_ABBR}-01-v0")
+        self.assertEqual(sop.name, f"{TEST_DEPT_ABBR}-SOP-0001-1")
+        self.assertEqual(wi.name, f"{TEST_DEPT_ABBR}-WI-0001-1")
 
     def test_autoname_amended_doc_keeps_base_id(self):
         original = self._build_doc(document_name_en="GMP-Test-Amend-Origin")
@@ -270,9 +270,9 @@ class TestGMPDocument(FrappeTestCase):
         amended.before_insert()
         amended.autoname()
 
-        base = original.name.rsplit("-v", 1)[0]
-        self.assertEqual(amended.name, f"{base}-v1")
-        self.assertEqual(amended.version_number, 1)
+        base = original.name.rsplit("-", 1)[0]
+        self.assertEqual(amended.name, f"{base}-2")
+        self.assertEqual(amended.version_number, 2)
 
     def test_autoname_throws_when_dept_missing_abbr(self):
         no_abbr_dept = "GMP-Test-NoAbbr Department"
@@ -309,7 +309,7 @@ class TestGMPDocument(FrappeTestCase):
 
         amended.before_insert()
 
-        self.assertEqual(amended.version_number, 1)
+        self.assertEqual(amended.version_number, 2)
         # An inherited file must be cleared so the user re-uploads a fresh one.
         self.assertIsNone(amended.attachment_file)
         self.assertIsNone(amended.file_integrity_hash)
@@ -330,7 +330,7 @@ class TestGMPDocument(FrappeTestCase):
 
         amended.before_insert()
 
-        self.assertEqual(amended.version_number, 1)
+        self.assertEqual(amended.version_number, 2)
         self.assertEqual(amended.attachment_file, fresh_url)
 
     # ------------------------------------------------------------------ #
@@ -604,8 +604,9 @@ class TestGMPDocument(FrappeTestCase):
 
     def test_amend_insert_produces_versioned_name(self):
         # The 'Default Naming' amend rule must let our autoname() run via the
-        # real insert path so the name becomes …-v1, not the framework's
-        # …-v0-1 counter. Hermetic: no submit/LibreOffice needed — the
+        # real insert path so the name becomes …-0001-2 (version segment bumped),
+        # not the framework's …-0001-1-1 counter. Hermetic: no submit/LibreOffice
+        # needed — the
         # predecessor is forced to a cancelled docstatus so it is amendable.
         from dms.install import _ensure_amend_naming_rule
 
@@ -624,10 +625,12 @@ class TestGMPDocument(FrappeTestCase):
         amended.attachment_file = self._dummy_attachment("GMP-Test-AmendName-V1").file_url
         amended.insert(ignore_permissions=True)
 
-        base = original.name.rsplit("-v", 1)[0]
-        self.assertEqual(amended.name, f"{base}-v1")
-        self.assertNotIn("-v0-1", amended.name)
-        self.assertEqual(amended.version_number, 1)
+        base = original.name.rsplit("-", 1)[0]
+        self.assertEqual(amended.name, f"{base}-2")
+        # The framework's default amend counter would append to the full source
+        # name (…-0001-1-1); our autoname must instead bump the version segment.
+        self.assertFalse(amended.name.startswith(original.name + "-"))
+        self.assertEqual(amended.version_number, 2)
 
     # ------------------------------------------------------------------ #
     #  Issue #2 — cancel transitions status to Obsolete                  #
@@ -727,7 +730,7 @@ class TestGMPDocument(FrappeTestCase):
         from dms.dms.doctype.gmp_document.gmp_document import get_document_reference_tree
 
         with self.assertRaises(frappe.DoesNotExistError):
-            get_document_reference_tree("SOP-NOPE-99-v0")
+            get_document_reference_tree("NOPE-SOP-9999-1")
 
     # ------------------------------------------------------------------ #
     #  Issue #1 — base PDF regenerates when the File record is missing   #
