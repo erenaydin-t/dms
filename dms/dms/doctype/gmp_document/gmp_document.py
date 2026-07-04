@@ -473,7 +473,7 @@ class GMPDocument(NestedSet):
         if not self.attachment_file.lower().endswith(ALLOWED_EXTENSIONS):
             frappe.throw(_("Only .docx, .xlsx, or .vsdx files are allowed for GMP Documents."))
 
-        controlled_url = f"/private/files/{self.name}{self._controlled_ext()}"
+        controlled_url = f"/private/files/{self._source_filename()}"
         if self.attachment_file == controlled_url:
             # Already this document's own controlled file (e.g. a re-save with no
             # new upload) — just keep the integrity hash current.
@@ -491,15 +491,17 @@ class GMPDocument(NestedSet):
         with open(src_path, "rb") as fh:
             content = fh.read()
 
-        # Promote the upload to this document's OWN controlled .docx. We copy the
+        # Promote the upload to this document's OWN pristine template. We copy the
         # bytes into a per-document physical file and own its File record rather
         # than renaming the uploaded file in place, because Frappe deduplicates
         # uploads by content hash: identical or derived uploads (e.g. each
         # version started from the same base file) are pointed at a single shared
         # physical file, and renaming / overwriting it then bleeds one document's
         # content into another document's render. Owning an independent file
-        # decouples this document from that sharing.
-        controlled = self._set_controlled_file(content)
+        # decouples this document from that sharing. This file is IMMUTABLE — the
+        # render writes its clean deliverable to a separate file so the pristine
+        # tagged template always remains available as the render source.
+        controlled = self._own_private_file(content, self._source_filename())
         self.attachment_file = controlled.file_url
         self.file_integrity_hash = _compute_sha256(controlled.get_full_path())
 
@@ -509,29 +511,40 @@ class GMPDocument(NestedSet):
         frappe.clear_document_cache(self.doctype, self.name)
 
     def _controlled_ext(self):
-        """Extension of this document's controlled source file, derived from the
-        current attachment. One of ALLOWED_EXTENSIONS; defaults to .docx. Stable
-        across saves because attachment_file is repointed at the controlled file
-        (which carries the same extension) after promotion."""
+        """Extension of this document's source template, derived from the current
+        attachment. One of ALLOWED_EXTENSIONS; defaults to .docx. Stable across
+        saves because attachment_file stays pointed at the immutable pristine
+        template (which carries the same extension)."""
         src = (self.attachment_file or "").lower()
         for ext in ALLOWED_EXTENSIONS:
             if src.endswith(ext):
                 return ext
         return ".docx"
 
-    def _set_controlled_file(self, content):
-        """Persist ``content`` as this document's controlled source file (in its
-        native format — .docx/.xlsx/.vsdx) in a physical file owned solely by
-        this document, with a File record whose ``content_hash`` is kept in sync.
-        Returns the File doc.
+    def _source_filename(self):
+        """Filename of the immutable pristine template (the render source). This
+        is what ``attachment_file`` points to; it is never overwritten by a
+        render, so re-renders (cancel, expiry, regenerate) stay idempotent."""
+        return f"{self.name}{self._controlled_ext()}"
+
+    def _deliverable_filename(self):
+        """Filename of the CLEAN rendered deliverable (tags populated, no images)
+        stored as a separate file so the pristine source survives. Downloaded by
+        managers via download_word_document; regenerated on every render."""
+        return f"{self.name}-controlled{self._controlled_ext()}"
+
+    def _own_private_file(self, content, filename):
+        """Persist ``content`` to /private/files/<filename> in a physical file
+        owned solely by this document, with a File record whose ``content_hash``
+        is kept in sync. Returns the File doc.
 
         Deliberately bypasses Frappe's content-hash deduplication (it writes the
         file directly and inserts/updates the File row without going through
         File.save): dedup can otherwise point several documents at one physical
-        file which — combined with the in-place clean-render overwrite that left
+        file which — combined with an in-place overwrite that left
         File.content_hash stale — caused one document's PDF to contain another
         document's content."""
-        fname = f"{self.name}{self._controlled_ext()}"
+        fname = filename
         url = f"/private/files/{fname}"
         path = get_files_path(fname, is_private=1)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -645,12 +658,15 @@ class GMPDocument(NestedSet):
         self._persist_render_artifacts(clean_bytes, pdf_bytes)
 
     def _persist_render_artifacts(self, clean_bytes, pdf_bytes):
-        """Common tail for every format: store the clean deliverable as the
-        controlled source file (hash in sync) and replace the signed base PDF."""
-        # Replace the controlled source file with the clean render. Routed
-        # through _set_controlled_file so the File's content_hash is updated too —
-        # an in-place overwrite would leave it stale and poison Frappe's dedup.
-        self._set_controlled_file(clean_bytes)
+        """Common tail for every format: store the clean deliverable as its OWN
+        file (leaving the pristine source template untouched) and replace the
+        signed base PDF.
+
+        Critically, this does NOT overwrite ``attachment_file`` / the source
+        template — that immutability is what lets cancel, expiry and download-time
+        regeneration re-render from a still-tagged template. The clean deliverable
+        lives at ``_deliverable_filename()`` and is served by download_word_document."""
+        self._own_private_file(clean_bytes, self._deliverable_filename())
 
         # SHA-256 reflects the deliverable (clean) bytes, not the signed PDF.
         self.db_set(
@@ -823,11 +839,14 @@ class GMPDocument(NestedSet):
             return fh.read(), pdf_bytes
 
     def _resolve_render_source(self):
-        """Return (source_docx_path, field_mappings) for the render.
+        """Return (source_template_path, field_mappings) for the render.
 
-        The render source is always the user's uploaded .docx; the linked Word
-        Template contributes only its tag mappings (custom_tag -> system_field).
-        word_template is mandatory, so mappings are always read from it."""
+        The render source is the immutable pristine template that
+        ``attachment_file`` points to (never overwritten by a render), so every
+        re-render still sees the ``{{ tags }}`` needed to place text, signatures
+        and the QA stamp. The linked Word Template contributes only its tag
+        mappings (custom_tag -> system_field); it is mandatory, so mappings are
+        always read from it."""
         template = frappe.get_doc("GMP Word Template", self.word_template)
         mappings = list(template.field_mappings or [])
         file_doc = self._get_file_doc(self.attachment_file)
@@ -1373,6 +1392,56 @@ def _resolve_base_pdf_path(doc):
     return path
 
 
+def _resolve_deliverable_path(doc):
+    """Return the on-disk path of the clean rendered deliverable (the downloadable
+    Word/Excel/Visio file), regenerating from the pristine template if the File
+    record or the physical file is missing. Lookup is by the deterministic
+    deliverable filename attached to the document."""
+    fname = doc._deliverable_filename()
+
+    def _find_on_disk():
+        for f in frappe.get_all(
+            "File",
+            filters={
+                "attached_to_doctype": doc.doctype,
+                "attached_to_name": doc.name,
+                "file_name": fname,
+            },
+            fields=["name"],
+        ):
+            path = frappe.get_doc("File", f.name).get_full_path()
+            if os.path.exists(path):
+                return path
+        return None
+
+    path = _find_on_disk()
+    if path:
+        return path
+
+    # Missing deliverable — regenerate from the pristine template. Regeneration
+    # mutates the document and rewrites File records, so restrict it to managers.
+    if not _is_unrestricted(frappe.session.user):
+        frappe.throw(
+            _(
+                "The controlled document file for {0} is temporarily unavailable. "
+                "Please ask a DMS/QA manager to regenerate it."
+            ).format(doc.name)
+        )
+    if not doc.attachment_file:
+        frappe.throw(
+            _(
+                "The deliverable for {0} is unavailable and cannot be regenerated: "
+                "the source template is missing."
+            ).format(doc.name)
+        )
+    doc._render_and_generate_pdf()
+
+    path = _find_on_disk()
+    if not path:
+        frappe.throw(_("The deliverable for {0} could not be generated.").format(doc.name))
+    return path
+
+
 # ---------------------------------------------------------------------- #
 #  Workflow                                                              #
 # ---------------------------------------------------------------------- #
@@ -1678,30 +1747,29 @@ def get_dms_tree_children(parent=None):
 
 @frappe.whitelist()
 def download_word_document(docname):
-    """Stream the clean .docx (text fields rendered, no signatures).
+    """Stream the clean rendered deliverable (text fields rendered, no signatures
+    or QA stamp) in its native format (.docx/.xlsx/.vsdx).
 
-    The signed PDF lives at /api/method/...download_watermarked_pdf;
-    this endpoint serves the Word counterpart that GMP audits can store
-    without exposing actor signatures."""
+    This is the CLEAN deliverable file, kept separate from the immutable pristine
+    template at ``attachment_file`` — so it never exposes the raw ``{{ tags }}``.
+    The signed PDF lives at /api/method/...download_watermarked_pdf; this endpoint
+    serves the editable counterpart that GMP audits can store without exposing
+    actor signatures."""
     doc = frappe.get_doc("GMP Document", docname)
     doc.check_permission("read")
 
-    # The clean Word file is a manager-only control-distribution artifact;
+    # The clean deliverable is a manager-only control-distribution artifact;
     # department members are limited to the watermarked controlled-copy PDF.
     if not _is_unrestricted(frappe.session.user):
         frappe.throw(
-            _("Only DMS/QA managers may download the Word file. Use 'Download PDF (Controlled Copy)' instead."),
+            _("Only DMS/QA managers may download the source document file. Use 'Download PDF (Controlled Copy)' instead."),
             frappe.PermissionError,
         )
 
     if not doc.attachment_file:
-        frappe.throw(_("No Word file is attached to {0}.").format(docname))
+        frappe.throw(_("No template is attached to {0}.").format(docname))
 
-    file_doc = doc._get_file_doc(doc.attachment_file)
-    physical_path = file_doc.get_full_path()
-    if not os.path.exists(physical_path):
-        frappe.throw(_("Word file is missing on disk."))
-
+    physical_path = _resolve_deliverable_path(doc)
     with open(physical_path, "rb") as fh:
         content = fh.read()
 
