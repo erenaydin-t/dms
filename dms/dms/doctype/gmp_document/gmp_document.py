@@ -41,8 +41,14 @@ UNRESTRICTED_ROLES = frozenset({"System Manager", "QA Manager", "DMS Manager"})
 MAX_REFERENCE_TREE_DEPTH = 10
 
 VALIDITY_YEARS_MAP = {"2 Years": 2, "3 Years": 3, "5 Years": 5}
-ALLOWED_EXTENSIONS = (".docx",)
+ALLOWED_EXTENSIONS = (".docx", ".xlsx", ".vsdx")
 SIGNATURE_WIDTH_MM = 40  # rendered signature width in PDF
+
+# Visio cannot embed the QA stamp in-package reliably (libvisio does not
+# rasterise ForeignData bitmaps on PDF export), so the stamp is overlaid on the
+# converted PDF at these coordinates. Points, bottom-left origin, Letter page
+# (612x792). Tune on the server once the real template layout is fixed.
+VSDX_STAMP_PLACEMENT = {"page": 0, "x": 430, "y": 70, "width": 130}
 # python-docx/InlineImage embeds these raster formats reliably. PNG is
 # preferred (transparency); JPG/JPEG accepted because HR uploads vary.
 ALLOWED_SIGNATURE_EXTENSIONS = (".png", ".jpg", ".jpeg")
@@ -352,7 +358,7 @@ class GMPDocument(NestedSet):
         if not self.word_template:
             frappe.throw(_("A Word Template must be selected before submitting."))
         if not self.attachment_file:
-            frappe.throw(_("A .docx attachment is required before submitting."))
+            frappe.throw(_("A .docx, .xlsx, or .vsdx attachment is required before submitting."))
 
         # Stamp the approver *before* the PDF render so the approver's signature
         # is resolved and embedded. on_submit fires only on the QA-approval
@@ -465,9 +471,9 @@ class GMPDocument(NestedSet):
                 previous_url = previous.attachment_file
 
         if not self.attachment_file.lower().endswith(ALLOWED_EXTENSIONS):
-            frappe.throw(_("Only .docx files are allowed for GMP Documents."))
+            frappe.throw(_("Only .docx, .xlsx, or .vsdx files are allowed for GMP Documents."))
 
-        controlled_url = f"/private/files/{self.name}.docx"
+        controlled_url = f"/private/files/{self.name}{self._controlled_ext()}"
         if self.attachment_file == controlled_url:
             # Already this document's own controlled file (e.g. a re-save with no
             # new upload) — just keep the integrity hash current.
@@ -502,10 +508,22 @@ class GMPDocument(NestedSet):
         )
         frappe.clear_document_cache(self.doctype, self.name)
 
+    def _controlled_ext(self):
+        """Extension of this document's controlled source file, derived from the
+        current attachment. One of ALLOWED_EXTENSIONS; defaults to .docx. Stable
+        across saves because attachment_file is repointed at the controlled file
+        (which carries the same extension) after promotion."""
+        src = (self.attachment_file or "").lower()
+        for ext in ALLOWED_EXTENSIONS:
+            if src.endswith(ext):
+                return ext
+        return ".docx"
+
     def _set_controlled_file(self, content):
-        """Persist ``content`` as this document's controlled .docx in a physical
-        file owned solely by this document, with a File record whose
-        ``content_hash`` is kept in sync. Returns the File doc.
+        """Persist ``content`` as this document's controlled source file (in its
+        native format — .docx/.xlsx/.vsdx) in a physical file owned solely by
+        this document, with a File record whose ``content_hash`` is kept in sync.
+        Returns the File doc.
 
         Deliberately bypasses Frappe's content-hash deduplication (it writes the
         file directly and inserts/updates the File row without going through
@@ -513,7 +531,7 @@ class GMPDocument(NestedSet):
         file which — combined with the in-place clean-render overwrite that left
         File.content_hash stale — caused one document's PDF to contain another
         document's content."""
-        fname = f"{self.name}.docx"
+        fname = f"{self.name}{self._controlled_ext()}"
         url = f"/private/files/{fname}"
         path = get_files_path(fname, is_private=1)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -567,23 +585,25 @@ class GMPDocument(NestedSet):
 
     def _purge_superseded_attachments(self, keep, previous_url, also_remove=None):
         """Delete File rows left behind by an attachment change — the original
-        upload, the previous controlled file, and any other .docx attached to
-        this document — keeping only the File we just promoted. Frappe guards the
-        physical delete when another File row references the same path, so a
-        shared (deduplicated) upload never removes another document's bytes."""
+        upload, the previous controlled file, and any other source-format file
+        (.docx/.xlsx/.vsdx) attached to this document — keeping only the File we
+        just promoted. The generated base PDF is deliberately excluded (only
+        ALLOWED_EXTENSIONS match), so a re-upload never deletes the signed PDF.
+        Frappe guards the physical delete when another File row references the
+        same path, so a shared (deduplicated) upload never removes another
+        document's bytes."""
         stale = set(also_remove or [])
         if previous_url:
             stale.update(frappe.get_all("File", filters={"file_url": previous_url}, pluck="name"))
+        attached = frappe.get_all(
+            "File",
+            filters={"attached_to_doctype": self.doctype, "attached_to_name": self.name},
+            fields=["name", "file_name"],
+        )
         stale.update(
-            frappe.get_all(
-                "File",
-                filters={
-                    "attached_to_doctype": self.doctype,
-                    "attached_to_name": self.name,
-                    "file_name": ["like", "%.docx"],
-                },
-                pluck="name",
-            )
+            row.name
+            for row in attached
+            if (row.file_name or "").lower().endswith(ALLOWED_EXTENSIONS)
         )
         stale.discard(keep)
         for name in stale:
@@ -592,18 +612,15 @@ class GMPDocument(NestedSet):
             frappe.delete_doc("File", name, force=True, ignore_permissions=True)
 
     def _render_and_generate_pdf(self):
-        """Two-pass render from a single pristine source template:
+        """Render the controlled source file and the signed base PDF from the
+        uploaded template, dispatching by file format.
 
-        1. Clean render — every {{ field }} populated, every signature
-           placeholder rendered as empty string. Becomes the canonical
-           Word file users download (no signatures embedded).
-        2. With-signatures render — same fields, plus inline PNG images at
-           every signature placeholder. Used only as the source for the
-           DOCX→PDF conversion; the intermediate file is then discarded.
+        Every format produces the same two artefacts:
 
-        Result: the persisted base PDF carries the signatures, the saved
-        .docx does not. Watermarking still happens on-demand at download
-        time on top of the signed base PDF.
+        1. A CLEAN deliverable in the native format (.docx/.xlsx/.vsdx) with all
+           text tags populated but NO images embedded — what managers download.
+        2. A signed base PDF that additionally carries the signature images and
+           the QA status stamp.
 
         The render source is the user's uploaded attachment; the linked Word
         Template supplies only the custom-tag -> system-field mappings applied
@@ -611,83 +628,37 @@ class GMPDocument(NestedSet):
         """
         source_path, field_mappings = self._resolve_render_source()
 
-        if not source_path.lower().endswith(ALLOWED_EXTENSIONS):
-            frappe.throw(_("Render source must be a .docx file."))
+        ext = os.path.splitext(source_path)[1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            frappe.throw(_("Render source must be a .docx, .xlsx, or .vsdx file."))
 
-        soffice = shutil.which("soffice") or shutil.which("libreoffice")
-        if not soffice:
-            frappe.throw(_("LibreOffice (soffice) is not installed on the server. Cannot generate PDF."))
+        soffice = self._soffice_binary()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # 1. Clean render — deliverable Word file
-            clean_path = os.path.join(tmpdir, f"{self.name}.docx")
-            try:
-                clean_template = DocxTemplate(source_path)
-                clean_template.render(self._build_template_context(field_mappings=field_mappings))
-                clean_template.save(clean_path)
-            except Exception:
-                frappe.log_error(
-                    frappe.get_traceback(),
-                    "GMP Document: Word template render (clean) failed",
-                )
-                frappe.throw(_("Failed to render Word template. Check Error Log for details."))
+            if ext == ".docx":
+                clean_bytes, pdf_bytes = self._render_docx(source_path, field_mappings, soffice, tmpdir)
+            elif ext == ".xlsx":
+                clean_bytes, pdf_bytes = self._render_xlsx(source_path, field_mappings, soffice, tmpdir)
+            else:  # .vsdx
+                clean_bytes, pdf_bytes = self._render_vsdx(source_path, field_mappings, soffice, tmpdir)
 
-            # 2. With-signatures render — source for PDF
-            sig_path = os.path.join(tmpdir, f"{self.name}-with-signatures.docx")
-            try:
-                sig_template = DocxTemplate(source_path)
-                sig_context = self._build_template_context(
-                    template_for_images=sig_template, field_mappings=field_mappings
-                )
-                sig_template.render(sig_context)
-                sig_template.save(sig_path)
-            except Exception:
-                frappe.log_error(
-                    frappe.get_traceback(),
-                    "GMP Document: Word template render (with signatures) failed",
-                )
-                frappe.throw(_("Failed to render Word template with signatures. Check Error Log."))
+        self._persist_render_artifacts(clean_bytes, pdf_bytes)
 
-            # 3. DOCX → PDF (with signatures)
-            try:
-                subprocess.run(
-                    [soffice, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, sig_path],
-                    capture_output=True,
-                    timeout=180,
-                    check=True,
-                )
-            except subprocess.TimeoutExpired:
-                frappe.throw(_("PDF conversion timed out."))
-            except subprocess.CalledProcessError as exc:
-                frappe.log_error(
-                    title="GMP Document: DOCX to PDF conversion failed",
-                    message=(exc.stderr or b"").decode("utf-8", errors="ignore"),
-                )
-                frappe.throw(_("PDF conversion failed. Check Error Log for details."))
-
-            generated_pdf = os.path.join(tmpdir, f"{self.name}-with-signatures.pdf")
-            if not os.path.exists(generated_pdf):
-                frappe.throw(_("PDF was not generated by LibreOffice."))
-
-            with open(generated_pdf, "rb") as fh:
-                pdf_bytes = fh.read()
-            with open(clean_path, "rb") as fh:
-                clean_bytes = fh.read()
-
-        # 4. Replace the controlled .docx with the clean render (the deliverable
-        # Word file). Routed through _set_controlled_file so the File's
-        # content_hash is updated too — an in-place overwrite would leave it
-        # stale and poison Frappe's dedup for later uploads.
+    def _persist_render_artifacts(self, clean_bytes, pdf_bytes):
+        """Common tail for every format: store the clean deliverable as the
+        controlled source file (hash in sync) and replace the signed base PDF."""
+        # Replace the controlled source file with the clean render. Routed
+        # through _set_controlled_file so the File's content_hash is updated too —
+        # an in-place overwrite would leave it stale and poison Frappe's dedup.
         self._set_controlled_file(clean_bytes)
 
-        # 5. SHA-256 reflects the deliverable (clean) bytes, not the signed PDF.
+        # SHA-256 reflects the deliverable (clean) bytes, not the signed PDF.
         self.db_set(
             "file_integrity_hash",
             hashlib.sha256(clean_bytes).hexdigest(),
             update_modified=False,
         )
 
-        # 6. Persist the signed PDF (replacing any prior copy).
         base_pdf_filename = f"{self.name}.pdf"
         for old in frappe.get_all(
             "File",
@@ -707,6 +678,149 @@ class GMPDocument(NestedSet):
             dn=self.name,
             is_private=1,
         )
+
+    def _soffice_binary(self):
+        soffice = shutil.which("soffice") or shutil.which("libreoffice")
+        if not soffice:
+            frappe.throw(_("LibreOffice (soffice) is not installed on the server. Cannot generate PDF."))
+        return soffice
+
+    def _convert_to_pdf(self, soffice, src_path, tmpdir):
+        """Convert ``src_path`` to PDF via LibreOffice into ``tmpdir`` and return
+        the PDF bytes. Shared by every format's render pipeline."""
+        try:
+            subprocess.run(
+                [soffice, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, src_path],
+                capture_output=True,
+                timeout=180,
+                check=True,
+            )
+        except subprocess.TimeoutExpired:
+            frappe.throw(_("PDF conversion timed out."))
+        except subprocess.CalledProcessError as exc:
+            frappe.log_error(
+                title="GMP Document: PDF conversion failed",
+                message=(exc.stderr or b"").decode("utf-8", errors="ignore"),
+            )
+            frappe.throw(_("PDF conversion failed. Check Error Log for details."))
+
+        stem = os.path.splitext(os.path.basename(src_path))[0]
+        generated_pdf = os.path.join(tmpdir, f"{stem}.pdf")
+        if not os.path.exists(generated_pdf):
+            frappe.throw(_("PDF was not generated by LibreOffice."))
+        with open(generated_pdf, "rb") as fh:
+            return fh.read()
+
+    def _resolve_render_images(self, field_mappings=None):
+        """Map of ``{tag: absolute_png_path}`` for the image placeholders, from
+        current state — the QA status stamp plus the three signatures. Mirrors
+        the actor-then-assigned signature resolution used by the .docx image
+        pass. User-defined aliases (custom_tag -> an image system_field) are
+        propagated so an aliased image tag resolves in xlsx/vsdx too."""
+        images = {}
+        stamp = self._resolve_stamp_path()
+        if stamp:
+            images["qa_stamp"] = stamp
+        for tag, actor, assigned in (
+            ("preparer_signature", self.prepared_by, self.prepared_by),
+            ("reviewer_signature", self.reviewed_by, self.reviewer),
+            ("qa_signature", self.approved_by, self.qa_approver),
+        ):
+            path = _resolve_signature_path(actor) or _resolve_signature_path(assigned)
+            if path:
+                images[tag] = path
+        for row in (field_mappings or []):
+            alias = (row.custom_tag or "").strip()
+            if alias and row.system_field in images:
+                images[alias] = images[row.system_field]
+        return images
+
+    def _render_docx(self, source_path, field_mappings, soffice, tmpdir):
+        """DOCX: two docxtpl passes (clean deliverable + with-images source)."""
+        clean_path = os.path.join(tmpdir, f"{self.name}.docx")
+        try:
+            clean_template = DocxTemplate(source_path)
+            clean_template.render(self._build_template_context(field_mappings=field_mappings))
+            clean_template.save(clean_path)
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                "GMP Document: Word template render (clean) failed",
+            )
+            frappe.throw(_("Failed to render Word template. Check Error Log for details."))
+
+        sig_path = os.path.join(tmpdir, f"{self.name}-with-signatures.docx")
+        try:
+            sig_template = DocxTemplate(source_path)
+            sig_context = self._build_template_context(
+                template_for_images=sig_template, field_mappings=field_mappings
+            )
+            sig_template.render(sig_context)
+            sig_template.save(sig_path)
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                "GMP Document: Word template render (with signatures) failed",
+            )
+            frappe.throw(_("Failed to render Word template with signatures. Check Error Log."))
+
+        pdf_bytes = self._convert_to_pdf(soffice, sig_path, tmpdir)
+        with open(clean_path, "rb") as fh:
+            return fh.read(), pdf_bytes
+
+    def _render_xlsx(self, source_path, field_mappings, soffice, tmpdir):
+        """XLSX: openpyxl renders text tags per cell; images are anchored as real
+        pictures in the PDF-source pass. Calc rasterises anchored images on PDF
+        export, so the stamp/signatures need no post-overlay."""
+        from .format_renderers import render_xlsx
+
+        text_context = self._build_template_context(field_mappings=field_mappings)
+        clean_path = os.path.join(tmpdir, f"{self.name}.xlsx")
+        img_path = os.path.join(tmpdir, f"{self.name}-with-images.xlsx")
+        try:
+            render_xlsx(source_path, clean_path, text_context, images={})
+            render_xlsx(
+                source_path, img_path, text_context,
+                images=self._resolve_render_images(field_mappings),
+            )
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "GMP Document: Excel render failed")
+            frappe.throw(_("Failed to render Excel template. Check Error Log for details."))
+
+        pdf_bytes = self._convert_to_pdf(soffice, img_path, tmpdir)
+        with open(clean_path, "rb") as fh:
+            return fh.read(), pdf_bytes
+
+    def _render_vsdx(self, source_path, field_mappings, soffice, tmpdir):
+        """VSDX: render text tags in the page XML (no in-package image embedding);
+        the QA stamp is overlaid onto the converted PDF. The single text render
+        is both the deliverable and the PDF source since no images are baked in."""
+        from .format_renderers import render_vsdx, stamp_pdf
+
+        text_context = self._build_template_context(field_mappings=field_mappings)
+        clean_path = os.path.join(tmpdir, f"{self.name}.vsdx")
+        try:
+            render_vsdx(source_path, clean_path, text_context)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "GMP Document: Visio render failed")
+            frappe.throw(_("Failed to render Visio template. Check Error Log for details."))
+
+        pdf_bytes = self._convert_to_pdf(soffice, clean_path, tmpdir)
+
+        stamp = self._resolve_stamp_path()
+        if stamp:
+            # Overlay failure must not sink the whole submit — log and ship the
+            # unstamped PDF; the stamp can be regenerated on the server.
+            try:
+                pdf_bytes = stamp_pdf(pdf_bytes, [{**VSDX_STAMP_PLACEMENT, "image": stamp}])
+            except Exception:
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    "GMP Document: Visio PDF stamp overlay failed",
+                )
+
+        with open(clean_path, "rb") as fh:
+            return fh.read(), pdf_bytes
 
     def _resolve_render_source(self):
         """Return (source_docx_path, field_mappings) for the render.
@@ -1591,7 +1705,7 @@ def download_word_document(docname):
     with open(physical_path, "rb") as fh:
         content = fh.read()
 
-    frappe.local.response.filename = f"{docname}.docx"
+    frappe.local.response.filename = f"{docname}{doc._controlled_ext()}"
     frappe.local.response.filecontent = content
     frappe.local.response.type = "download"
 
