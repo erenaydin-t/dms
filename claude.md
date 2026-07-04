@@ -27,7 +27,7 @@ Core Fields:
 - `reason_for_change` (Small Text, Mandatory ONLY if `amended_from` is not empty)
 - `attachment_file` (Attach)
 - `file_md5_hash` (Data, Read Only)
-- `version_number` (Int, Default: 0)
+- `version_number` (Int, Default: 1)
 - `is_active` (Check, Default: 1)
 - `requires_training` (Check, Default: 0)
 </database_schema>
@@ -36,7 +36,10 @@ Core Fields:
 You must implement the following server-side logic in `gmp_document.py`:
 
 1.  **Autonaming (`autoname`):**
-    Name format: `[document_type]-[department_abbr]-[auto_increment]-v[version_number]`.
+    Strict name format: `[department_abbr]-[form_type]-[document_number]-[version]`, e.g. `PR-FRM-0001-1`.
+    - Exactly four dash-separated segments — no prefixes, suffixes, spaces, or extra characters (no `v` before the version).
+    - `document_number` is zero-padded to 4 digits (`0001`) and increments per department+form-type pair; amended versions share their predecessor's number.
+    - `version` starts at 1 (never 0); on amendment the logical base (`[dept]-[type]-[number]`) is retained and only the version segment is bumped.
     *(Note: Fetch the department abbreviation from the Department DocType, assume a custom field `custom_abbr` exists).*
 
 2.  **Date Calculations (`before_save`):**
