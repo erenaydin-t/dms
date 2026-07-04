@@ -47,6 +47,20 @@ SIGNATURE_WIDTH_MM = 40  # rendered signature width in PDF
 # preferred (transparency); JPG/JPEG accepted because HR uploads vary.
 ALLOWED_SIGNATURE_EXTENSIONS = (".png", ".jpg", ".jpeg")
 
+# QA status stamps baked into the signed base PDF at the {{ qa_stamp }}
+# placeholder (same InlineImage mechanism as signatures). The approved stamp is
+# embedded when the document is active & QA-approved; the rejected stamp when it
+# becomes obsolete (cancelled or auto-expired). Assets ship inside the app
+# package so they resolve on any host.
+STAMP_WIDTH_MM = 45  # rendered QA-stamp width in PDF
+STAMP_APPROVED = "qaapproved.png"
+STAMP_REJECTED = "qarejected.png"
+
+
+def _stamp_asset_path(filename):
+    """Absolute path to a packaged QA stamp image (dms/stamps/<filename>)."""
+    return frappe.get_app_path("dms", "stamps", filename)
+
 
 def document_type_label(code):
     """Human label for a GMP Document Type code (the link stores the code, which
@@ -96,6 +110,7 @@ TEMPLATE_FIELDS = [
     ("preparer_signature", "Preparer Signature (image)"),
     ("reviewer_signature", "Reviewer Signature (image)"),
     ("qa_signature", "QA Approver Signature (image)"),
+    ("qa_stamp", "QA Status Stamp (image)"),
 ]
 
 TEMPLATE_FIELD_KEYS = frozenset(key for key, _label in TEMPLATE_FIELDS)
@@ -395,6 +410,23 @@ class GMPDocument(NestedSet):
         # native workflow badge stops reading "Approved".
         self.db_set("is_active", 0, update_modified=False)
         self.db_set("workflow_status", WF_OBSOLETE, update_modified=False)
+
+        # Re-stamp the persisted base PDF with the QA-rejected stamp. is_active is
+        # now 0, so _resolve_stamp_path() selects the rejected asset (the stamp
+        # itself is embedded only in the PDF pass, never the clean .docx). The
+        # re-render also refreshes the deliverable .docx to reflect the now-
+        # obsolete status text, updating file_integrity_hash accordingly.
+        # Guarded + logged rather than throwing: a cancellation must complete
+        # even if LibreOffice is unavailable — the stamp can be regenerated
+        # later, but the document must not stay stuck.
+        if self.attachment_file:
+            try:
+                self._render_and_generate_pdf()
+            except Exception:
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    "GMP Document: QA-rejected re-stamp on cancel failed",
+                )
 
     def copy_attachments_from_amended_from(self):
         # GMP change control: a revised document must re-acquire its own
@@ -763,6 +795,8 @@ class GMPDocument(NestedSet):
             "preparer_signature": "",
             "reviewer_signature": "",
             "qa_signature": "",
+            # ----- QA status stamp (default: empty for clean DOCX) -----
+            "qa_stamp": "",
         }
 
         if template_for_images is not None:
@@ -789,6 +823,13 @@ class GMPDocument(NestedSet):
                     template_for_images, qa_path, width=Mm(SIGNATURE_WIDTH_MM)
                 )
 
+            # QA status stamp — approved while active, rejected once obsolete.
+            stamp_path = self._resolve_stamp_path()
+            if stamp_path:
+                context["qa_stamp"] = InlineImage(
+                    template_for_images, stamp_path, width=Mm(STAMP_WIDTH_MM)
+                )
+
         # Apply user-defined aliases last so a custom tag can mirror any
         # resolved system value — text fields, the *_name lookups above, or a
         # *_signature InlineImage (so {{ my_sig }} can map to a signature).
@@ -798,6 +839,30 @@ class GMPDocument(NestedSet):
                 context[tag] = context[row.system_field]
 
         return context
+
+    def _resolve_stamp_path(self):
+        """Absolute path to the QA status stamp for the current state, or None.
+
+        - Obsolete (cancelled or auto-expired -> is_active == 0): rejected stamp.
+        - Active & QA-approved (approved_by set): approved stamp.
+        - Otherwise (draft, not yet approved): no stamp.
+
+        Only ever consulted in the with-images render pass, so the clean
+        deliverable .docx stays stamp-free — the stamp lives only in the signed
+        base PDF, mirroring how signatures are handled."""
+        if not self.is_active:
+            path = _stamp_asset_path(STAMP_REJECTED)
+        elif self.approved_by:
+            path = _stamp_asset_path(STAMP_APPROVED)
+        else:
+            return None
+        if not os.path.exists(path):
+            frappe.log_error(
+                f"QA stamp asset missing: {path}",
+                "GMP Document: stamp asset not found",
+            )
+            return None
+        return path
 
     # ------------------------------------------------------------------ #
     #  Workflow side effects (driven by native apply_workflow)           #
@@ -1063,6 +1128,48 @@ def _resolve_signature_path(user_email):
         return None
 
     return physical_path
+
+
+# ---------------------------------------------------------------------- #
+#  Scheduled task                                                        #
+# ---------------------------------------------------------------------- #
+
+
+def expire_gmp_documents():
+    """Daily sweep: obsolete every active, QA-approved GMP Document whose
+    ``expiry_date`` has passed, and re-stamp its base PDF with the QA-rejected
+    stamp.
+
+    Expiry is NOT cancellation — docstatus stays 1 (the record remains an
+    official, submitted revision); only ``is_active`` flips to 0 and the
+    lifecycle status becomes Obsolete, which makes _resolve_stamp_path() select
+    the rejected asset on re-render. Each document is committed independently so
+    one failure (e.g. a stray missing attachment) cannot block the rest of the
+    sweep. Rows with a NULL expiry_date never match the ``<=`` filter, so
+    documents without a set expiry are left untouched."""
+    due = frappe.get_all(
+        "GMP Document",
+        filters={
+            "docstatus": 1,
+            "is_active": 1,
+            "expiry_date": ["<=", today()],
+        },
+        pluck="name",
+    )
+    for name in due:
+        try:
+            doc = frappe.get_doc("GMP Document", name)
+            doc.db_set("is_active", 0, update_modified=False)
+            doc.db_set("workflow_status", WF_OBSOLETE, update_modified=False)
+            if doc.attachment_file:
+                doc._render_and_generate_pdf()
+            frappe.db.commit()
+        except Exception:
+            frappe.db.rollback()
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"GMP Document: auto-expire failed for {name}",
+            )
 
 
 # ---------------------------------------------------------------------- #

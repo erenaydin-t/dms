@@ -65,14 +65,13 @@ has_permission = {
 # ------------------------------------------------------------------------- #
 #  Scheduled tasks                                                          #
 # ------------------------------------------------------------------------- #
-# Daily sweep that flags documents whose next_revision_date is reached.
-# Implementation is left as an extension point - wire a method in the
-# controller (e.g. `notify_documents_due_for_revision`) and uncomment.
-# scheduler_events = {
-#     "daily": [
-#         "dms.dms.doctype.gmp_document.gmp_document.notify_documents_due_for_revision",
-#     ],
-# }
+# Daily sweep that obsoletes documents past their expiry_date and re-stamps
+# their base PDF with the QA-rejected stamp. See expire_gmp_documents().
+scheduler_events = {
+    "daily": [
+        "dms.dms.doctype.gmp_document.gmp_document.expire_gmp_documents",
+    ],
+}
 
 # ------------------------------------------------------------------------- #
 #  Required apps                                                            #
