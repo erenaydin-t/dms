@@ -259,23 +259,29 @@ class GMPDocument(NestedSet):
         # file, so clear an attachment that was carried over from the
         # predecessor by the amend — but never one the user uploaded for this
         # revision. The distinction is made by File *ownership*, not URL string:
-        # Frappe deduplicates uploads by content hash, so a freshly attached
+        # Frappe deduplicates uploads by content hash, so a freshly uploaded
         # .docx can be handed the predecessor's file_url while being a distinct
-        # File attached to this new document. A string compare wrongly treated
-        # that as inherited and nulled it, so the mandatory check then failed
-        # with "Value missing for Attachment (.docx)". An inherited file is one
-        # whose File record is still attached to the predecessor.
-        inherited_attachment = bool(
-            self.attachment_file
-            and frappe.db.exists(
+        # File row (still unattached at before_insert). A plain url/exists check
+        # wrongly treated that as inherited and nulled it, so the mandatory
+        # check then failed with "Value missing for Attachment (.docx)".
+        #
+        # A genuine re-upload always creates its OWN File row (unattached here,
+        # or attached to this new doc), whereas amend-copy creates none — the
+        # only File(s) carrying the url stay attached to the predecessor. So the
+        # attachment is inherited iff a File with this url exists AND every File
+        # with it is attached to the predecessor.
+        inherited_attachment = False
+        if self.attachment_file:
+            files = frappe.get_all(
                 "File",
-                {
-                    "file_url": self.attachment_file,
-                    "attached_to_doctype": self.doctype,
-                    "attached_to_name": self.amended_from,
-                },
+                filters={"file_url": self.attachment_file},
+                fields=["attached_to_doctype", "attached_to_name"],
             )
-        )
+            inherited_attachment = bool(files) and all(
+                f.attached_to_doctype == self.doctype
+                and f.attached_to_name == self.amended_from
+                for f in files
+            )
         if not self.attachment_file or inherited_attachment:
             self.attachment_file = None
             self.file_integrity_hash = None
