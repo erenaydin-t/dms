@@ -194,7 +194,7 @@ class GMPDocument(NestedSet):
         # 0-based. Deriving it from the chain keeps names collision-free and
         # always starting at 1 regardless of how version_number is numbered.
         if self.amended_from:
-            base_name, _, prev_seg = self.amended_from.rpartition("-")
+            base_name, _sep, prev_seg = self.amended_from.rpartition("-")
             try:
                 next_seg = int(prev_seg) + 1
             except ValueError:
