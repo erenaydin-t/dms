@@ -208,6 +208,13 @@ def _ensure_document_types():
             if frappe.db.get_value("GMP Document Type", code, "type_name") != type_name:
                 frappe.db.set_value("GMP Document Type", code, "type_name", type_name)
             continue
+        # type_name is a unique field. An earlier version of this seed may have
+        # created the same label under a different code (record name); inserting
+        # it again would raise IntegrityError(1062, "Duplicate entry … for key
+        # 'type_name'") and abort the whole migration. Skip when the label
+        # already exists so re-seeding stays idempotent.
+        if frappe.db.exists("GMP Document Type", {"type_name": type_name}):
+            continue
         frappe.get_doc({
             "doctype": "GMP Document Type",
             "code": code,

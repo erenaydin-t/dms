@@ -185,18 +185,22 @@ class GMPDocument(NestedSet):
                 )
             )
 
-        # Version numbering starts at 1 (never 0). before_insert enforces this on
-        # the model; the fallback keeps naming correct if autoname runs first.
-        version = self.version_number or 1
-
         # Strict ID structure: [Dept Abbr]-[Form Type]-[Number(4)]-[Version]
         #   e.g. PR-FRM-0001-1
         # No prefixes, suffixes, spaces or extra characters — exactly four
-        # dash-separated segments. On amendment, the logical ID (first three
-        # segments) is retained and only the trailing version segment changes.
+        # dash-separated segments. The trailing version segment reflects the
+        # document's POSITION in its amendment chain (first issue == 1), NOT the
+        # version_number field — which is human revision content and may be
+        # 0-based. Deriving it from the chain keeps names collision-free and
+        # always starting at 1 regardless of how version_number is numbered.
         if self.amended_from:
-            base_name = self.amended_from.rsplit("-", 1)[0]
-            self.name = f"{base_name}-{version}"
+            base_name, _, prev_seg = self.amended_from.rpartition("-")
+            try:
+                next_seg = int(prev_seg) + 1
+            except ValueError:
+                # Predecessor name is malformed; fall back to version_number.
+                next_seg = cint(self.version_number) + 1
+            self.name = f"{base_name}-{next_seg}"
             return
 
         # document_type links to GMP Document Type, whose record name *is* the
@@ -223,7 +227,8 @@ class GMPDocument(NestedSet):
                 continue
 
         next_inc = str(max_increment + 1).zfill(4)
-        self.name = f"{dept_abbr}-{type_code}-{next_inc}-{version}"
+        # A brand-new document is the first version of its chain: segment 1.
+        self.name = f"{dept_abbr}-{type_code}-{next_inc}-1"
 
     def before_insert(self):
         if not self.prepared_by:
@@ -232,10 +237,13 @@ class GMPDocument(NestedSet):
             self.workflow_status = WF_DRAFT
 
         if not self.amended_from:
-            # A brand-new document is ALWAYS version 1 — version numbering starts
-            # at 1, never 0. Forced here (not merely defaulted) so a stray client
-            # value cannot produce a v0 document.
-            self.version_number = 1
+            # version_number is the human *revision* number rendered into the
+            # document body — it is content, not identity. The name's trailing
+            # segment (see autoname) is what always starts at 1; version_number
+            # merely defaults to 1 for a brand-new document, while a 0-based
+            # revision scheme may set it explicitly (e.g. first issue == rev 0).
+            if self.version_number is None:
+                self.version_number = 1
             return
 
         predecessor = frappe.db.get_value(
@@ -918,7 +926,7 @@ class GMPDocument(NestedSet):
             "expiry_date": cstr(self.expiry_date) if self.expiry_date else "",
             "next_revision_date": cstr(self.next_revision_date) if self.next_revision_date else "",
             # ----- versioning -----
-            "version_number": self.version_number or 1,
+            "version_number": cint(self.version_number),
             "is_active": int(bool(self.is_active)),
             "requires_training": int(bool(self.requires_training)),
             # ----- change control -----
