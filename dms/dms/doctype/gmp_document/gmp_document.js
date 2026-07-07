@@ -92,6 +92,12 @@ function add_download_pdf_button(frm) {
         __("Get PDF")
     );
 
+    frm.add_custom_button(
+        __("Download PDF (Uncontrolled Copy)"),
+        () => download_watermarked_pdf(frm, "uncontrolled"),
+        __("Get PDF")
+    );
+
     const is_manager =
         frappe.user.has_role("DMS Manager") ||
         frappe.user.has_role("QA Manager") ||
@@ -160,7 +166,7 @@ async function download_word_document(frm) {
 }
 
 
-async function download_watermarked_pdf(frm) {
+async function download_watermarked_pdf(frm, variant) {
     if (frm.is_dirty()) {
         frappe.msgprint({
             title: __("Unsaved Changes"),
@@ -172,7 +178,10 @@ async function download_watermarked_pdf(frm) {
 
     const endpoint =
         "/api/method/dms.dms.doctype.gmp_document.gmp_document.download_watermarked_pdf";
-    const url = `${endpoint}?docname=${encodeURIComponent(frm.doc.name)}`;
+    let url = `${endpoint}?docname=${encodeURIComponent(frm.doc.name)}`;
+    if (variant) {
+        url += `&variant=${encodeURIComponent(variant)}`;
+    }
 
     frappe.dom.freeze(__("Generating watermarked PDF - please wait..."));
 

@@ -1339,12 +1339,20 @@ def expire_gmp_documents():
 
 
 @frappe.whitelist()
-def download_watermarked_pdf(docname):
-    """Stream the base PDF with a status-driven watermark.
+def download_watermarked_pdf(docname, variant=None):
+    """Stream the base PDF with a page-spanning watermark.
 
-    Watermark is resolved at call time so a status change (is_active,
-    docstatus) is reflected immediately without re-rendering the PDF. The
-    base PDF path is resolved dynamically and regenerated on demand if the
+    ``variant`` selects the copy type:
+
+    - ``None`` / ``"controlled"`` (default): the watermark is resolved from the
+      live document status (CONTROLLED COPY / OBSOLETE / DRAFT), so a status
+      change is reflected immediately without re-rendering the PDF.
+    - ``"uncontrolled"``: every page carries an ``UNCONTROLLED COPY`` watermark
+      regardless of status, plus a footer stamped with the Persian (Jalali)
+      date and time of generation. No extra page is added — the existing pages
+      are reused verbatim (Issue: uncontrolled reference prints).
+
+    The base PDF path is resolved dynamically and regenerated on demand if the
     File record or the on-disk file has gone missing (Issue #1)."""
     doc = frappe.get_doc("GMP Document", docname)
     doc.check_permission("read")
@@ -1358,8 +1366,18 @@ def download_watermarked_pdf(docname):
 
     base_pdf_path = _resolve_base_pdf_path(doc)
 
-    watermark_text = _resolve_watermark_text(doc)
-    watermarked = _apply_watermark(base_pdf_path, watermark_text)
+    footer_text = None
+    if variant == "uncontrolled":
+        watermark_text = "UNCONTROLLED COPY"
+        # 21 CFR Part 11: an uncontrolled reference print is only meaningful with
+        # a print timestamp. GMP sites in Iran expect the Jalali calendar.
+        footer_text = _("Uncontrolled copy — printed {0} (not subject to change control)").format(
+            _jalali_now_stamp()
+        )
+    else:
+        watermark_text = _resolve_watermark_text(doc)
+
+    watermarked = _apply_watermark(base_pdf_path, watermark_text, footer_text=footer_text)
 
     safe_label = watermark_text.replace(" ", "_")
     frappe.local.response.filename = f"{docname}-{safe_label}.pdf"
@@ -1885,7 +1903,46 @@ def _resolve_watermark_text(doc):
     return "DRAFT - NOT FOR USE"
 
 
-def _apply_watermark(pdf_path, watermark_text):
+def _gregorian_to_jalali(gy, gm, gd):
+    """Convert a Gregorian date to the Jalali (Solar Hijri) calendar.
+
+    Pure-python implementation of the standard `jdf` algorithm — avoids adding a
+    third-party calendar dependency for a single stamp. Returns (jy, jm, jd)."""
+    g_days_in_month = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    gy2 = gy + 1 if gm > 2 else gy
+    days = (
+        355666
+        + (365 * gy)
+        + ((gy2 + 3) // 4)
+        - ((gy2 + 99) // 100)
+        + ((gy2 + 399) // 400)
+        + gd
+        + g_days_in_month[gm - 1]
+    )
+    jy = -1595 + (33 * (days // 12053))
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        jm = 1 + (days // 31)
+        jd = 1 + (days % 31)
+    else:
+        jm = 7 + ((days - 186) // 30)
+        jd = 1 + ((days - 186) % 30)
+    return jy, jm, jd
+
+
+def _jalali_now_stamp():
+    """Current site-time as a Jalali `YYYY/MM/DD HH:MM:SS` stamp."""
+    now = now_datetime()
+    jy, jm, jd = _gregorian_to_jalali(now.year, now.month, now.day)
+    return f"{jy:04d}/{jm:02d}/{jd:02d} {now.hour:02d}:{now.minute:02d}:{now.second:02d}"
+
+
+def _apply_watermark(pdf_path, watermark_text, footer_text=None):
     from pypdf import PdfReader, PdfWriter
     from reportlab.lib.colors import Color
     from reportlab.pdfgen import canvas
@@ -1906,6 +1963,14 @@ def _apply_watermark(pdf_path, watermark_text):
         c.setFont("Helvetica-Bold", 80)
         c.drawCentredString(0, 0, watermark_text)
         c.restoreState()
+
+        if footer_text:
+            c.saveState()
+            c.setFillColor(Color(0.20, 0.20, 0.20, alpha=0.85))
+            c.setFont("Helvetica", 8)
+            c.drawCentredString(width / 2, 18, footer_text)
+            c.restoreState()
+
         c.save()
         overlay_buffer.seek(0)
 
