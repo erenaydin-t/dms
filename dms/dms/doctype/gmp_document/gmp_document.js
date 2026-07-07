@@ -98,6 +98,12 @@ function add_download_pdf_button(frm) {
         __("Get PDF")
     );
 
+    frm.add_custom_button(
+        __("Download PDF (Plain)"),
+        () => download_watermarked_pdf(frm, "plain"),
+        __("Get PDF")
+    );
+
     const is_manager =
         frappe.user.has_role("DMS Manager") ||
         frappe.user.has_role("QA Manager") ||

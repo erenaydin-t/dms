@@ -1338,48 +1338,75 @@ def expire_gmp_documents():
 # ---------------------------------------------------------------------- #
 
 
+PDF_VARIANTS = ("controlled", "uncontrolled", "plain")
+
+
 @frappe.whitelist()
 def download_watermarked_pdf(docname, variant=None):
     """Stream the base PDF with a page-spanning watermark.
 
-    ``variant`` selects the copy type:
+    ``variant`` selects the copy type (unknown values are rejected):
 
     - ``None`` / ``"controlled"`` (default): the watermark is resolved from the
       live document status (CONTROLLED COPY / OBSOLETE / DRAFT), so a status
       change is reflected immediately without re-rendering the PDF.
-    - ``"uncontrolled"``: every page carries an ``UNCONTROLLED COPY`` watermark
-      regardless of status, plus a footer stamped with the Persian (Jalali)
-      date and time of generation. No extra page is added — the existing pages
-      are reused verbatim (Issue: uncontrolled reference prints).
+    - ``"uncontrolled"``: every page carries an ``UNCONTROLLED COPY`` watermark,
+      plus a footer stamped with the Persian (Jalali) date and time of
+      generation. No extra page is added — the existing pages are reused
+      verbatim (Issue: uncontrolled reference prints).
+    - ``"plain"``: no watermark; only the Jalali print-timestamp footer.
+
+    An obsolete document (is_active == 0) is ALWAYS stamped OBSOLETE, whatever
+    variant was requested — a retired document must never leave the system
+    looking like a normal approved copy (GMP/data-integrity rule).
 
     The base PDF path is resolved dynamically and regenerated on demand if the
     File record or the on-disk file has gone missing (Issue #1)."""
     doc = frappe.get_doc("GMP Document", docname)
     doc.check_permission("read")
 
+    variant = (cstr(variant).strip().lower()) or "controlled"
+    if variant not in PDF_VARIANTS:
+        frappe.throw(
+            _("Unknown PDF variant {0}. Valid variants: {1}.").format(
+                frappe.bold(variant), ", ".join(PDF_VARIANTS)
+            )
+        )
+
     if doc.docstatus != 1:
         frappe.throw(
-            _("A controlled PDF is only available after {0} has been QA-approved (submitted).").format(
+            _("A PDF is only available after {0} has been QA-approved (submitted).").format(
                 docname
             )
         )
 
     base_pdf_path = _resolve_base_pdf_path(doc)
 
-    footer_text = None
     if variant == "uncontrolled":
         watermark_text = "UNCONTROLLED COPY"
-        # 21 CFR Part 11: an uncontrolled reference print is only meaningful with
-        # a print timestamp. GMP sites in Iran expect the Jalali calendar.
-        footer_text = _("Uncontrolled copy — printed {0} (not subject to change control)").format(
-            _jalali_now_stamp()
-        )
+    elif variant == "plain":
+        watermark_text = None
     else:
         watermark_text = _resolve_watermark_text(doc)
 
+    # Obsolete always wins: no variant may hide the retired status.
+    if not doc.is_active:
+        watermark_text = "OBSOLETE"
+
+    # 21 CFR Part 11: a reference print outside change control is only
+    # meaningful with a print timestamp. GMP sites in Iran expect the Jalali
+    # calendar. Deliberately NOT translated: the footer is drawn with
+    # reportlab's built-in Helvetica (WinAnsi-only), which cannot encode
+    # Persian script — a translated string would crash or render as boxes.
+    footer_text = None
+    if variant == "uncontrolled":
+        footer_text = f"Uncontrolled copy - printed {_jalali_now_stamp()} (Jalali) - not subject to change control"
+    elif variant == "plain":
+        footer_text = f"Printed {_jalali_now_stamp()} (Jalali)"
+
     watermarked = _apply_watermark(base_pdf_path, watermark_text, footer_text=footer_text)
 
-    safe_label = watermark_text.replace(" ", "_")
+    safe_label = (watermark_text or "PLAIN").replace(" ", "_")
     frappe.local.response.filename = f"{docname}-{safe_label}.pdf"
     frappe.local.response.filecontent = watermarked
     frappe.local.response.type = "download"
@@ -1943,6 +1970,10 @@ def _jalali_now_stamp():
 
 
 def _apply_watermark(pdf_path, watermark_text, footer_text=None):
+    """Merge a diagonal watermark and/or a footer line onto every page.
+
+    ``watermark_text=None`` skips the diagonal stamp (plain variant); both
+    strings must stay WinAnsi-encodable (built-in Helvetica)."""
     from pypdf import PdfReader, PdfWriter
     from reportlab.lib.colors import Color
     from reportlab.pdfgen import canvas
@@ -1956,13 +1987,14 @@ def _apply_watermark(pdf_path, watermark_text, footer_text=None):
 
         overlay_buffer = BytesIO()
         c = canvas.Canvas(overlay_buffer, pagesize=(width, height))
-        c.saveState()
-        c.translate(width / 2, height / 2)
-        c.rotate(45)
-        c.setFillColor(Color(0.85, 0.10, 0.10, alpha=0.30))
-        c.setFont("Helvetica-Bold", 80)
-        c.drawCentredString(0, 0, watermark_text)
-        c.restoreState()
+        if watermark_text:
+            c.saveState()
+            c.translate(width / 2, height / 2)
+            c.rotate(45)
+            c.setFillColor(Color(0.85, 0.10, 0.10, alpha=0.30))
+            c.setFont("Helvetica-Bold", 80)
+            c.drawCentredString(0, 0, watermark_text)
+            c.restoreState()
 
         if footer_text:
             c.saveState()
