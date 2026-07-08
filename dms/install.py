@@ -302,8 +302,16 @@ def _sync_gmp_workflow():
         })
         changed = True
 
-    # Re-assert conditions on rows that exist but drifted. Keyed by
-    # (state, action) — the same action may fan out from several states.
+    # Re-assert conditions, the allowed role and the self-approval flag on
+    # rows that exist but drifted. Keyed by (state, action) — the same action
+    # may fan out from several states.
+    #
+    # `allowed` drifts when a site admin RENAMES a role: rename_doc rewrites
+    # every link, so the transition suddenly requires e.g. a Persian-named
+    # role while the doctype permissions and code role-checks keep using the
+    # canonical English name that migrate re-creates — silently locking every
+    # real user out of the workflow. Re-asserting restores the canonical role
+    # (rename roles for display via Translation, not by renaming the Role).
     cond_by_key = {(tr["state"], tr["action"]): tr for tr in GMP_WORKFLOW_TRANSITIONS}
     for tr in wf.transitions:
         desired = cond_by_key.get((tr.state, tr.action))
@@ -311,6 +319,9 @@ def _sync_gmp_workflow():
             continue
         if tr.condition != desired["condition"]:
             tr.condition = desired["condition"]
+            changed = True
+        if tr.allowed != desired["allowed"]:
+            tr.allowed = desired["allowed"]
             changed = True
         want_self = desired.get("allow_self_approval", 1)
         if int(tr.allow_self_approval or 0) != want_self:
