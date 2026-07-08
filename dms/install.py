@@ -124,20 +124,25 @@ _REVISION_CANCEL = (
     'or frappe.session.user == "Administrator")'
 )
 
+# allow_self_approval=1 on every transition: without it Frappe blocks a user
+# from acting on a document they *own* (doc.owner == user) — which is the
+# NORMAL case here: the preparer both creates the draft and submits it for
+# review. The real per-actor control is the `condition` on each transition
+# (assigned preparer/reviewer/QA approver only), not the ownership check.
 GMP_WORKFLOW_TRANSITIONS = [
-    {"state": "Draft",               "action": "Submit for Review",          "next_state": "Under Review",        "allowed": "QA Manager", "condition": _PREPARER},
-    {"state": "Revision Requested",  "action": "Submit for Review",          "next_state": "Under Review",        "allowed": "QA Manager", "condition": _PREPARER},
-    {"state": "Under Review",        "action": "Approve as Reviewer",        "next_state": "Pending QA Approval", "allowed": "QA Manager", "condition": _REVIEWER},
-    {"state": "Under Review",        "action": "Request Revision (Reviewer)","next_state": "Revision Requested",  "allowed": "QA Manager", "condition": _REVIEWER},
-    {"state": "Pending QA Approval", "action": "Approve as QA",              "next_state": "Approved",            "allowed": "QA Manager", "condition": _QA},
-    {"state": "Pending QA Approval", "action": "Request Revision (QA)",      "next_state": "Under Review",        "allowed": "QA Manager", "condition": _QA},
+    {"state": "Draft",               "action": "Submit for Review",          "next_state": "Under Review",        "allowed": "QA Manager", "condition": _PREPARER, "allow_self_approval": 1},
+    {"state": "Revision Requested",  "action": "Submit for Review",          "next_state": "Under Review",        "allowed": "QA Manager", "condition": _PREPARER, "allow_self_approval": 1},
+    {"state": "Under Review",        "action": "Approve as Reviewer",        "next_state": "Pending QA Approval", "allowed": "QA Manager", "condition": _REVIEWER, "allow_self_approval": 1},
+    {"state": "Under Review",        "action": "Request Revision (Reviewer)","next_state": "Revision Requested",  "allowed": "QA Manager", "condition": _REVIEWER, "allow_self_approval": 1},
+    {"state": "Pending QA Approval", "action": "Approve as QA",              "next_state": "Approved",            "allowed": "QA Manager", "condition": _QA, "allow_self_approval": 1},
+    {"state": "Pending QA Approval", "action": "Request Revision (QA)",      "next_state": "Under Review",        "allowed": "QA Manager", "condition": _QA, "allow_self_approval": 1},
     # Abandon a draft revision at any pre-approval stage. Terminal: no
     # transition leaves Revision Cancelled, and the revised document remains
     # the effective version untouched.
-    {"state": "Draft",               "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL},
-    {"state": "Under Review",        "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL},
-    {"state": "Pending QA Approval", "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL},
-    {"state": "Revision Requested",  "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL},
+    {"state": "Draft",               "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
+    {"state": "Under Review",        "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
+    {"state": "Pending QA Approval", "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
+    {"state": "Revision Requested",  "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
 ]
 
 
@@ -293,16 +298,23 @@ def _sync_gmp_workflow():
             "next_state": tr["next_state"],
             "allowed": tr["allowed"],
             "condition": tr["condition"],
+            "allow_self_approval": tr.get("allow_self_approval", 1),
         })
         changed = True
 
     # Re-assert conditions on rows that exist but drifted. Keyed by
     # (state, action) — the same action may fan out from several states.
-    cond_by_key = {(tr["state"], tr["action"]): tr["condition"] for tr in GMP_WORKFLOW_TRANSITIONS}
+    cond_by_key = {(tr["state"], tr["action"]): tr for tr in GMP_WORKFLOW_TRANSITIONS}
     for tr in wf.transitions:
         desired = cond_by_key.get((tr.state, tr.action))
-        if desired and tr.condition != desired:
-            tr.condition = desired
+        if not desired:
+            continue
+        if tr.condition != desired["condition"]:
+            tr.condition = desired["condition"]
+            changed = True
+        want_self = desired.get("allow_self_approval", 1)
+        if int(tr.allow_self_approval or 0) != want_self:
+            tr.allow_self_approval = want_self
             changed = True
 
     # Re-assert allow_edit so existing installs pick up the DMS Manager
