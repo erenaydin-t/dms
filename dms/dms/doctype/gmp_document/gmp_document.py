@@ -421,6 +421,13 @@ class GMPDocument(NestedSet):
                 )
 
     def validate(self):
+        # Cancelling a revision must succeed from ANY pre-approval state —
+        # including a bare draft that has no attachment yet (create_revision
+        # deliberately strips the predecessor's file). The workflow save into
+        # the terminal state must not trip the mandatory attachment check.
+        if self.docstatus == 0 and self.workflow_status == WF_REVISION_CANCELLED and self.revision_of:
+            self.flags.ignore_mandatory = True
+
         if (self.amended_from or self.revision_of) and not (
             self.reason_for_change and self.reason_for_change.strip()
         ):
