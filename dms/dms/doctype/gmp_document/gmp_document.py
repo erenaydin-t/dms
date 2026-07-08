@@ -1686,6 +1686,13 @@ def create_revision(docname, reason_for_change):
     # and enforces the Approved+active predecessor and single-open-revision
     # guards. insert() runs with the caller's permissions, so the DocType
     # create permission (QA Manager) is enforced by Frappe itself.
+    #
+    # ignore_mandatory: change control deliberately strips the predecessor's
+    # controlled file, so the freshly created draft starts WITHOUT the
+    # mandatory attachment_file — the preparer uploads the revised file next.
+    # The gap is closed by the first workflow save (mandatory validation runs
+    # on Submit for Review) and again by on_submit.
+    revision.flags.ignore_mandatory = True
     revision.insert()
 
     source.add_comment(
