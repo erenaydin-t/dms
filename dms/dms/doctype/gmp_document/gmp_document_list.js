@@ -11,12 +11,36 @@ frappe.listview_settings['GMP Document'] = {
         'reviewer',
         'qa_approver',
         'prepared_by',
+        'effective_date',
     ],
 
     get_indicator: function (doc) {
         // Approved + active = green Controlled Copy
         if (doc.docstatus === 1 && doc.is_active) {
             return [__('Controlled'), 'green', 'docstatus,=,1|is_active,=,1'];
+        }
+        // QA-approved but not yet the effective version: scheduled with a
+        // future Effective Date (activated by the daily sweep on that date).
+        // Not date-gated — a due document stays "pending" until the sweep
+        // flips it, and must never read as Obsolete.
+        if (
+            doc.docstatus === 1 &&
+            doc.workflow_status === 'Approved' &&
+            !cint(doc.is_active)
+        ) {
+            return [
+                doc.effective_date
+                    ? __('Effective {0}', [frappe.datetime.str_to_user(doc.effective_date)])
+                    : __('Pending Effective'),
+                'orange',
+                'docstatus,=,1|is_active,=,0|workflow_status,=,Approved',
+            ];
+        }
+        // Abandoned draft revision, retained for audit. Checked before the
+        // generic inactive branch: these records also carry is_active=0 but
+        // were never an effective version, so 'Obsolete' would be misleading.
+        if (doc.workflow_status === 'Revision Cancelled') {
+            return [__('Revision Cancelled'), 'gray', 'workflow_status,=,Revision Cancelled'];
         }
         // Cancelled or inactive
         if (cint(doc.docstatus) === 2 || !cint(doc.is_active)) {

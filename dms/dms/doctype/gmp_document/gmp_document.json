@@ -27,6 +27,7 @@
   "reviewer",
   "qa_approver",
   "section_lifecycle",
+  "set_effective_date",
   "effective_date",
   "expiry_date",
   "column_break_life_1",
@@ -37,6 +38,7 @@
   "attachment_file",
   "file_integrity_hash",
   "section_change_control",
+  "revision_of",
   "reason_for_change",
   "section_review_history",
   "reviewed_by",
@@ -154,11 +156,21 @@
    "label": "Lifecycle"
   },
   {
+   "fieldname": "set_effective_date",
+   "fieldtype": "Check",
+   "label": "Edit Effective Date",
+   "default": "0",
+   "no_copy": 1,
+   "print_hide": 1,
+   "depends_on": "eval:doc.docstatus === 0 || doc.set_effective_date",
+   "description": "Like ERPNext's 'Edit Posting Date and Time': enables manual entry of the Effective Date. Leave off to let the system stamp it at QA approval."
+  },
+  {
    "fieldname": "effective_date",
    "fieldtype": "Date",
    "label": "Effective Date",
-   "read_only": 1,
-   "description": "Set automatically on first submit; do not edit manually."
+   "description": "Stamped with the QA-approval date by default. Tick 'Edit Effective Date' to schedule a future date or backdate (QA/DMS Manager only). A future-dated document stays pending — not the effective version — until the date arrives.",
+   "read_only_depends_on": "eval:!doc.set_effective_date"
   },
   {
    "fieldname": "expiry_date",
@@ -224,7 +236,7 @@
    "fieldname": "workflow_status",
    "fieldtype": "Select",
    "label": "Workflow Status",
-   "options": "Draft\nUnder Review\nPending QA Approval\nApproved\nRevision Requested\nObsolete",
+   "options": "Draft\nUnder Review\nPending QA Approval\nApproved\nRevision Requested\nRevision Cancelled\nObsolete",
    "default": "Draft",
    "read_only": 1,
    "in_list_view": 1,
@@ -267,14 +279,26 @@
    "fieldname": "section_change_control",
    "fieldtype": "Section Break",
    "label": "Change Control",
-   "depends_on": "eval:doc.amended_from"
+   "depends_on": "eval:doc.amended_from || doc.revision_of"
+  },
+  {
+   "fieldname": "revision_of",
+   "fieldtype": "Link",
+   "label": "Revision Of",
+   "options": "GMP Document",
+   "no_copy": 1,
+   "print_hide": 1,
+   "read_only": 1,
+   "search_index": 1,
+   "depends_on": "eval:doc.revision_of",
+   "description": "The approved document this record revises. That document stays effective until this revision is QA-approved."
   },
   {
    "fieldname": "reason_for_change",
    "fieldtype": "Small Text",
    "label": "Reason for Change",
-   "depends_on": "eval:doc.amended_from",
-   "mandatory_depends_on": "eval:doc.amended_from"
+   "depends_on": "eval:doc.amended_from || doc.revision_of",
+   "mandatory_depends_on": "eval:doc.amended_from || doc.revision_of"
   },
   {
    "fieldname": "section_review_history",
@@ -425,7 +449,7 @@
  "is_submittable": 1,
  "is_tree": 1,
  "links": [],
- "modified": "2026-04-25 00:00:00.000000",
+ "modified": "2026-07-09 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "DMS",
  "name": "GMP Document",

@@ -65,10 +65,15 @@ has_permission = {
 # ------------------------------------------------------------------------- #
 #  Scheduled tasks                                                          #
 # ------------------------------------------------------------------------- #
-# Daily sweep that obsoletes documents past their expiry_date and re-stamps
-# their base PDF with the QA-rejected stamp. See expire_gmp_documents().
+# Daily sweeps. Activation first: a future-dated approved document whose
+# effective_date arrives today becomes the effective version (retiring its
+# predecessor) before the expiry filter evaluates; the expiry sweep then
+# obsoletes documents past their expiry_date and re-stamps their base PDF
+# with the QA-rejected stamp. See activate_effective_documents() /
+# expire_gmp_documents().
 scheduler_events = {
     "daily": [
+        "dms.dms.doctype.gmp_document.gmp_document.activate_effective_documents",
         "dms.dms.doctype.gmp_document.gmp_document.expire_gmp_documents",
     ],
 }

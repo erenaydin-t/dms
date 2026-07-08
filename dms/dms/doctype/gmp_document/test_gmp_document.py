@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils import cint
 
 from dms.dms.doctype.gmp_document.gmp_document import (
     TEMPLATE_FIELDS,
@@ -145,6 +146,10 @@ def _purge_test_documents():
             if doc.docstatus == 1:
                 doc.flags.ignore_permissions = True
                 doc.cancel()
+            # The audit-retention guard (on_trash) blocks deleting cancelled
+            # revisions; downgrade the status so test fixtures can be purged.
+            if doc.workflow_status == "Revision Cancelled":
+                doc.db_set("workflow_status", "Draft", update_modified=False)
             frappe.delete_doc("GMP Document", name, ignore_permissions=True, force=True)
         except Exception:
             pass
@@ -334,6 +339,250 @@ class TestGMPDocument(FrappeTestCase):
         self.assertEqual(amended.attachment_file, fresh_url)
 
     # ------------------------------------------------------------------ #
+    #  Non-destructive revision lifecycle (create_revision)              #
+    # ------------------------------------------------------------------ #
+
+    def _force_approved(self, doc):
+        """Simulate a QA-approved effective version without running the render
+        pipeline (mirrors the docstatus-forcing pattern of the amend tests)."""
+        frappe.db.set_value(
+            "GMP Document",
+            doc.name,
+            {"docstatus": 1, "workflow_status": "Approved", "is_active": 1},
+            update_modified=False,
+        )
+        doc.reload()
+        return doc
+
+    def test_create_revision_keeps_predecessor_effective(self):
+        from dms.dms.doctype.gmp_document.gmp_document import create_revision
+
+        original = self._build_doc(document_name_en="GMP-Test-Rev-Origin")
+        original.insert(ignore_permissions=True)
+        self._force_approved(original)
+
+        rev_name = create_revision(original.name, "Update per CAPA-2026-002")
+        rev = frappe.get_doc("GMP Document", rev_name)
+
+        # The draft revision is a separate, linked record with a fresh cycle.
+        self.assertEqual(rev.revision_of, original.name)
+        self.assertEqual(rev.docstatus, 0)
+        self.assertEqual(rev.workflow_status, "Draft")
+        self.assertEqual(rev.version_number, 2)
+        self.assertEqual(rev.name, f"{original.name.rsplit('-', 1)[0]}-2")
+        # The predecessor's controlled file is never carried over.
+        self.assertFalse(rev.attachment_file)
+        self.assertFalse(rev.effective_date)
+
+        # The predecessor is untouched: still Approved, submitted and active.
+        original.reload()
+        self.assertEqual(original.docstatus, 1)
+        self.assertEqual(original.workflow_status, "Approved")
+        self.assertEqual(cint(original.is_active), 1)
+        self.assertEqual(original.version_number, 1)
+
+    def test_create_revision_requires_approved_active_source(self):
+        from dms.dms.doctype.gmp_document.gmp_document import create_revision
+
+        draft = self._build_doc(document_name_en="GMP-Test-Rev-Draft")
+        draft.insert(ignore_permissions=True)
+        with self.assertRaises(frappe.ValidationError):
+            create_revision(draft.name, "reason")
+
+        retired = self._build_doc(document_name_en="GMP-Test-Rev-Retired")
+        retired.insert(ignore_permissions=True)
+        self._force_approved(retired)
+        frappe.db.set_value("GMP Document", retired.name, "is_active", 0, update_modified=False)
+        with self.assertRaises(frappe.ValidationError):
+            create_revision(retired.name, "reason")
+
+    def test_create_revision_requires_reason(self):
+        from dms.dms.doctype.gmp_document.gmp_document import create_revision
+
+        original = self._build_doc(document_name_en="GMP-Test-Rev-NoReason")
+        original.insert(ignore_permissions=True)
+        self._force_approved(original)
+
+        with self.assertRaises(frappe.ValidationError):
+            create_revision(original.name, "   ")
+
+    def test_create_revision_blocks_parallel_open_revision(self):
+        from dms.dms.doctype.gmp_document.gmp_document import create_revision
+
+        original = self._build_doc(document_name_en="GMP-Test-Rev-Parallel")
+        original.insert(ignore_permissions=True)
+        self._force_approved(original)
+
+        create_revision(original.name, "first attempt")
+        with self.assertRaises(frappe.ValidationError):
+            create_revision(original.name, "second attempt")
+
+    def test_cancelled_revision_frees_slot_and_next_name_skips_it(self):
+        from dms.dms.doctype.gmp_document.gmp_document import create_revision
+
+        original = self._build_doc(document_name_en="GMP-Test-Rev-Cancelled")
+        original.insert(ignore_permissions=True)
+        self._force_approved(original)
+        base = original.name.rsplit("-", 1)[0]
+
+        first = create_revision(original.name, "abandoned attempt")
+        self.assertEqual(first, f"{base}-2")
+        # Simulate the 'Cancel Revision' workflow transition.
+        frappe.db.set_value(
+            "GMP Document",
+            first,
+            {"workflow_status": "Revision Cancelled", "is_active": 0},
+            update_modified=False,
+        )
+
+        # The slot is free again, and the retained cancelled record keeps its
+        # name — the next revision takes the NEXT segment, never colliding.
+        second = create_revision(original.name, "second attempt")
+        self.assertEqual(second, f"{base}-3")
+        self.assertEqual(frappe.db.get_value("GMP Document", second, "version_number"), 2)
+
+        # Predecessor still effective throughout.
+        original.reload()
+        self.assertEqual(original.workflow_status, "Approved")
+        self.assertEqual(cint(original.is_active), 1)
+
+    def test_revision_approval_obsoletes_predecessor(self):
+        from dms.dms.doctype.gmp_document.gmp_document import create_revision
+
+        original = self._build_doc(document_name_en="GMP-Test-Rev-Supersede")
+        original.insert(ignore_permissions=True)
+        self._force_approved(original)
+
+        rev = frappe.get_doc("GMP Document", create_revision(original.name, "supersede test"))
+        # Exercise the on_submit hand-over directly (the full submit path needs
+        # LibreOffice and is covered by the e2e suite).
+        rev._obsolete_superseded_version()
+
+        original.reload()
+        self.assertEqual(original.workflow_status, "Obsolete")
+        self.assertEqual(cint(original.is_active), 0)
+        # Obsolete via supersession is NOT a cancel: the record stays submitted.
+        self.assertEqual(original.docstatus, 1)
+
+    def test_cancelled_revision_cannot_be_deleted(self):
+        from dms.dms.doctype.gmp_document.gmp_document import create_revision
+
+        original = self._build_doc(document_name_en="GMP-Test-Rev-Retain")
+        original.insert(ignore_permissions=True)
+        self._force_approved(original)
+
+        rev_name = create_revision(original.name, "to be cancelled")
+        frappe.db.set_value(
+            "GMP Document", rev_name, "workflow_status", "Revision Cancelled", update_modified=False
+        )
+
+        with self.assertRaises(frappe.ValidationError):
+            frappe.delete_doc("GMP Document", rev_name, ignore_permissions=True)
+
+    # ------------------------------------------------------------------ #
+    #  Effective-date scheduling (posting-date semantics)                 #
+    # ------------------------------------------------------------------ #
+
+    def test_effective_date_is_system_controlled_without_checkbox(self):
+        doc = self._build_doc(document_name_en="GMP-Test-Eff-SysCtl")
+        doc.effective_date = "2030-01-01"  # manual value without the checkbox
+        doc.insert(ignore_permissions=True)
+        # Silently normalized away, like ERPNext's posting date.
+        self.assertFalse(doc.effective_date)
+        self.assertFalse(doc.expiry_date)
+
+    def test_effective_date_manual_with_checkbox_survives(self):
+        doc = self._build_doc(document_name_en="GMP-Test-Eff-Manual")
+        doc.set_effective_date = 1
+        doc.effective_date = "2030-01-01"
+        doc.insert(ignore_permissions=True)  # Administrator passes the role gate
+        self.assertEqual(str(doc.effective_date), "2030-01-01")
+        # Lifecycle dates derive from the scheduled date (3 Years validity).
+        self.assertEqual(str(doc.expiry_date), "2033-01-01")
+
+    def test_submit_requires_date_when_manual_mode_enabled(self):
+        doc = self._build_doc(document_name_en="GMP-Test-Eff-NoDate")
+        doc.set_effective_date = 1
+        doc.insert(ignore_permissions=True)
+        doc.workflow_status = "Approved"  # satisfy the before_submit guard
+        with self.assertRaises(frappe.ValidationError):
+            doc.submit()
+
+    def test_activation_sweep_promotes_due_pending_document(self):
+        from dms.dms.doctype.gmp_document.gmp_document import activate_effective_documents
+
+        original = self._build_doc(document_name_en="GMP-Test-Eff-Sweep-Origin")
+        original.insert(ignore_permissions=True)
+        self._force_approved(original)
+
+        # A pending revision whose effective date has arrived.
+        from dms.dms.doctype.gmp_document.gmp_document import create_revision
+        rev_name = create_revision(original.name, "scheduled rollout")
+        frappe.db.set_value(
+            "GMP Document",
+            rev_name,
+            {
+                "docstatus": 1,
+                "workflow_status": "Approved",
+                "is_active": 0,
+                "effective_date": frappe.utils.add_days(frappe.utils.today(), -1),
+            },
+            update_modified=False,
+        )
+
+        activate_effective_documents()
+
+        rev = frappe.get_doc("GMP Document", rev_name)
+        self.assertEqual(cint(rev.is_active), 1)
+        original.reload()
+        self.assertEqual(original.workflow_status, "Obsolete")
+        self.assertEqual(cint(original.is_active), 0)
+        self.assertEqual(original.docstatus, 1)
+
+    def test_activation_sweep_skips_future_and_obsolete(self):
+        from dms.dms.doctype.gmp_document.gmp_document import activate_effective_documents
+
+        future = self._build_doc(document_name_en="GMP-Test-Eff-Future")
+        future.insert(ignore_permissions=True)
+        frappe.db.set_value(
+            "GMP Document",
+            future.name,
+            {
+                "docstatus": 1,
+                "workflow_status": "Approved",
+                "is_active": 0,
+                "effective_date": frappe.utils.add_days(frappe.utils.today(), 10),
+            },
+            update_modified=False,
+        )
+
+        obsolete = self._build_doc(document_name_en="GMP-Test-Eff-Obsolete")
+        obsolete.insert(ignore_permissions=True)
+        frappe.db.set_value(
+            "GMP Document",
+            obsolete.name,
+            {
+                "docstatus": 1,
+                "workflow_status": "Obsolete",
+                "is_active": 0,
+                "effective_date": frappe.utils.add_days(frappe.utils.today(), -30),
+            },
+            update_modified=False,
+        )
+
+        activate_effective_documents()
+
+        self.assertEqual(
+            cint(frappe.db.get_value("GMP Document", future.name, "is_active")), 0
+        )
+        self.assertEqual(
+            frappe.db.get_value("GMP Document", obsolete.name, "workflow_status"), "Obsolete"
+        )
+        self.assertEqual(
+            cint(frappe.db.get_value("GMP Document", obsolete.name, "is_active")), 0
+        )
+
+    # ------------------------------------------------------------------ #
     #  Approver stamping (drives the approver's PDF signature)            #
     # ------------------------------------------------------------------ #
 
@@ -520,6 +769,27 @@ class TestGMPDocument(FrappeTestCase):
     def test_watermark_draft_for_unsubmitted_active(self):
         doc = MagicMock(docstatus=0, is_active=1)
         self.assertEqual(_resolve_watermark_text(doc), "DRAFT - NOT FOR USE")
+
+    def test_watermark_not_yet_effective_for_pending(self):
+        # QA-approved but future-dated: neither controlled nor obsolete.
+        doc = MagicMock(
+            docstatus=1,
+            is_active=0,
+            workflow_status="Approved",
+            effective_date=frappe.utils.add_days(frappe.utils.today(), 5),
+        )
+        self.assertEqual(_resolve_watermark_text(doc), "NOT YET EFFECTIVE")
+
+    def test_watermark_pending_until_sweep_activates(self):
+        # The date has arrived but the activation sweep hasn't run yet: the
+        # document is still pending — it must NOT read as Obsolete.
+        doc = MagicMock(
+            docstatus=1,
+            is_active=0,
+            workflow_status="Approved",
+            effective_date=frappe.utils.add_days(frappe.utils.today(), -1),
+        )
+        self.assertEqual(_resolve_watermark_text(doc), "NOT YET EFFECTIVE")
 
     # ------------------------------------------------------------------ #
     #  Watermark overlay (integration - requires reportlab + pypdf)      #

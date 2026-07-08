@@ -27,7 +27,7 @@ Core Fields:
 - `reason_for_change` (Small Text, Mandatory ONLY if `amended_from` is not empty)
 - `attachment_file` (Attach)
 - `file_md5_hash` (Data, Read Only)
-- `version_number` (Int, Default: 1)
+- `version_number` (Int, Default: 1) — the human *revision* number rendered into the document body (content, not identity). Defaults to 1 for a new document, but a 0-based revision scheme may set it explicitly (first issue == rev 0). Distinct from the name's trailing `version` segment (see Autonaming): `version_number` is not forced and may be 0, whereas the name segment always starts at 1.
 - `is_active` (Check, Default: 1)
 - `requires_training` (Check, Default: 0)
 </database_schema>
@@ -39,11 +39,15 @@ You must implement the following server-side logic in `gmp_document.py`:
     Strict name format: `[department_abbr]-[form_type]-[document_number]-[version]`, e.g. `PR-FRM-0001-1`.
     - Exactly four dash-separated segments — no prefixes, suffixes, spaces, or extra characters (no `v` before the version).
     - `document_number` is zero-padded to 4 digits (`0001`) and increments per department+form-type pair; amended versions share their predecessor's number.
-    - `version` starts at 1 (never 0); on amendment the logical base (`[dept]-[type]-[number]`) is retained and only the version segment is bumped.
+    - `version` here is the name's trailing segment, which reflects the document's **position in its amendment chain** — NOT the `version_number` field. It starts at 1 (never 0) for a brand-new document; on amendment the logical base (`[dept]-[type]-[number]`) is retained and the segment is set to the predecessor's segment + 1. Deriving it from the chain (rather than from `version_number`) keeps names collision-free and always 1-based even when `version_number` is numbered from 0.
     *(Note: Fetch the department abbreviation from the Department DocType, assume a custom field `custom_abbr` exists).*
 
-2.  **Date Calculations (`before_save`):**
+2.  **Date Calculations (`before_save`) & Effective-Date Scheduling:**
     If `effective_date` is set, automatically calculate `expiry_date` based on `validity_period` (add years). Set `next_revision_date` to exactly 1 month prior to `expiry_date`.
+    `effective_date` follows ERPNext's posting-date semantics via the `set_effective_date` checkbox ("Edit Effective Date", mirrors `set_posting_time`):
+    - Checkbox OFF (default): system-controlled — any manual value on a draft is silently normalized away, and the QA-approval date is stamped at submit.
+    - Checkbox ON: a QA/DMS/System Manager (server-enforced) may backdate or schedule a future date; submit requires the date to be filled.
+    - A **future** `effective_date` makes the approved document **pending**: `is_active = 0`, workflow stays Approved, watermark reads "NOT YET EFFECTIVE", and the predecessor (revision flow) remains the effective version. The daily `activate_effective_documents` sweep (runs before the expiry sweep) flips it active on the date, retires the predecessor, and repoints references.
 
 3.  **File Integrity & Renaming (`before_save`):**
     If `attachment_file` is provided or changed:
@@ -53,11 +57,13 @@ You must implement the following server-side logic in `gmp_document.py`:
 4.  **Word Template Engine (`on_submit`):**
     Use the `docxtpl` library. Open the attached `.docx` file, render the context (pass docname, version, effective date, etc., to replace bookmarks/jinja tags in the word file), and overwrite the saved file with the rendered version.
 
-5.  **Revision & Archiving (`on_cancel` or custom amend logic):**
-    When a document is amended:
-    - Increment `version_number` by 1.
-    - Clear `attachment_file`, `file_md5_hash`, and `effective_date`.
-    - Set the old document's `is_active` to 0.
+5.  **Revision & Archiving (non-destructive revise flow via `create_revision`):**
+    Revisions do NOT use Frappe's cancel+amend. A whitelisted `create_revision(docname, reason_for_change)` copies the current effective version into a separate draft record linked back via `revision_of` (Link, read-only) — the source document stays **Approved, submitted and active** the whole time the draft moves through the review workflow:
+    - Only an Approved + active + submitted document can be revised, and a document may have at most ONE open revision at a time (cancelled revisions don't count).
+    - The draft gets the next chain name segment (`MAX(existing segments) + 1`, so retained cancelled revisions never collide), a candidate `version_number` (predecessor + 1), a cleared `attachment_file`/hash/dates, and a fresh Draft workflow cycle. The predecessor's controlled file is never reused or replaced.
+    - On QA approval (`on_submit`), the predecessor is automatically retired: `is_active = 0`, `workflow_status = Obsolete` — but it KEEPS docstatus 1 (submitted, immutable audit record; not a cancel, so Frappe never offers "Amend" on it). The official version number therefore only advances at approval. References are repointed to the new version.
+    - Abandoning a draft revision happens via the workflow action "Cancel Revision" (any pre-approval state → terminal state **Revision Cancelled**, doc_status 0). The predecessor is untouched and remains effective; the cancelled draft is retained for audit and `on_trash` blocks its deletion.
+    - Legacy amend (`amended_from`) still works for manually cancelled documents and shares the same chain-naming, reset, and guard logic.
 
 6.  **PDF Generation & Watermarking (Whitelisted Method):**
     Create a `@frappe.whitelist()` method `download_watermarked_pdf(docname)`.

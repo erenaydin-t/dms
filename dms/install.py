@@ -86,6 +86,13 @@ GMP_WORKFLOW_STATES = [
     {"state": "Pending QA Approval",  "doc_status": 0, "allow_edit": "DMS Manager", "style": "Primary"},
     {"state": "Approved",             "doc_status": 1, "allow_edit": "DMS Manager", "style": "Success"},
     {"state": "Revision Requested",   "doc_status": 0, "allow_edit": "QA Manager",  "style": "Danger"},
+    # Terminal state for an abandoned draft revision (a record created via
+    # create_revision(), i.e. revision_of is set). The record is retained for
+    # audit — on_trash blocks deletion — and the document it revises stays
+    # Approved/active throughout. doc_status stays 0: the draft never entered
+    # the controlled (submitted) domain. allow_edit "DMS Manager" keeps the
+    # dead draft read-only for regular QA Managers.
+    {"state": "Revision Cancelled",   "doc_status": 0, "allow_edit": "DMS Manager", "style": "Danger"},
     # Terminal state for cancelled (obsolete) documents. on_cancel() sets
     # workflow_status to this directly (doc_status 2 = cancelled) so the
     # native badge stops reading "Approved". allow_edit is "QA Manager" here so
@@ -107,6 +114,15 @@ GMP_WORKFLOW_STATES = [
 _PREPARER = 'doc.prepared_by == frappe.session.user or frappe.session.user == "Administrator"'
 _REVIEWER = 'doc.reviewer == frappe.session.user or frappe.session.user == "Administrator"'
 _QA = 'doc.qa_approver == frappe.session.user or frappe.session.user == "Administrator"'
+# Cancelling a revision is only meaningful on a draft created via
+# create_revision() (revision_of set) and is reserved to the preparer, the QA
+# approver, or Administrator. A plain draft (no revision_of) never offers it.
+_REVISION_CANCEL = (
+    "doc.revision_of and ("
+    "doc.prepared_by == frappe.session.user "
+    "or doc.qa_approver == frappe.session.user "
+    'or frappe.session.user == "Administrator")'
+)
 
 GMP_WORKFLOW_TRANSITIONS = [
     {"state": "Draft",               "action": "Submit for Review",          "next_state": "Under Review",        "allowed": "QA Manager", "condition": _PREPARER},
@@ -115,6 +131,13 @@ GMP_WORKFLOW_TRANSITIONS = [
     {"state": "Under Review",        "action": "Request Revision (Reviewer)","next_state": "Revision Requested",  "allowed": "QA Manager", "condition": _REVIEWER},
     {"state": "Pending QA Approval", "action": "Approve as QA",              "next_state": "Approved",            "allowed": "QA Manager", "condition": _QA},
     {"state": "Pending QA Approval", "action": "Request Revision (QA)",      "next_state": "Under Review",        "allowed": "QA Manager", "condition": _QA},
+    # Abandon a draft revision at any pre-approval stage. Terminal: no
+    # transition leaves Revision Cancelled, and the revised document remains
+    # the effective version untouched.
+    {"state": "Draft",               "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL},
+    {"state": "Under Review",        "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL},
+    {"state": "Pending QA Approval", "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL},
+    {"state": "Revision Requested",  "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL},
 ]
 
 
@@ -224,32 +247,60 @@ def _ensure_document_types():
 
 def _sync_gmp_workflow():
     """Idempotently bring an existing GMP Document Workflow up to date with the
-    states/transitions this module owns: add the 'Obsolete' state and
-    (re)assert the per-actor transition `condition`s. Safe on every migrate."""
+    states/transitions this module owns: append any missing state or
+    transition and (re)assert the per-actor transition `condition`s. Never
+    removes rows the user added by hand. Safe on every migrate."""
     if not frappe.db.exists("Workflow", GMP_WORKFLOW_NAME):
         return
 
     wf = frappe.get_doc("Workflow", GMP_WORKFLOW_NAME)
+    changed = False
 
-    have_obsolete = any(s.state == "Obsolete" for s in wf.states)
-    if not have_obsolete:
-        if not frappe.db.exists("Workflow State", "Obsolete"):
+    # Append module-owned states that the install predates (e.g. 'Obsolete',
+    # 'Revision Cancelled'), seeding the Workflow State master as needed.
+    have_states = {s.state for s in wf.states}
+    for st in GMP_WORKFLOW_STATES:
+        if st["state"] in have_states:
+            continue
+        if not frappe.db.exists("Workflow State", st["state"]):
             frappe.get_doc({
                 "doctype": "Workflow State",
-                "workflow_state_name": "Obsolete",
-                "style": "Danger",
+                "workflow_state_name": st["state"],
+                "style": st["style"],
             }).insert(ignore_permissions=True)
         wf.append("states", {
-            "state": "Obsolete",
-            "doc_status": 2,
-            "allow_edit": "System Manager",
-            "style": "Danger",
+            "state": st["state"],
+            "doc_status": st["doc_status"],
+            "allow_edit": st["allow_edit"],
+            "style": st["style"],
         })
+        changed = True
 
-    cond_by_action = {tr["action"]: tr["condition"] for tr in GMP_WORKFLOW_TRANSITIONS}
-    changed = not have_obsolete
+    # Append module-owned transitions that the install predates (e.g. the
+    # 'Cancel Revision' fan), seeding the Workflow Action Master as needed.
+    have_transitions = {(tr.state, tr.action) for tr in wf.transitions}
+    for tr in GMP_WORKFLOW_TRANSITIONS:
+        if (tr["state"], tr["action"]) in have_transitions:
+            continue
+        if not frappe.db.exists("Workflow Action Master", tr["action"]):
+            frappe.get_doc({
+                "doctype": "Workflow Action Master",
+                "workflow_action_name": tr["action"],
+            }).insert(ignore_permissions=True)
+        wf.append("transitions", {
+            "state": tr["state"],
+            "action": tr["action"],
+            "next_state": tr["next_state"],
+            "allowed": tr["allowed"],
+            "condition": tr["condition"],
+        })
+        changed = True
+
+    # Re-assert conditions on rows that exist but drifted. Keyed by
+    # (state, action) — the same action may fan out from several states.
+    cond_by_key = {(tr["state"], tr["action"]): tr["condition"] for tr in GMP_WORKFLOW_TRANSITIONS}
     for tr in wf.transitions:
-        desired = cond_by_action.get(tr.action)
+        desired = cond_by_key.get((tr.state, tr.action))
         if desired and tr.condition != desired:
             tr.condition = desired
             changed = True

@@ -153,9 +153,18 @@ WF_UNDER_REVIEW = "Under Review"
 WF_PENDING_QA = "Pending QA Approval"
 WF_APPROVED = "Approved"
 WF_REVISION = "Revision Requested"
+WF_REVISION_CANCELLED = "Revision Cancelled"
 WF_OBSOLETE = "Obsolete"
 
-WF_ALL = (WF_DRAFT, WF_UNDER_REVIEW, WF_PENDING_QA, WF_APPROVED, WF_REVISION, WF_OBSOLETE)
+WF_ALL = (
+    WF_DRAFT,
+    WF_UNDER_REVIEW,
+    WF_PENDING_QA,
+    WF_APPROVED,
+    WF_REVISION,
+    WF_REVISION_CANCELLED,
+    WF_OBSOLETE,
+)
 
 
 class GMPDocument(NestedSet):
@@ -189,18 +198,20 @@ class GMPDocument(NestedSet):
         #   e.g. PR-FRM-0001-1
         # No prefixes, suffixes, spaces or extra characters — exactly four
         # dash-separated segments. The trailing version segment reflects the
-        # document's POSITION in its amendment chain (first issue == 1), NOT the
+        # document's POSITION in its revision chain (first issue == 1), NOT the
         # version_number field — which is human revision content and may be
         # 0-based. Deriving it from the chain keeps names collision-free and
         # always starting at 1 regardless of how version_number is numbered.
-        if self.amended_from:
-            base_name, _sep, prev_seg = self.amended_from.rpartition("-")
-            try:
-                next_seg = int(prev_seg) + 1
-            except ValueError:
-                # Predecessor name is malformed; fall back to version_number.
-                next_seg = cint(self.version_number) + 1
-            self.name = f"{base_name}-{next_seg}"
+        #
+        # Both successor mechanisms share the same chain: `revision_of` (the
+        # non-destructive revise flow) and `amended_from` (legacy cancel+amend).
+        # The next segment is MAX(existing segments in the chain) + 1 — not
+        # predecessor's segment + 1 — because a cancelled revision is retained
+        # in the database and keeps its name, leaving an occupied segment that
+        # a naive +1 would collide with.
+        predecessor_name = self.revision_of or self.amended_from
+        if predecessor_name:
+            self.name = self._next_chain_name(predecessor_name)
             return
 
         # document_type links to GMP Document Type, whose record name *is* the
@@ -230,13 +241,46 @@ class GMPDocument(NestedSet):
         # A brand-new document is the first version of its chain: segment 1.
         self.name = f"{dept_abbr}-{type_code}-{next_inc}-1"
 
+    @staticmethod
+    def _next_chain_name(predecessor_name):
+        """Next collision-free name in a revision chain.
+
+        Chain members share the logical base ``[dept]-[type]-[number]`` and
+        differ only in the trailing integer segment. Scans every existing
+        member (including retained cancelled revisions) and returns
+        ``base-(max_segment + 1)``."""
+        base_name, _sep, prev_seg = predecessor_name.rpartition("-")
+        try:
+            max_seg = int(prev_seg)
+        except ValueError:
+            # Malformed predecessor name: no chain to scan — degrade to
+            # suffixing it, which at least stays unique per rpartition base.
+            base_name = predecessor_name
+            max_seg = 0
+
+        for existing_name in frappe.get_all(
+            "GMP Document",
+            filters=[["name", "like", f"{base_name}-%"]],
+            pluck="name",
+        ):
+            rest = existing_name[len(base_name) + 1:]
+            try:
+                seg = int(rest)
+            except ValueError:
+                continue  # different chain sharing the prefix (never 4-segment)
+            if seg > max_seg:
+                max_seg = seg
+
+        return f"{base_name}-{max_seg + 1}"
+
     def before_insert(self):
         if not self.prepared_by:
             self.prepared_by = frappe.session.user
         if not self.workflow_status:
             self.workflow_status = WF_DRAFT
 
-        if not self.amended_from:
+        predecessor_name = self.revision_of or self.amended_from
+        if not predecessor_name:
             # version_number is the human *revision* number rendered into the
             # document body — it is content, not identity. The name's trailing
             # segment (see autoname) is what always starts at 1; version_number
@@ -246,30 +290,43 @@ class GMPDocument(NestedSet):
                 self.version_number = 1
             return
 
+        if self.revision_of and self.amended_from:
+            frappe.throw(
+                _("A GMP Document cannot be both a revision (revision_of) and an amendment (amended_from) at once.")
+            )
+
+        self._guard_successor_creation(predecessor_name)
+
         predecessor = frappe.db.get_value(
             "GMP Document",
-            self.amended_from,
+            predecessor_name,
             ["version_number"],
             as_dict=True,
         ) or frappe._dict()
-        # Amendments increment from the predecessor; since the chain starts at 1,
-        # the first amendment is version 2, the next 3, and so on.
+        # Successors increment from the predecessor; since the chain starts at 1,
+        # the first revision is version 2, the next 3, and so on. For the
+        # non-destructive revise flow this is the *candidate* number only: the
+        # predecessor keeps its version_number and stays the effective version
+        # until this draft is QA-approved, so the official version increases
+        # only at approval — and not at all if the revision is cancelled.
         self.version_number = (cint(predecessor.version_number) or 0) + 1
         # Change control: a revised document must re-acquire its own controlled
         # file, so clear an attachment that was carried over from the
-        # predecessor by the amend — but never one the user uploaded for this
-        # revision. The distinction is made by File *ownership*, not URL string:
-        # Frappe deduplicates uploads by content hash, so a freshly uploaded
-        # .docx can be handed the predecessor's file_url while being a distinct
-        # File row (still unattached at before_insert). A plain url/exists check
-        # wrongly treated that as inherited and nulled it, so the mandatory
-        # check then failed with "Value missing for Attachment (.docx)".
+        # predecessor by the amend/copy — but never one the user uploaded for
+        # this revision. The distinction is made by File *ownership*, not URL
+        # string: Frappe deduplicates uploads by content hash, so a freshly
+        # uploaded .docx can be handed the predecessor's file_url while being a
+        # distinct File row (still unattached at before_insert). A plain
+        # url/exists check wrongly treated that as inherited and nulled it, so
+        # the mandatory check then failed with "Value missing for Attachment
+        # (.docx)".
         #
         # A genuine re-upload always creates its OWN File row (unattached here,
-        # or attached to this new doc), whereas amend-copy creates none — the
+        # or attached to this new doc), whereas amend/copy creates none — the
         # only File(s) carrying the url stay attached to the predecessor. So the
         # attachment is inherited iff a File with this url exists AND every File
-        # with it is attached to the predecessor.
+        # with it is attached to the predecessor. The predecessor's own file is
+        # therefore never reused, let alone replaced, by a revision.
         inherited_attachment = False
         if self.attachment_file:
             files = frappe.get_all(
@@ -279,18 +336,20 @@ class GMPDocument(NestedSet):
             )
             inherited_attachment = bool(files) and all(
                 f.attached_to_doctype == self.doctype
-                and f.attached_to_name == self.amended_from
+                and f.attached_to_name == predecessor_name
                 for f in files
             )
         if not self.attachment_file or inherited_attachment:
             self.attachment_file = None
             self.file_integrity_hash = None
         self.effective_date = None
+        self.set_effective_date = 0  # each revision decides its own scheduling
         self.expiry_date = None
         self.next_revision_date = None
-        # The amended draft starts a fresh review cycle. It is also the new
-        # active version — the predecessor was amended from a cancelled
-        # (is_active=0) doc, so re-assert active here rather than inherit 0.
+        # The successor draft starts a fresh review cycle. is_active=1 marks it
+        # as the live candidate of its chain (for an amend, the predecessor was
+        # cancelled, so re-assert active rather than inherit 0); the *effective*
+        # version is still whichever chain member has docstatus == 1.
         self.is_active = 1
         self.workflow_status = WF_DRAFT
         self.reviewed_by = None
@@ -301,11 +360,102 @@ class GMPDocument(NestedSet):
         self.last_revision_by = None
         self.last_revision_on = None
 
+    def _guard_successor_creation(self, predecessor_name):
+        """Integrity guards for creating a successor (revision or amendment).
+
+        - The revise flow requires an Approved, active, submitted predecessor —
+          the record that stays effective while the revision is drafted.
+        - A chain may have at most ONE open successor at a time; retained
+          cancelled revisions don't count.
+        - A predecessor that was already superseded by an approved successor
+          can never grow a second, parallel successor."""
+        if self.revision_of:
+            pred = frappe.db.get_value(
+                "GMP Document",
+                self.revision_of,
+                ["docstatus", "workflow_status", "is_active"],
+                as_dict=True,
+            )
+            if not pred:
+                frappe.throw(_("Document {0} does not exist.").format(self.revision_of))
+            if pred.docstatus != 1 or pred.workflow_status != WF_APPROVED or not cint(pred.is_active):
+                frappe.throw(
+                    _(
+                        "Only the current effective version can be revised: {0} must be "
+                        "Approved and active (it is {1})."
+                    ).format(self.revision_of, _(pred.workflow_status or "Draft"))
+                )
+
+        # Superseded already? (An approved successor exists.)
+        for link_field in ("revision_of", "amended_from"):
+            approved_successor = frappe.db.get_value(
+                "GMP Document", {link_field: predecessor_name, "docstatus": 1}, "name"
+            )
+            if approved_successor:
+                frappe.throw(
+                    _(
+                        "{0} has already been superseded by {1}. Revise the current "
+                        "effective version instead."
+                    ).format(predecessor_name, approved_successor)
+                )
+
+        # One open successor at a time. Cancelled revisions are retained
+        # records (workflow_status == Revision Cancelled) and don't block.
+        for link_field in ("revision_of", "amended_from"):
+            open_successor = frappe.db.get_value(
+                "GMP Document",
+                {
+                    link_field: predecessor_name,
+                    "docstatus": 0,
+                    "workflow_status": ["!=", WF_REVISION_CANCELLED],
+                    "name": ["!=", self.name or ""],
+                },
+                "name",
+            )
+            if open_successor:
+                frappe.throw(
+                    _(
+                        "A revision of {0} is already in progress: {1}. Complete or "
+                        "cancel it before starting another."
+                    ).format(predecessor_name, frappe.bold(open_successor))
+                )
+
     def validate(self):
-        if self.amended_from and not (self.reason_for_change and self.reason_for_change.strip()):
-            frappe.throw(_("Reason for Change is mandatory when amending a GMP Document."))
+        if (self.amended_from or self.revision_of) and not (
+            self.reason_for_change and self.reason_for_change.strip()
+        ):
+            frappe.throw(_("Reason for Change is mandatory when revising a GMP Document."))
+        self._enforce_effective_date_policy()
         self._check_circular_references()
         self._validate_signatures()
+
+    def _enforce_effective_date_policy(self):
+        """ERPNext posting-date semantics for ``effective_date``.
+
+        Mirrors the `set_posting_time` pattern: with the 'Edit Effective Date'
+        checkbox OFF the field is system-controlled — any manual value on a
+        draft is silently normalized away (exactly like ERPNext overwriting
+        posting_date when set_posting_time is unchecked) and the system stamps
+        the QA-approval date at submit. With the checkbox ON, a QA/DMS manager
+        may schedule a future date or backdate; a future date keeps the
+        document pending (not effective) until the daily sweep activates it."""
+        if self.docstatus != 0:
+            return  # post-submit edits are governed by Frappe's submitted-doc rules
+
+        if not cint(self.set_effective_date):
+            previous = self.get_doc_before_save()
+            system_value = previous.effective_date if previous else None
+            if cstr(self.effective_date) != cstr(system_value):
+                self.effective_date = system_value
+                self._calculate_lifecycle_dates()
+            return
+
+        allowed = {"QA Manager", "DMS Manager", "System Manager"}
+        if frappe.session.user != "Administrator" and not (allowed & set(frappe.get_roles())):
+            frappe.throw(
+                _("Only a QA Manager or DMS Manager may edit the Effective Date."),
+                frappe.PermissionError,
+            )
 
     def _validate_signatures(self):
         """Block save/submit unless the assigned Reviewer and QA Approver each
@@ -375,6 +525,18 @@ class GMPDocument(NestedSet):
                 frappe.PermissionError,
             )
 
+        # Manual effective-date mode must resolve to an actual date by
+        # approval time: either the scheduler date was entered, or the box is
+        # unticked and the system stamps today in on_submit.
+        if cint(self.set_effective_date) and not self.effective_date:
+            frappe.throw(
+                _(
+                    "'Edit Effective Date' is enabled but no Effective Date is set. "
+                    "Enter the date or untick the option to let the system stamp "
+                    "the approval date."
+                )
+            )
+
     def on_update(self):
         # Workflow transitions arrive via Frappe's native apply_workflow(),
         # which save()s the doc — so audit stamping and ToDo housekeeping that
@@ -405,9 +567,72 @@ class GMPDocument(NestedSet):
             self.db_set("next_revision_date", self.next_revision_date, update_modified=False)
 
         self._render_and_generate_pdf()
+
+        # A future-dated document is QA-approved but PENDING: it must not
+        # become the effective version — nor displace its predecessor — until
+        # the effective date arrives (activate_effective_documents sweep).
+        # The render above ran while is_active was still 1, so the base PDF
+        # carries the approved stamp, as it should for an approved document.
+        if _is_pending_effective_date(self.effective_date):
+            self.db_set("is_active", 0, update_modified=False)
+            self.add_comment(
+                "Info",
+                _(
+                    "QA-approved with a future Effective Date ({0}); the document "
+                    "becomes the effective version on that date."
+                ).format(self.effective_date),
+            )
+            return
+
+        # Effective immediately: only after the render has succeeded (a throw
+        # above aborts the submit and leaves the predecessor untouched) does
+        # the predecessor stop being the effective version.
+        self._obsolete_superseded_version()
         # Now that this revision is officially approved, swing any dependent
         # references off the superseded version and onto this one.
         self._repoint_references_to_self()
+
+    def _obsolete_superseded_version(self):
+        """Retire the document this approved revision supersedes.
+
+        The non-destructive revise flow (revision_of) keeps the predecessor
+        Approved and effective throughout drafting and review; the moment the
+        revision is QA-approved, the predecessor transitions to Obsolete —
+        automatically, not via cancel. It keeps docstatus 1 (same pattern as
+        the expiry sweep): the record stays a submitted, immutable audit
+        artifact, and crucially Frappe never offers 'Amend' on it, which a
+        cancel would — inviting a parallel chain."""
+        if not self.revision_of:
+            return
+
+        pred = frappe.get_doc("GMP Document", self.revision_of)
+        if pred.docstatus != 1 or not cint(pred.is_active):
+            return  # already retired (e.g. expired or manually cancelled meanwhile)
+
+        pred.db_set("is_active", 0, update_modified=False)
+        pred.db_set("workflow_status", WF_OBSOLETE, update_modified=False)
+        pred.add_comment(
+            "Info",
+            _("Superseded by approved revision {0} — status set to Obsolete.").format(self.name),
+        )
+        self.add_comment(
+            "Info",
+            _("Approval of this revision obsoleted predecessor {0}.").format(pred.name),
+        )
+
+        # Re-stamp the predecessor's persisted base PDF with the rejected/
+        # obsolete stamp (is_active is now 0, so _resolve_stamp_path() selects
+        # it). Guarded: approval of the new revision must complete even if
+        # LibreOffice is unavailable — downloads are protected regardless,
+        # because the dynamic watermark already resolves to OBSOLETE.
+        if pred.attachment_file:
+            try:
+                pred._render_and_generate_pdf()
+            except Exception:
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    "GMP Document: obsolete re-stamp of superseded version failed",
+                )
 
     def _stamp_approver(self):
         """Record the QA approver (and timestamp) if not already set.
@@ -461,6 +686,19 @@ class GMPDocument(NestedSet):
                     frappe.get_traceback(),
                     "GMP Document: QA-rejected re-stamp on cancel failed",
                 )
+
+    def on_trash(self, *args, **kwargs):
+        # 21 CFR Part 11 retention: a cancelled revision is a controlled audit
+        # record — it documents that a change was attempted and abandoned — and
+        # must stay in the database with its Revision Cancelled status.
+        if self.workflow_status == WF_REVISION_CANCELLED:
+            frappe.throw(
+                _(
+                    "Cancelled revisions are retained for audit traceability and "
+                    "cannot be deleted."
+                )
+            )
+        super().on_trash(*args, **kwargs)
 
     def copy_attachments_from_amended_from(self):
         # GMP change control: a revised document must re-acquire its own
@@ -1011,7 +1249,11 @@ class GMPDocument(NestedSet):
         Only ever consulted in the with-images render pass, so the clean
         deliverable .docx stays stamp-free — the stamp lives only in the signed
         base PDF, mirroring how signatures are handled."""
-        if not self.is_active:
+        if _is_pending_effective(self):
+            # Future-dated but QA-approved: a re-render while pending must keep
+            # the approved stamp, not the rejected one is_active=0 would imply.
+            path = _stamp_asset_path(STAMP_APPROVED)
+        elif not self.is_active:
             path = _stamp_asset_path(STAMP_REJECTED)
         elif self.approved_by:
             path = _stamp_asset_path(STAMP_APPROVED)
@@ -1083,6 +1325,33 @@ class GMPDocument(NestedSet):
             _close_open_todos(self, allocated_to=self.qa_approver)
             _create_todo(self, self.reviewer, _("Re-review — QA requested revision on {0}").format(self.name))
 
+        elif curr == WF_REVISION_CANCELLED:
+            # Draft revision abandoned. Terminal: the record is retained for
+            # audit (on_trash blocks deletion) and the revised document remains
+            # the effective version — it was never touched by this draft.
+            self.db_set("is_active", 0, update_modified=False)
+            self.add_comment(
+                "Workflow",
+                _("Revision cancelled by {0} — {1} remains the effective version.").format(
+                    actor, self.revision_of or _("the approved predecessor")
+                ),
+            )
+            for assignee in (self.prepared_by, self.reviewer, self.qa_approver):
+                _close_open_todos(self, allocated_to=assignee)
+            if self.revision_of:
+                try:
+                    frappe.get_doc("GMP Document", self.revision_of).add_comment(
+                        "Info",
+                        _("Draft revision {0} was cancelled; this version remains effective.").format(
+                            self.name
+                        ),
+                    )
+                except Exception:
+                    frappe.log_error(
+                        frappe.get_traceback(),
+                        "GMP Document: revision-cancelled comment on predecessor failed",
+                    )
+
     def _stamp_revision_request(self, actor):
         """Record who/when on a revision request. The reason text is captured
         in the writable `last_revision_request` field on the form before the
@@ -1099,12 +1368,13 @@ class GMPDocument(NestedSet):
         """Swing dependents' reference rows from the superseded version to this
         newly-approved one, so cross-references always resolve to the current
         controlled version (Issue #4)."""
-        if not self.amended_from:
+        predecessor_name = self.revision_of or self.amended_from
+        if not predecessor_name:
             return
 
         rows = frappe.get_all(
             "GMP Document Reference",
-            filters={"referenced_document": self.amended_from},
+            filters={"referenced_document": predecessor_name},
             fields=["name", "parent", "parenttype"],
         )
         repointed_parents = set()
@@ -1126,7 +1396,7 @@ class GMPDocument(NestedSet):
                 frappe.get_doc("GMP Document", parent_name).add_comment(
                     "Info",
                     _("Reference {0} automatically superseded by {1}.").format(
-                        self.amended_from, self.name
+                        predecessor_name, self.name
                     ),
                 )
             except Exception:
@@ -1296,6 +1566,50 @@ def _resolve_signature_path(user_email):
 # ---------------------------------------------------------------------- #
 
 
+def activate_effective_documents():
+    """Daily sweep: make every QA-approved, future-dated GMP Document whose
+    ``effective_date`` has arrived the effective version of its chain.
+
+    Pending documents are the only rows carrying (docstatus 1, workflow
+    Approved, is_active 0) — every other inactive submitted document has
+    workflow_status Obsolete — so the filter cannot touch retired records.
+    Activation performs the hand-over on_submit deferred: flip is_active,
+    retire the superseded predecessor, repoint dependents' references. Each
+    document commits independently so one failure cannot block the sweep.
+
+    Runs before expire_gmp_documents (hooks order) so a document that becomes
+    effective today is active before the expiry filter evaluates."""
+    due = frappe.get_all(
+        "GMP Document",
+        filters={
+            "docstatus": 1,
+            "is_active": 0,
+            "workflow_status": WF_APPROVED,
+            "effective_date": ["<=", today()],
+        },
+        pluck="name",
+    )
+    for name in due:
+        try:
+            doc = frappe.get_doc("GMP Document", name)
+            doc.db_set("is_active", 1, update_modified=False)
+            doc.add_comment(
+                "Info",
+                _("Effective Date {0} reached — this document is now the effective version.").format(
+                    doc.effective_date
+                ),
+            )
+            doc._obsolete_superseded_version()
+            doc._repoint_references_to_self()
+            frappe.db.commit()
+        except Exception:
+            frappe.db.rollback()
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"GMP Document: effective-date activation failed for {name}",
+            )
+
+
 def expire_gmp_documents():
     """Daily sweep: obsolete every active, QA-approved GMP Document whose
     ``expiry_date`` has passed, and re-stamp its base PDF with the QA-rejected
@@ -1336,6 +1650,51 @@ def expire_gmp_documents():
 # ---------------------------------------------------------------------- #
 #  Whitelisted endpoint                                                  #
 # ---------------------------------------------------------------------- #
+
+
+@frappe.whitelist()
+def create_revision(docname, reason_for_change):
+    """Start a non-destructive revision of an approved document.
+
+    Unlike Frappe's cancel+amend, the source document is NOT cancelled: it
+    stays Approved, active and effective while the new draft revision moves
+    through the review workflow. The draft is a separate record linked back
+    via ``revision_of``; only when it is QA-approved does on_submit retire the
+    predecessor to Obsolete (and only then does the official version number
+    advance). Abandoning the draft (workflow action 'Cancel Revision') leaves
+    the predecessor untouched and retains the draft as a Revision Cancelled
+    audit record.
+
+    Guards (enforced server-side in before_insert):
+    - source must be Approved, submitted and active;
+    - at most one open revision per document."""
+    source = frappe.get_doc("GMP Document", docname)
+    source.check_permission("read")
+
+    reason = (reason_for_change or "").strip()
+    if not reason:
+        frappe.throw(_("Reason for Change is required to start a revision."))
+
+    revision = frappe.copy_doc(source)  # no_copy fields (revision_of, amended_from) reset by copy
+    revision.docstatus = 0  # copy_doc may carry the source's submitted docstatus
+    revision.revision_of = source.name
+    revision.amended_from = None
+    revision.reason_for_change = reason
+    revision.prepared_by = frappe.session.user
+    # before_insert() derives the rest — chain-based name segment, candidate
+    # version_number, cleared attachment/dates/audit stamps, workflow Draft —
+    # and enforces the Approved+active predecessor and single-open-revision
+    # guards. insert() runs with the caller's permissions, so the DocType
+    # create permission (QA Manager) is enforced by Frappe itself.
+    revision.insert()
+
+    source.add_comment(
+        "Info",
+        _("Revision {0} started by {1}; this version remains effective until the revision is approved.").format(
+            revision.name, frappe.session.user
+        ),
+    )
+    return revision.name
 
 
 PDF_VARIANTS = ("controlled", "uncontrolled", "plain")
@@ -1389,8 +1748,12 @@ def download_watermarked_pdf(docname, variant=None):
     else:
         watermark_text = _resolve_watermark_text(doc)
 
-    # Obsolete always wins: no variant may hide the retired status.
-    if not doc.is_active:
+    # Status always wins: no variant may hide that a document is retired —
+    # or not yet effective. A pending (future-dated, QA-approved) document is
+    # not obsolete, but it must not circulate looking like a normal copy.
+    if _is_pending_effective(doc):
+        watermark_text = "NOT YET EFFECTIVE"
+    elif not doc.is_active:
         watermark_text = "OBSOLETE"
 
     # 21 CFR Part 11: a reference print outside change control is only
@@ -1922,9 +2285,34 @@ def get_document_reference_tree(docname, depth=3):
     return _build(root, depth, set())
 
 
+def _is_pending_effective_date(effective_date):
+    """True when the date lies in the future (document scheduled, not yet
+    effective)."""
+    return bool(effective_date) and getdate(effective_date) > getdate(today())
+
+
+def _is_pending_effective(doc):
+    """True for a QA-approved document that is not yet the effective version:
+    submitted and still workflow-Approved, but deliberately kept inactive so
+    the predecessor (if any) stays effective. Deliberately NOT date-gated —
+    between the effective date arriving and the daily activation sweep
+    running, the document is still pending, not obsolete. Obsoleted documents
+    also carry is_active == 0 but their workflow_status is Obsolete, never
+    Approved."""
+    return (
+        doc.docstatus == 1
+        and doc.workflow_status == WF_APPROVED
+        and not cint(doc.is_active)
+    )
+
+
 def _resolve_watermark_text(doc):
     if doc.docstatus == 1 and doc.is_active:
         return "CONTROLLED COPY"
+    if _is_pending_effective(doc):
+        # Approved but future-dated: not obsolete, but must not read as a
+        # controlled effective copy either.
+        return "NOT YET EFFECTIVE"
     if not doc.is_active:
         return "OBSOLETE"
     return "DRAFT - NOT FOR USE"

@@ -9,8 +9,20 @@ frappe.ui.form.on("GMP Document", {
     refresh(frm) {
         toggle_reason_for_change(frm);
         add_download_pdf_button(frm);
+        add_create_revision_button(frm);
+        show_revision_banner(frm);
+        show_pending_effective_banner(frm);
+        toggle_effective_date_controls(frm);
         toggle_assignment_fields(frm);
         render_reference_tree(frm);
+    },
+
+    set_effective_date(frm) {
+        // Unticking hands the field back to the system (the server normalizes
+        // any manual value away on save, like ERPNext's posting date).
+        if (!cint(frm.doc.set_effective_date) && frm.doc.docstatus === 0) {
+            frm.set_value("effective_date", null);
+        }
     },
 
     version_number(frm) {
@@ -18,6 +30,10 @@ frappe.ui.form.on("GMP Document", {
     },
 
     amended_from(frm) {
+        toggle_reason_for_change(frm);
+    },
+
+    revision_of(frm) {
         toggle_reason_for_change(frm);
     },
 
@@ -59,16 +75,146 @@ function warn_if_no_signature(frm, fieldname, label) {
 
 
 /**
- * Show and require `reason_for_change` only for amendments; hide it on the
- * initial version. Keyed off `amended_from`, not the version number: version
- * numbering now starts at 1, so a version-based rule would wrongly show the
- * field on every first-version document.
+ * Show and require `reason_for_change` only for revisions/amendments; hide it
+ * on the initial version. Keyed off `revision_of`/`amended_from`, not the
+ * version number: version numbering now starts at 1, so a version-based rule
+ * would wrongly show the field on every first-version document.
  */
 function toggle_reason_for_change(frm) {
-    const is_amended = Boolean(frm.doc.amended_from);
+    const is_revision = Boolean(frm.doc.amended_from || frm.doc.revision_of);
 
-    frm.toggle_display("reason_for_change", is_amended);
-    frm.toggle_reqd("reason_for_change", is_amended);
+    frm.toggle_display("reason_for_change", is_revision);
+    frm.toggle_reqd("reason_for_change", is_revision);
+}
+
+
+/**
+ * Non-destructive revision entry point. Offered only on the current effective
+ * version (Approved + submitted + active). The server re-enforces every guard
+ * (create_revision -> before_insert), so this gate is UX only.
+ */
+function add_create_revision_button(frm) {
+    if (frm.is_new()) return;
+    if (frm.doc.docstatus !== 1) return;
+    if (frm.doc.workflow_status !== "Approved" || !cint(frm.doc.is_active)) return;
+
+    const can_author =
+        frappe.user.has_role("QA Manager") ||
+        frappe.user.has_role("DMS Manager") ||
+        frappe.user.has_role("System Manager");
+    if (!can_author) return;
+
+    frm.add_custom_button(__("Create Revision"), () => {
+        frappe.prompt(
+            [
+                {
+                    fieldname: "reason_for_change",
+                    fieldtype: "Small Text",
+                    label: __("Reason for Change"),
+                    reqd: 1,
+                },
+            ],
+            (values) => {
+                frappe.call({
+                    method: "dms.dms.doctype.gmp_document.gmp_document.create_revision",
+                    args: {
+                        docname: frm.doc.name,
+                        reason_for_change: values.reason_for_change,
+                    },
+                    freeze: true,
+                    freeze_message: __("Creating draft revision..."),
+                    callback(r) {
+                        if (!r.message) return;
+                        frappe.show_alert(
+                            {
+                                message: __(
+                                    "Draft revision {0} created. {1} remains effective until it is approved.",
+                                    [r.message, frm.doc.name]
+                                ),
+                                indicator: "green",
+                            },
+                            8
+                        );
+                        frappe.set_route("Form", "GMP Document", r.message);
+                    },
+                });
+            },
+            __("Start Revision of {0}", [frm.doc.name]),
+            __("Create Draft Revision")
+        );
+    });
+}
+
+
+/**
+ * ERPNext posting-date UX for the Effective Date: the checkbox that unlocks
+ * manual entry is only offered to the roles the server accepts (QA/DMS/System
+ * Manager) — for everyone else the date stays visibly system-controlled.
+ * Server-side enforcement lives in _enforce_effective_date_policy().
+ */
+function toggle_effective_date_controls(frm) {
+    const can_edit =
+        frappe.user.has_role("QA Manager") ||
+        frappe.user.has_role("DMS Manager") ||
+        frappe.user.has_role("System Manager");
+    // Keep the checkbox visible when already ticked so its effect is auditable.
+    frm.toggle_display(
+        "set_effective_date",
+        can_edit || cint(frm.doc.set_effective_date)
+    );
+}
+
+
+/**
+ * Banner for a QA-approved document whose Effective Date lies in the future:
+ * approved, but not the effective version until the date arrives.
+ */
+function show_pending_effective_banner(frm) {
+    if (frm.is_new() || frm.doc.docstatus !== 1) return;
+    if (cint(frm.doc.is_active)) return;
+    if (frm.doc.workflow_status !== "Approved") return;
+    if (!frm.doc.effective_date) return;
+
+    frm.set_intro(
+        __(
+            "QA-approved, scheduled to become effective on {0}. Until then it is not the effective version{1}.",
+            [
+                frappe.datetime.str_to_user(frm.doc.effective_date),
+                frm.doc.revision_of
+                    ? " " + __("and {0} remains in force", [frm.doc.revision_of])
+                    : "",
+            ]
+        ),
+        "orange"
+    );
+}
+
+
+/**
+ * Orientation banner for the non-destructive revision flow: on a draft
+ * revision, say which version stays effective; on a cancelled revision, say
+ * the record is a retained audit artifact.
+ */
+function show_revision_banner(frm) {
+    if (frm.is_new() || !frm.doc.revision_of) return;
+
+    if (frm.doc.workflow_status === "Revision Cancelled") {
+        frm.set_intro(
+            __(
+                "This revision was cancelled and is retained for audit. {0} remains the effective version.",
+                [`<a href="/app/gmp-document/${encodeURIComponent(frm.doc.revision_of)}">${frm.doc.revision_of}</a>`]
+            ),
+            "red"
+        );
+    } else if (frm.doc.docstatus === 0) {
+        frm.set_intro(
+            __(
+                "Draft revision of {0} — that version remains effective and unchanged until this revision is QA-approved.",
+                [`<a href="/app/gmp-document/${encodeURIComponent(frm.doc.revision_of)}">${frm.doc.revision_of}</a>`]
+            ),
+            "blue"
+        );
+    }
 }
 
 
