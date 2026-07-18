@@ -35,7 +35,9 @@ fixtures = [
     },
     {
         "dt": "Role",
-        "filters": [["role_name", "in", ["QA Manager", "DMS Manager"]]],
+        "filters": [
+            ["role_name", "in", ["QA Manager", "DMS Manager", "DMS Initiator", "DMS Approver"]]
+        ],
     },
 ]
 

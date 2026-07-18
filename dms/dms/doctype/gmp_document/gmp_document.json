@@ -23,9 +23,15 @@
   "section_workflow",
   "workflow_status",
   "prepared_by",
+  "supervisor",
   "column_break_wf_1",
   "reviewer",
   "qa_approver",
+  "qa_supervisor",
+  "regulatory_manager",
+  "section_qa_review",
+  "qa_reviews",
+  "qa_review_complete",
   "section_lifecycle",
   "set_effective_date",
   "effective_date",
@@ -41,11 +47,18 @@
   "revision_of",
   "reason_for_change",
   "section_review_history",
+  "supervisor_approved_by",
+  "supervisor_approved_on",
   "reviewed_by",
   "reviewed_on",
   "column_break_rh_1",
   "approved_by",
   "approved_on",
+  "column_break_rh_2",
+  "manager_approved_by",
+  "manager_approved_on",
+  "regulatory_validated_by",
+  "regulatory_validated_on",
   "section_revision",
   "last_revision_by",
   "last_revision_on",
@@ -236,7 +249,7 @@
    "fieldname": "workflow_status",
    "fieldtype": "Select",
    "label": "Workflow Status",
-   "options": "Draft\nUnder Review\nPending QA Approval\nApproved\nRevision Requested\nRevision Cancelled\nObsolete",
+   "options": "Draft\nPending Supervisor Approval\nUnder Review\nPending QA Supervisor\nQA Review In Progress\nPending Manager Approval\nPending Regulatory Validation\nPending Final QA Approval\nApproved\nRevision Requested\nRevision Cancelled\nObsolete",
    "default": "Draft",
    "read_only": 1,
    "in_list_view": 1,
@@ -260,20 +273,20 @@
    "fieldtype": "Link",
    "label": "Reviewer",
    "options": "User",
-   "reqd": 1,
    "in_standard_filter": 1,
    "ignore_user_permissions": 1,
-   "description": "User who must review the document before it goes to QA."
+   "description": "Resolved automatically on submission: the supervisor's own manager (Employee → Reports To chain). Acts at the review stage and again as the Manager after QA review.",
+   "read_only": 1
   },
   {
    "fieldname": "qa_approver",
    "fieldtype": "Link",
    "label": "QA Approver",
    "options": "User",
-   "reqd": 1,
    "in_standard_filter": 1,
    "ignore_user_permissions": 1,
-   "description": "User who performs the final QA approval and triggers submit."
+   "description": "Resolved automatically from DMS Settings for the document's department. Performs the final authorization and the Publish action.",
+   "read_only": 1
   },
   {
    "fieldname": "section_change_control",
@@ -444,6 +457,103 @@
    "no_copy": 1,
    "print_hide": 1,
    "read_only": 1
+  },
+  {
+   "fieldname": "supervisor",
+   "fieldtype": "Link",
+   "label": "Supervisor",
+   "options": "User",
+   "read_only": 1,
+   "in_standard_filter": 1,
+   "ignore_user_permissions": 1,
+   "description": "Resolved automatically on submission: the preparer's direct supervisor (Employee → Reports To)."
+  },
+  {
+   "fieldname": "qa_supervisor",
+   "fieldtype": "Link",
+   "label": "QA Supervisor",
+   "options": "User",
+   "read_only": 1,
+   "in_standard_filter": 1,
+   "ignore_user_permissions": 1,
+   "description": "Resolved automatically from DMS Settings for the document's department. May approve directly or delegate a sequential QA review queue."
+  },
+  {
+   "fieldname": "regulatory_manager",
+   "fieldtype": "Link",
+   "label": "Regulatory Manager",
+   "options": "User",
+   "read_only": 1,
+   "ignore_user_permissions": 1,
+   "description": "Resolved automatically from DMS Settings for the document's department. Validates the document after Manager approval."
+  },
+  {
+   "fieldname": "section_qa_review",
+   "fieldtype": "Section Break",
+   "label": "QA Review Queue",
+   "collapsible": 1
+  },
+  {
+   "fieldname": "qa_reviews",
+   "fieldtype": "Table",
+   "label": "QA Reviews",
+   "options": "GMP QA Review",
+   "read_only": 1,
+   "description": "Sequential review queue delegated by the QA Supervisor. Rows are managed by the workflow engine and retained across delegation rounds for audit."
+  },
+  {
+   "fieldname": "qa_review_complete",
+   "fieldtype": "Check",
+   "label": "QA Review Complete",
+   "read_only": 1,
+   "hidden": 1,
+   "default": "0"
+  },
+  {
+   "fieldname": "supervisor_approved_by",
+   "fieldtype": "Link",
+   "label": "Supervisor Approved By",
+   "options": "User",
+   "read_only": 1,
+   "ignore_user_permissions": 1
+  },
+  {
+   "fieldname": "supervisor_approved_on",
+   "fieldtype": "Datetime",
+   "label": "Supervisor Approved On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "manager_approved_by",
+   "fieldtype": "Link",
+   "label": "Manager Approved By",
+   "options": "User",
+   "read_only": 1,
+   "ignore_user_permissions": 1
+  },
+  {
+   "fieldname": "manager_approved_on",
+   "fieldtype": "Datetime",
+   "label": "Manager Approved On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "regulatory_validated_by",
+   "fieldtype": "Link",
+   "label": "Regulatory Validated By",
+   "options": "User",
+   "read_only": 1,
+   "ignore_user_permissions": 1
+  },
+  {
+   "fieldname": "regulatory_validated_on",
+   "fieldtype": "Datetime",
+   "label": "Regulatory Validated On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_rh_2",
+   "fieldtype": "Column Break"
   }
  ],
  "is_submittable": 1,
@@ -506,6 +616,24 @@
    "read": 1,
    "report": 1,
    "print": 1
+  },
+  {
+   "role": "DMS Initiator",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "print": 1,
+   "email": 1,
+   "report": 1,
+   "share": 1
+  },
+  {
+   "role": "DMS Approver",
+   "read": 1,
+   "write": 1,
+   "print": 1,
+   "email": 1,
+   "report": 1
   }
  ],
  "search_fields": "document_name_en,document_name_fa,document_type,department",

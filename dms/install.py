@@ -75,17 +75,29 @@ GMP_WORKFLOW_NAME = "GMP Document Workflow"
 # trigger for on_submit (PDF render etc.).
 # `allow_edit` is the single role permitted to edit a document while it sits in
 # that state (Frappe Workflow allows exactly one role per state). The preparer
-# states (Draft / Revision Requested) stay with "QA Manager" so authors edit
-# their own drafts; the in-pipeline and submitted states are owned by
-# "DMS Manager" (the module-owner/admin role) so an owner can correct or
-# override a document anywhere in the controlled lifecycle. A module owner who
-# also authors drafts should additionally hold "QA Manager".
+# states (Draft / Revision Requested) belong to "DMS Initiator" (the authoring
+# role) so authors edit their own drafts; the in-pipeline and submitted states
+# are owned by "DMS Manager" (the module-owner/admin role) so an owner can
+# correct or override a document anywhere in the controlled lifecycle. A module
+# owner who also authors drafts should additionally hold "DMS Initiator".
+#
+# The approval chain (see GMP_WORKFLOW_TRANSITIONS):
+#   Draft → Pending Supervisor Approval → Under Review (supervisor's manager)
+#   → Pending QA Supervisor → [QA Review In Progress: sequential delegated
+#   queue, driven by the controller's queue engine, not by manual transitions]
+#   → Pending Manager Approval (the same manager who reviewed) → Pending
+#   Regulatory Validation → Pending Final QA Approval → Approved (Publish).
 GMP_WORKFLOW_STATES = [
-    {"state": "Draft",                "doc_status": 0, "allow_edit": "QA Manager",  "style": "Warning"},
-    {"state": "Under Review",         "doc_status": 0, "allow_edit": "DMS Manager", "style": "Primary"},
-    {"state": "Pending QA Approval",  "doc_status": 0, "allow_edit": "DMS Manager", "style": "Primary"},
-    {"state": "Approved",             "doc_status": 1, "allow_edit": "DMS Manager", "style": "Success"},
-    {"state": "Revision Requested",   "doc_status": 0, "allow_edit": "QA Manager",  "style": "Danger"},
+    {"state": "Draft",                         "doc_status": 0, "allow_edit": "DMS Initiator", "style": "Warning"},
+    {"state": "Pending Supervisor Approval",   "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
+    {"state": "Under Review",                  "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
+    {"state": "Pending QA Supervisor",         "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
+    {"state": "QA Review In Progress",         "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Info"},
+    {"state": "Pending Manager Approval",      "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
+    {"state": "Pending Regulatory Validation", "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
+    {"state": "Pending Final QA Approval",     "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
+    {"state": "Approved",                      "doc_status": 1, "allow_edit": "DMS Manager",   "style": "Success"},
+    {"state": "Revision Requested",            "doc_status": 0, "allow_edit": "DMS Initiator", "style": "Danger"},
     # Terminal state for an abandoned draft revision (a record created via
     # create_revision(), i.e. revision_of is set). The record is retained for
     # audit — on_trash blocks deletion — and the document it revises stays
@@ -105,14 +117,18 @@ GMP_WORKFLOW_STATES = [
     {"state": "Obsolete",             "doc_status": 2, "allow_edit": "QA Manager",  "style": "Danger"},
 ]
 
-# Each transition is gated by role (QA Manager) AND a per-actor `condition`:
-# only the assigned preparer / reviewer / QA approver (or Administrator, as an
+# Each transition is gated by role AND a per-actor `condition`: only the
+# specific User resolved onto the document (supervisor / reviewer / QA
+# supervisor / regulatory manager / QA approver — or Administrator, as an
 # escape hatch) may act. frappe.session is exposed in the workflow condition
 # eval globals, so `doc.<field> == frappe.session.user` is a safe expression.
 # The controller's _apply_workflow_side_effects() reacts to the resulting
 # workflow_status change to stamp audit fields and shuffle ToDos.
 _PREPARER = 'doc.prepared_by == frappe.session.user or frappe.session.user == "Administrator"'
+_SUPERVISOR = 'doc.supervisor == frappe.session.user or frappe.session.user == "Administrator"'
 _REVIEWER = 'doc.reviewer == frappe.session.user or frappe.session.user == "Administrator"'
+_QA_SUPERVISOR = 'doc.qa_supervisor == frappe.session.user or frappe.session.user == "Administrator"'
+_REGULATORY = 'doc.regulatory_manager == frappe.session.user or frappe.session.user == "Administrator"'
 _QA = 'doc.qa_approver == frappe.session.user or frappe.session.user == "Administrator"'
 # Cancelling a revision is only meaningful on a draft created via
 # create_revision() (revision_of set) and is reserved to the preparer, the QA
@@ -129,33 +145,84 @@ _REVISION_CANCEL = (
 # NORMAL case here: the preparer both creates the draft and submits it for
 # review. The real per-actor control is the `condition` on each transition
 # (assigned preparer/reviewer/QA approver only), not the ownership check.
+# Forward chain + one-level "Return" at every stage (plus a full return to
+# the preparer from the pre-QA stages). "QA Review In Progress" has no manual
+# forward transition on purpose: it is entered by delegate_qa_review() and
+# left by the controller's queue engine when the last delegated reviewer
+# completes — only the emergency "Recall Delegation" is a human action.
 GMP_WORKFLOW_TRANSITIONS = [
-    {"state": "Draft",               "action": "Submit for Review",          "next_state": "Under Review",        "allowed": "QA Manager", "condition": _PREPARER, "allow_self_approval": 1},
-    {"state": "Revision Requested",  "action": "Submit for Review",          "next_state": "Under Review",        "allowed": "QA Manager", "condition": _PREPARER, "allow_self_approval": 1},
-    {"state": "Under Review",        "action": "Approve as Reviewer",        "next_state": "Pending QA Approval", "allowed": "QA Manager", "condition": _REVIEWER, "allow_self_approval": 1},
-    {"state": "Under Review",        "action": "Request Revision (Reviewer)","next_state": "Revision Requested",  "allowed": "QA Manager", "condition": _REVIEWER, "allow_self_approval": 1},
-    {"state": "Pending QA Approval", "action": "Approve as QA",              "next_state": "Approved",            "allowed": "QA Manager", "condition": _QA, "allow_self_approval": 1},
-    {"state": "Pending QA Approval", "action": "Request Revision (QA)",      "next_state": "Under Review",        "allowed": "QA Manager", "condition": _QA, "allow_self_approval": 1},
-    # Abandon a draft revision at any pre-approval stage. Terminal: no
+    {"state": "Draft",                         "action": "Submit for Approval",     "next_state": "Pending Supervisor Approval",   "allowed": "DMS Initiator", "condition": _PREPARER, "allow_self_approval": 1},
+    {"state": "Revision Requested",            "action": "Submit for Approval",     "next_state": "Pending Supervisor Approval",   "allowed": "DMS Initiator", "condition": _PREPARER, "allow_self_approval": 1},
+
+    {"state": "Pending Supervisor Approval",   "action": "Approve (Supervisor)",    "next_state": "Under Review",                  "allowed": "DMS Approver",  "condition": _SUPERVISOR, "allow_self_approval": 1},
+    {"state": "Pending Supervisor Approval",   "action": "Return to Preparer",      "next_state": "Revision Requested",            "allowed": "DMS Approver",  "condition": _SUPERVISOR, "allow_self_approval": 1},
+
+    {"state": "Under Review",                  "action": "Approve as Reviewer",     "next_state": "Pending QA Supervisor",         "allowed": "DMS Approver",  "condition": _REVIEWER, "allow_self_approval": 1},
+    {"state": "Under Review",                  "action": "Return to Supervisor",    "next_state": "Pending Supervisor Approval",   "allowed": "DMS Approver",  "condition": _REVIEWER, "allow_self_approval": 1},
+    {"state": "Under Review",                  "action": "Return to Preparer",      "next_state": "Revision Requested",            "allowed": "DMS Approver",  "condition": _REVIEWER, "allow_self_approval": 1},
+
+    {"state": "Pending QA Supervisor",         "action": "Approve (QA Supervisor)", "next_state": "Pending Manager Approval",      "allowed": "DMS Approver",  "condition": _QA_SUPERVISOR, "allow_self_approval": 1},
+    {"state": "Pending QA Supervisor",         "action": "Return to Reviewer",      "next_state": "Under Review",                  "allowed": "DMS Approver",  "condition": _QA_SUPERVISOR, "allow_self_approval": 1},
+    {"state": "Pending QA Supervisor",         "action": "Return to Preparer",      "next_state": "Revision Requested",            "allowed": "DMS Approver",  "condition": _QA_SUPERVISOR, "allow_self_approval": 1},
+
+    {"state": "QA Review In Progress",         "action": "Recall Delegation",       "next_state": "Pending QA Supervisor",         "allowed": "DMS Approver",  "condition": _QA_SUPERVISOR, "allow_self_approval": 1},
+
+    {"state": "Pending Manager Approval",      "action": "Approve (Manager)",       "next_state": "Pending Regulatory Validation", "allowed": "DMS Approver",  "condition": _REVIEWER, "allow_self_approval": 1},
+    {"state": "Pending Manager Approval",      "action": "Return to QA Supervisor", "next_state": "Pending QA Supervisor",         "allowed": "DMS Approver",  "condition": _REVIEWER, "allow_self_approval": 1},
+
+    {"state": "Pending Regulatory Validation", "action": "Validate (Regulatory)",   "next_state": "Pending Final QA Approval",     "allowed": "DMS Approver",  "condition": _REGULATORY, "allow_self_approval": 1},
+    {"state": "Pending Regulatory Validation", "action": "Return to Manager",       "next_state": "Pending Manager Approval",      "allowed": "DMS Approver",  "condition": _REGULATORY, "allow_self_approval": 1},
+
+    {"state": "Pending Final QA Approval",     "action": "Publish",                 "next_state": "Approved",                      "allowed": "QA Manager",    "condition": _QA, "allow_self_approval": 1},
+    {"state": "Pending Final QA Approval",     "action": "Return to Regulatory",    "next_state": "Pending Regulatory Validation", "allowed": "QA Manager",    "condition": _QA, "allow_self_approval": 1},
+
+    # Abandon a draft revision at any pre-QA-delegation stage. Terminal: no
     # transition leaves Revision Cancelled, and the revised document remains
     # the effective version untouched.
-    {"state": "Draft",               "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
-    {"state": "Under Review",        "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
-    {"state": "Pending QA Approval", "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
-    {"state": "Revision Requested",  "action": "Cancel Revision",            "next_state": "Revision Cancelled",  "allowed": "QA Manager", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
+    {"state": "Draft",                         "action": "Cancel Revision",         "next_state": "Revision Cancelled",            "allowed": "DMS Initiator", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
+    {"state": "Revision Requested",            "action": "Cancel Revision",         "next_state": "Revision Cancelled",            "allowed": "DMS Initiator", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
+    {"state": "Pending Supervisor Approval",   "action": "Cancel Revision",         "next_state": "Revision Cancelled",            "allowed": "DMS Initiator", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
+    {"state": "Under Review",                  "action": "Cancel Revision",         "next_state": "Revision Cancelled",            "allowed": "DMS Initiator", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
+    {"state": "Pending QA Supervisor",         "action": "Cancel Revision",         "next_state": "Revision Cancelled",            "allowed": "DMS Initiator", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
 ]
+
+# Rows of the pre-v1.3 short chain that the module used to own and now
+# actively removes on migrate (states are only removed when no transition
+# still references them and no document sits in them — see
+# _sync_gmp_workflow). Documents parked in a retired state are remapped by
+# patch v1_3_0.upgrade_workflow_chain BEFORE the state row disappears.
+GMP_RETIRED_TRANSITIONS = {
+    ("Draft", "Submit for Review"),
+    ("Revision Requested", "Submit for Review"),
+    ("Under Review", "Request Revision (Reviewer)"),
+    ("Pending QA Approval", "Approve as QA"),
+    ("Pending QA Approval", "Request Revision (QA)"),
+    ("Pending QA Approval", "Cancel Revision"),
+}
+GMP_RETIRED_STATES = {"Pending QA Approval"}
+
+
+# Module-owned roles:
+#   DMS Initiator — authors: create drafts, upload the controlled file,
+#                   submit for approval, cancel their own draft revisions.
+#   DMS Approver  — line/QA/regulatory actors acting through workflow
+#                   transitions (supervisor, reviewer/manager, QA supervisor,
+#                   regulatory manager). The per-transition `condition` pins
+#                   each action to the specific User resolved on the document.
+#   QA Manager    — QA department staff; owns the final Publish.
+#   DMS Manager   — module owner / admin.
+DMS_ROLES = ("QA Manager", "DMS Manager", "DMS Initiator", "DMS Approver")
 
 
 def before_install():
-    _ensure_role("QA Manager", desk_access=1)
-    # Module-owner / admin role with full CRUD + cancel across every document
-    # and department. Created before the DocTypes sync so their permission rows
-    # resolve the role on a fresh install.
-    _ensure_role("DMS Manager", desk_access=1)
+    # Created before the DocTypes sync so their permission rows resolve the
+    # roles on a fresh install.
+    for role in DMS_ROLES:
+        _ensure_role(role, desk_access=1)
 
 
 def after_install():
-    _ensure_role("DMS Manager", desk_access=1)
+    _ensure_roles()
     _ensure_department_abbr_field()
     _ensure_employee_signature_field()
     _ensure_amend_naming_rule()
@@ -167,13 +234,18 @@ def after_install():
 def after_migrate():
     # Idempotent re-assertion of custom fields; never touches user
     # preferences (default_workspace) so existing customizations stick.
-    _ensure_role("DMS Manager", desk_access=1)
+    _ensure_roles()
     _ensure_department_abbr_field()
     _ensure_employee_signature_field()
     _ensure_amend_naming_rule()
     _ensure_document_types()
     _ensure_gmp_workflow()
     _sync_gmp_workflow()
+
+
+def _ensure_roles():
+    for role in DMS_ROLES:
+        _ensure_role(role, desk_access=1)
 
 
 def _ensure_role(role_name, desk_access=1):
@@ -323,9 +395,39 @@ def _sync_gmp_workflow():
         if tr.allowed != desired["allowed"]:
             tr.allowed = desired["allowed"]
             changed = True
+        # next_state drifts when the module re-routes a kept action (v1.3
+        # points 'Approve as Reviewer' at 'Pending QA Supervisor' instead of
+        # the retired 'Pending QA Approval').
+        if tr.next_state != desired["next_state"]:
+            tr.next_state = desired["next_state"]
+            changed = True
         want_self = desired.get("allow_self_approval", 1)
         if int(tr.allow_self_approval or 0) != want_self:
             tr.allow_self_approval = want_self
+            changed = True
+
+    # Remove transitions of the retired pre-v1.3 short chain. Unlike the
+    # append/assert passes this DOES delete rows — but only the exact
+    # (state, action) pairs the module itself used to ship; anything a site
+    # admin added by hand has a different key and is left alone.
+    before_count = len(wf.transitions)
+    wf.transitions = [
+        tr for tr in wf.transitions if (tr.state, tr.action) not in GMP_RETIRED_TRANSITIONS
+    ]
+    if len(wf.transitions) != before_count:
+        changed = True
+
+    # Retire states once nothing references them: no remaining transition
+    # from/into the state and no document parked in it (patch
+    # v1_3_0.upgrade_workflow_chain remaps those first).
+    for retired in GMP_RETIRED_STATES:
+        if any(tr.state == retired or tr.next_state == retired for tr in wf.transitions):
+            continue
+        if frappe.db.exists("GMP Document", {"workflow_status": retired}):
+            continue
+        before_count = len(wf.states)
+        wf.states = [s for s in wf.states if s.state != retired]
+        if len(wf.states) != before_count:
             changed = True
 
     # Re-assert allow_edit so existing installs pick up the DMS Manager

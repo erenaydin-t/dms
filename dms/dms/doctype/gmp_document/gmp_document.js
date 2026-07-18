@@ -13,7 +13,7 @@ frappe.ui.form.on("GMP Document", {
         show_revision_banner(frm);
         show_pending_effective_banner(frm);
         toggle_effective_date_controls(frm);
-        toggle_assignment_fields(frm);
+        add_qa_queue_ui(frm);
         render_reference_tree(frm);
     },
 
@@ -414,18 +414,141 @@ function parse_filename(content_disposition, default_name) {
 // the native workflow-state badge in the form header. The only workflow
 // helper that remains is the assignment lock below.
 
-const WF_DRAFT = 'Draft';
-const WF_REVISION = 'Revision Requested';
+// -------------------------------------------------------------------- //
+//  Sequential QA review queue (delegate / complete / skip)             //
+// -------------------------------------------------------------------- //
+// All actors are resolved server-side when the preparer submits for
+// approval; the queue below is the QA Supervisor's delegation tool. The
+// hard authorization lives in the whitelisted endpoints — these buttons
+// are convenience UI for the users allowed to act.
+
+const WF_PENDING_QA_SUPERVISOR = 'Pending QA Supervisor';
+const WF_QA_IN_PROGRESS = 'QA Review In Progress';
 
 
-function toggle_assignment_fields(frm) {
-    // Reviewer / QA Approver are editable only while the doc is sitting
-    // with the preparer (Draft or Revision Requested). Once it's in the
-    // pipeline the assignments are locked.
-    const status = frm.doc.workflow_status;
-    const editable = !status || status === WF_DRAFT || status === WF_REVISION;
-    frm.toggle_enable('reviewer', editable);
-    frm.toggle_enable('qa_approver', editable);
+function add_qa_queue_ui(frm) {
+    if (frm.is_new() || frm.doc.docstatus !== 0) return;
+    const user = frappe.session.user;
+    const is_qa_supervisor =
+        user === frm.doc.qa_supervisor ||
+        user === 'Administrator' ||
+        frappe.user.has_role('DMS Manager');
+
+    if (frm.doc.workflow_status === WF_PENDING_QA_SUPERVISOR && is_qa_supervisor) {
+        frm.add_custom_button(__('Delegate QA Review'), () => open_delegate_dialog(frm), __('QA Queue'));
+    }
+
+    if (frm.doc.workflow_status !== WF_QA_IN_PROGRESS) return;
+
+    const head = (frm.doc.qa_reviews || []).find((r) => r.status === 'Awaiting Review');
+    if (!head) return;
+
+    frm.set_intro(
+        __('QA review in progress — currently awaiting {0}.', [frappe.utils.escape_html(head.reviewer)]),
+        'blue'
+    );
+
+    if (user === head.reviewer || user === 'Administrator') {
+        frm.add_custom_button(__('Approve My QA Review'), () => complete_review_dialog(frm, 'Approve'), __('QA Queue'));
+        frm.add_custom_button(__('Return to QA Supervisor'), () => complete_review_dialog(frm, 'Return'), __('QA Queue'));
+    }
+    if (is_qa_supervisor) {
+        frm.add_custom_button(__('Skip Current Reviewer'), () => skip_reviewer_dialog(frm, head), __('QA Queue'));
+    }
+}
+
+
+function open_delegate_dialog(frm) {
+    const d = new frappe.ui.Dialog({
+        title: __('Delegate Sequential QA Review'),
+        fields: [
+            {
+                fieldtype: 'HTML',
+                options: `<p class="text-muted">${__(
+                    'Reviewers act one after the other, in this order. The document moves to the Manager only after every listed reviewer has completed (or been skipped with a reason).'
+                )}</p>`,
+            },
+            { fieldname: 'reviewer_1', fieldtype: 'Link', options: 'User', label: __('Reviewer 1'), reqd: 1 },
+            { fieldname: 'reviewer_2', fieldtype: 'Link', options: 'User', label: __('Reviewer 2') },
+            { fieldname: 'reviewer_3', fieldtype: 'Link', options: 'User', label: __('Reviewer 3') },
+        ],
+        primary_action_label: __('Delegate'),
+        primary_action(values) {
+            const reviewers = [values.reviewer_1, values.reviewer_2, values.reviewer_3].filter(Boolean);
+            frappe.call({
+                method: 'dms.dms.doctype.gmp_document.gmp_document.delegate_qa_review',
+                args: { docname: frm.doc.name, reviewers },
+                freeze: true,
+                freeze_message: __('Delegating…'),
+                callback() {
+                    d.hide();
+                    frm.reload_doc();
+                },
+            });
+        },
+    });
+    d.show();
+}
+
+
+function complete_review_dialog(frm, decision) {
+    const d = new frappe.ui.Dialog({
+        title: decision === 'Approve' ? __('Approve QA Review') : __('Return to QA Supervisor'),
+        fields: [
+            {
+                fieldname: 'comments',
+                fieldtype: 'Small Text',
+                label: __('Comments'),
+                reqd: decision === 'Return' ? 1 : 0,
+                description:
+                    decision === 'Return'
+                        ? __('A reason is mandatory when returning the document.')
+                        : __('Optional remarks, recorded on the review row and the timeline.'),
+            },
+        ],
+        primary_action_label: decision === 'Approve' ? __('Approve') : __('Return'),
+        primary_action(values) {
+            frappe.call({
+                method: 'dms.dms.doctype.gmp_document.gmp_document.complete_qa_review',
+                args: { docname: frm.doc.name, decision, comments: values.comments || '' },
+                freeze: true,
+                callback() {
+                    d.hide();
+                    frm.reload_doc();
+                },
+            });
+        },
+    });
+    d.show();
+}
+
+
+function skip_reviewer_dialog(frm, head) {
+    const d = new frappe.ui.Dialog({
+        title: __('Skip Current Reviewer'),
+        fields: [
+            {
+                fieldtype: 'HTML',
+                options: `<p>${__('The task currently sits with {0}. Skipping hands it to the next reviewer in the queue and is logged with your reason.', [
+                    frappe.utils.escape_html(head.reviewer),
+                ])}</p>`,
+            },
+            { fieldname: 'reason', fieldtype: 'Small Text', label: __('Reason'), reqd: 1 },
+        ],
+        primary_action_label: __('Skip'),
+        primary_action(values) {
+            frappe.call({
+                method: 'dms.dms.doctype.gmp_document.gmp_document.skip_qa_reviewer',
+                args: { docname: frm.doc.name, reason: values.reason },
+                freeze: true,
+                callback() {
+                    d.hide();
+                    frm.reload_doc();
+                },
+            });
+        },
+    });
+    d.show();
 }
 
 

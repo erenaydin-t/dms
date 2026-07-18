@@ -149,8 +149,13 @@ def check_signature(user):
 
 # Workflow states ----------------------------------------------------------- #
 WF_DRAFT = "Draft"
+WF_PENDING_SUPERVISOR = "Pending Supervisor Approval"
 WF_UNDER_REVIEW = "Under Review"
-WF_PENDING_QA = "Pending QA Approval"
+WF_PENDING_QA_SUPERVISOR = "Pending QA Supervisor"
+WF_QA_IN_PROGRESS = "QA Review In Progress"
+WF_PENDING_MANAGER = "Pending Manager Approval"
+WF_PENDING_REGULATORY = "Pending Regulatory Validation"
+WF_PENDING_FINAL_QA = "Pending Final QA Approval"
 WF_APPROVED = "Approved"
 WF_REVISION = "Revision Requested"
 WF_REVISION_CANCELLED = "Revision Cancelled"
@@ -158,13 +163,42 @@ WF_OBSOLETE = "Obsolete"
 
 WF_ALL = (
     WF_DRAFT,
+    WF_PENDING_SUPERVISOR,
     WF_UNDER_REVIEW,
-    WF_PENDING_QA,
+    WF_PENDING_QA_SUPERVISOR,
+    WF_QA_IN_PROGRESS,
+    WF_PENDING_MANAGER,
+    WF_PENDING_REGULATORY,
+    WF_PENDING_FINAL_QA,
     WF_APPROVED,
     WF_REVISION,
     WF_REVISION_CANCELLED,
     WF_OBSOLETE,
 )
+
+# Sequential QA-queue row statuses (GMP QA Review child table).
+QA_QUEUED = "Queued"
+QA_AWAITING = "Awaiting Review"
+QA_APPROVED = "Approved"
+QA_RETURNED = "Return Requested"
+QA_SKIPPED = "Skipped"
+QA_SUPERSEDED = "Superseded"
+QA_OPEN_STATUSES = (QA_QUEUED, QA_AWAITING)
+
+# Reverse-path edges: (from_state, to_state) → (actor field whose ToDo closes,
+# actor field who receives the task, untranslated ToDo message with {0} = doc
+# name). Every return stamps last_revision_by/on + the reason comment via
+# _stamp_revision_request, so the whole reverse path is logged and visible.
+_RETURN_EDGES = {
+    (WF_PENDING_SUPERVISOR, WF_REVISION):          ("supervisor",         "prepared_by",        "Address revision request — {0}"),
+    (WF_UNDER_REVIEW, WF_PENDING_SUPERVISOR):      ("reviewer",           "supervisor",         "Re-approve — reviewer returned {0}"),
+    (WF_UNDER_REVIEW, WF_REVISION):                ("reviewer",           "prepared_by",        "Address revision request — {0}"),
+    (WF_PENDING_QA_SUPERVISOR, WF_UNDER_REVIEW):   ("qa_supervisor",      "reviewer",           "Re-review — QA Supervisor returned {0}"),
+    (WF_PENDING_QA_SUPERVISOR, WF_REVISION):       ("qa_supervisor",      "prepared_by",        "Address revision request — {0}"),
+    (WF_PENDING_MANAGER, WF_PENDING_QA_SUPERVISOR): ("reviewer",          "qa_supervisor",      "Re-assess — Manager returned {0} to QA"),
+    (WF_PENDING_REGULATORY, WF_PENDING_MANAGER):   ("regulatory_manager", "reviewer",           "Re-approve — Regulatory returned {0}"),
+    (WF_PENDING_FINAL_QA, WF_PENDING_REGULATORY):  ("qa_approver",        "regulatory_manager", "Re-validate — Final QA returned {0}"),
+}
 
 
 class GMPDocument(NestedSet):
@@ -352,8 +386,24 @@ class GMPDocument(NestedSet):
         # version is still whichever chain member has docstatus == 1.
         self.is_active = 1
         self.workflow_status = WF_DRAFT
+        # Routing actors are re-resolved when this successor is submitted for
+        # approval — the org chart or DMS Settings may have changed since the
+        # predecessor's cycle — and every stage stamp starts blank.
+        self.supervisor = None
+        self.reviewer = None
+        self.qa_supervisor = None
+        self.regulatory_manager = None
+        self.qa_approver = None
+        self.qa_reviews = []
+        self.qa_review_complete = 0
+        self.supervisor_approved_by = None
+        self.supervisor_approved_on = None
         self.reviewed_by = None
         self.reviewed_on = None
+        self.manager_approved_by = None
+        self.manager_approved_on = None
+        self.regulatory_validated_by = None
+        self.regulatory_validated_on = None
         self.approved_by = None
         self.approved_on = None
         self.last_revision_request = None
@@ -434,7 +484,126 @@ class GMPDocument(NestedSet):
             frappe.throw(_("Reason for Change is mandatory when revising a GMP Document."))
         self._enforce_effective_date_policy()
         self._check_circular_references()
+        self._resolve_workflow_actors_on_submit_for_approval()
+        self._resolve_stage_actor_if_missing()
         self._validate_signatures()
+
+    def _resolve_stage_actor_if_missing(self):
+        """Safety net for documents that entered the pipeline before v1.3 (or
+        whose settings changed mid-flight): when a transition lands on a stage
+        whose settings-sourced actor was never resolved, resolve it now rather
+        than stranding the document in a state nobody is allowed to act on."""
+        before = self.get_doc_before_save()
+        if not before or before.workflow_status == self.workflow_status:
+            return
+        needed = {
+            WF_PENDING_QA_SUPERVISOR: ("qa_supervisor", _("QA Supervisor")),
+            WF_PENDING_REGULATORY: ("regulatory_manager", _("Regulatory Manager")),
+            WF_PENDING_FINAL_QA: ("qa_approver", _("QA Approver")),
+        }.get(self.workflow_status)
+        if not needed or self.get(needed[0]):
+            return
+
+        from dms.dms.doctype.dms_settings.dms_settings import resolve_department_actors
+
+        fieldname, label = needed
+        actor = resolve_department_actors(self.department).get(fieldname)
+        if not actor:
+            frappe.throw(
+                _("No {0} is configured for department {1}. Set it in DMS Settings.").format(
+                    label, frappe.bold(self.department or "?")
+                ),
+                title=_("Routing Failed"),
+            )
+        self.set(fieldname, actor)
+
+    def _resolve_workflow_actors_on_submit_for_approval(self):
+        """Dynamic routing: when the preparer submits the draft for approval
+        (Draft/Revision Requested → Pending Supervisor Approval), resolve and
+        freeze every workflow actor onto the document:
+
+          supervisor  — the preparer's direct supervisor (Employee.reports_to)
+          reviewer    — the supervisor's own manager; also acts later as the
+                        Manager in the post-QA approval step
+          qa_supervisor / regulatory_manager / qa_approver — from DMS Settings
+                        (per-department override, else global default)
+
+        Resolution runs inside validate() so the actors land in the same save
+        that performs the transition, and a failure aborts it with a precise
+        message. Re-submitting after a revision re-resolves, picking up org
+        chart or settings changes."""
+        before = self.get_doc_before_save()
+        entering = (
+            self.workflow_status == WF_PENDING_SUPERVISOR
+            and before is not None
+            and before.workflow_status in (WF_DRAFT, WF_REVISION)
+        )
+        if not entering:
+            return
+
+        def _employee_of(user, label):
+            emp = frappe.db.get_value(
+                "Employee",
+                {"user_id": user, "status": "Active"},
+                ["name", "employee_name", "reports_to"],
+                as_dict=True,
+            )
+            if not emp:
+                frappe.throw(
+                    _("{0} {1} has no active Employee record, so the approval chain cannot be resolved.").format(
+                        label, frappe.bold(user)
+                    ),
+                    title=_("Routing Failed"),
+                )
+            return emp
+
+        def _user_of_employee(employee_id, label):
+            user_id = frappe.db.get_value("Employee", employee_id, "user_id")
+            if not user_id:
+                frappe.throw(
+                    _("Employee {0} ({1}) is not linked to a User, so they cannot act in the workflow.").format(
+                        frappe.bold(employee_id), label
+                    ),
+                    title=_("Routing Failed"),
+                )
+            return user_id
+
+        preparer_emp = _employee_of(self.prepared_by, _("Preparer"))
+        if not preparer_emp.reports_to:
+            frappe.throw(
+                _("Employee {0} has no supervisor (Reports To is empty). Set it on the Employee record.").format(
+                    frappe.bold(preparer_emp.employee_name or preparer_emp.name)
+                ),
+                title=_("Routing Failed"),
+            )
+        self.supervisor = _user_of_employee(preparer_emp.reports_to, _("Supervisor"))
+
+        supervisor_reports_to = frappe.db.get_value("Employee", preparer_emp.reports_to, "reports_to")
+        if not supervisor_reports_to:
+            frappe.throw(
+                _("Supervisor {0} has no manager (Reports To is empty on their Employee record), so no Reviewer can be resolved.").format(
+                    frappe.bold(self.supervisor)
+                ),
+                title=_("Routing Failed"),
+            )
+        self.reviewer = _user_of_employee(supervisor_reports_to, _("Reviewer / Manager"))
+
+        from dms.dms.doctype.dms_settings.dms_settings import resolve_department_actors
+
+        actors = resolve_department_actors(self.department)
+        for fieldname, label in (
+            ("qa_supervisor", _("QA Supervisor")),
+            ("regulatory_manager", _("Regulatory Manager")),
+            ("qa_approver", _("QA Approver")),
+        ):
+            if not actors.get(fieldname):
+                frappe.throw(
+                    _("No {0} is configured for department {1}. Set it in DMS Settings.").format(
+                        label, frappe.bold(self.department or "?")
+                    ),
+                    title=_("Routing Failed"),
+                )
+            self.set(fieldname, actors[fieldname])
 
     def _enforce_effective_date_policy(self):
         """ERPNext posting-date semantics for ``effective_date``.
@@ -976,10 +1145,24 @@ class GMPDocument(NestedSet):
 
     def _convert_to_pdf(self, soffice, src_path, tmpdir):
         """Convert ``src_path`` to PDF via LibreOffice into ``tmpdir`` and return
-        the PDF bytes. Shared by every format's render pipeline."""
+        the PDF bytes. Shared by every format's render pipeline.
+
+        Each run gets a private ``UserInstallation`` profile: concurrent soffice
+        processes sharing the default profile exit 0 without producing output."""
+        profile_dir = os.path.join(tmpdir, ".lo-profile")
+        os.makedirs(profile_dir, exist_ok=True)
         try:
-            subprocess.run(
-                [soffice, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, src_path],
+            proc = subprocess.run(
+                [
+                    soffice,
+                    "--headless",
+                    f"-env:UserInstallation=file://{profile_dir}",
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    tmpdir,
+                    src_path,
+                ],
                 capture_output=True,
                 timeout=180,
                 check=True,
@@ -996,7 +1179,23 @@ class GMPDocument(NestedSet):
         stem = os.path.splitext(os.path.basename(src_path))[0]
         generated_pdf = os.path.join(tmpdir, f"{stem}.pdf")
         if not os.path.exists(generated_pdf):
-            frappe.throw(_("PDF was not generated by LibreOffice."))
+            # soffice also exits 0 when it has no import/export filter for the
+            # source format (e.g. libreoffice-calc/-draw not installed), so
+            # capture its output — the real reason is only ever printed there.
+            frappe.log_error(
+                title="GMP Document: PDF conversion produced no output",
+                message="\n".join(
+                    part
+                    for part in (
+                        f"binary: {soffice}",
+                        f"source: {os.path.basename(src_path)}",
+                        (proc.stdout or b"").decode("utf-8", errors="ignore"),
+                        (proc.stderr or b"").decode("utf-8", errors="ignore"),
+                    )
+                    if part
+                ),
+            )
+            frappe.throw(_("PDF was not generated by LibreOffice. Check Error Log for details."))
         with open(generated_pdf, "rb") as fh:
             return fh.read()
 
@@ -1281,12 +1480,15 @@ class GMPDocument(NestedSet):
     def _apply_workflow_side_effects(self):
         """Stamp audit fields and shuffle ToDos when workflow_status changes.
 
-        Transitions are performed by Frappe's native Workflow engine (the
-        "Actions" menu); this hook supplies the GMP bookkeeping the engine
-        does not: who reviewed/approved/requested-revision and when, plus the
-        task hand-off between the assigned preparer, reviewer and QA approver.
-        Per-actor authorisation is enforced separately by the transition
-        `condition` expressions defined in install.py.
+        Human transitions are performed by Frappe's native Workflow engine
+        (the "Actions" menu); this hook supplies the GMP bookkeeping the
+        engine does not: per-stage who/when stamps, timeline comments for the
+        forward AND reverse paths, and the task hand-off along the chain
+        (preparer → supervisor → reviewer → QA supervisor → manager →
+        regulatory → QA approver). Per-actor authorisation is enforced
+        separately by the transition `condition` expressions in install.py.
+        The sequential QA queue's own state changes bypass save (db_set in
+        the queue engine), so they do their bookkeeping inline, not here.
         """
         before = self.get_doc_before_save()
         if not before:
@@ -1299,38 +1501,75 @@ class GMPDocument(NestedSet):
 
         actor = frappe.session.user
 
-        if curr == WF_UNDER_REVIEW and prev in (WF_DRAFT, WF_REVISION):
-            # Preparer submitted for review.
-            self.add_comment("Workflow", _("Submitted for review by {0}").format(actor))
+        # ---------------- forward path ---------------- #
+        if curr == WF_PENDING_SUPERVISOR and prev in (WF_DRAFT, WF_REVISION):
+            # Preparer submitted for approval; actors were resolved in
+            # validate() during this same save.
+            self.add_comment(
+                "Workflow",
+                _("Submitted for approval by {0} — routed to supervisor {1}").format(actor, self.supervisor),
+            )
             _close_open_todos(self, allocated_to=self.prepared_by)
+            _create_todo(self, self.supervisor, _("Supervisor approval — GMP Document {0}").format(self.name))
+
+        elif curr == WF_UNDER_REVIEW and prev == WF_PENDING_SUPERVISOR:
+            self.db_set("supervisor_approved_by", actor, update_modified=False)
+            self.db_set("supervisor_approved_on", now_datetime(), update_modified=False)
+            self.add_comment("Workflow", _("Supervisor approved — forwarded to reviewer {0}").format(self.reviewer))
+            _close_open_todos(self, allocated_to=self.supervisor)
             _create_todo(self, self.reviewer, _("Review GMP Document {0}").format(self.name))
 
-        elif curr == WF_PENDING_QA:
-            # Reviewer approved — forward to QA.
+        elif curr == WF_PENDING_QA_SUPERVISOR and prev == WF_UNDER_REVIEW:
             self.db_set("reviewed_by", actor, update_modified=False)
             self.db_set("reviewed_on", now_datetime(), update_modified=False)
-            self.add_comment("Workflow", _("Reviewer approved — forwarded to QA"))
+            self.add_comment("Workflow", _("Reviewer approved — forwarded to QA Supervisor {0}").format(self.qa_supervisor))
             _close_open_todos(self, allocated_to=self.reviewer)
-            _create_todo(self, self.qa_approver, _("QA approval — GMP Document {0}").format(self.name))
+            _create_todo(self, self.qa_supervisor, _("QA Supervisor — approve or delegate review of {0}").format(self.name))
+
+        elif curr == WF_PENDING_MANAGER and prev == WF_PENDING_QA_SUPERVISOR:
+            # QA Supervisor approved directly, without delegating a queue (or
+            # past a halted one — retire any rows still queued from it).
+            self._supersede_open_qa_rows()
+            self.add_comment("Workflow", _("QA Supervisor approved — forwarded to Manager {0}").format(self.reviewer))
+            _close_open_todos(self, allocated_to=self.qa_supervisor)
+            _create_todo(self, self.reviewer, _("Manager approval — GMP Document {0}").format(self.name))
+
+        elif curr == WF_PENDING_REGULATORY and prev == WF_PENDING_MANAGER:
+            self.db_set("manager_approved_by", actor, update_modified=False)
+            self.db_set("manager_approved_on", now_datetime(), update_modified=False)
+            self.add_comment("Workflow", _("Manager approved — forwarded to Regulatory {0}").format(self.regulatory_manager))
+            _close_open_todos(self, allocated_to=self.reviewer)
+            _create_todo(self, self.regulatory_manager, _("Regulatory validation — GMP Document {0}").format(self.name))
+
+        elif curr == WF_PENDING_FINAL_QA and prev == WF_PENDING_REGULATORY:
+            self.db_set("regulatory_validated_by", actor, update_modified=False)
+            self.db_set("regulatory_validated_on", now_datetime(), update_modified=False)
+            self.add_comment("Workflow", _("Regulatory validated — forwarded to QA Approver {0}").format(self.qa_approver))
+            _close_open_todos(self, allocated_to=self.regulatory_manager)
+            _create_todo(self, self.qa_approver, _("Final QA authorization — publish GMP Document {0}").format(self.name))
 
         elif curr == WF_APPROVED:
-            # QA approved (this save also auto-submits the document).
+            # Final QA published (this save also auto-submits the document).
             self.db_set("approved_by", actor, update_modified=False)
             self.db_set("approved_on", now_datetime(), update_modified=False)
-            self.add_comment("Workflow", _("QA approval granted — document submitted"))
+            self.add_comment("Workflow", _("Final QA authorization granted — document published"))
             _close_open_todos(self, allocated_to=self.qa_approver)
 
-        elif curr == WF_REVISION and prev == WF_UNDER_REVIEW:
-            # Reviewer bounced the document back to the preparer.
-            self._stamp_revision_request(actor)
-            _close_open_todos(self, allocated_to=self.reviewer)
-            _create_todo(self, self.prepared_by, _("Address revision request — {0}").format(self.name))
+        # ------------- QA delegation recall ------------- #
+        elif prev == WF_QA_IN_PROGRESS and curr == WF_PENDING_QA_SUPERVISOR:
+            # Manual "Recall Delegation" by the QA Supervisor. (The queue
+            # engine's own returns bypass save, so only the human action
+            # arrives here.)
+            self._supersede_open_qa_rows()
+            self.add_comment("Workflow", _("QA delegation recalled by {0}").format(actor))
+            _create_todo(self, self.qa_supervisor, _("QA Supervisor — approve or delegate review of {0}").format(self.name))
 
-        elif curr == WF_UNDER_REVIEW and prev == WF_PENDING_QA:
-            # QA bounced the document back to the reviewer.
+        # ---------------- reverse path ---------------- #
+        elif (prev, curr) in _RETURN_EDGES:
+            from_field, to_field, todo_msg = _RETURN_EDGES[(prev, curr)]
             self._stamp_revision_request(actor)
-            _close_open_todos(self, allocated_to=self.qa_approver)
-            _create_todo(self, self.reviewer, _("Re-review — QA requested revision on {0}").format(self.name))
+            _close_open_todos(self, allocated_to=self.get(from_field))
+            _create_todo(self, self.get(to_field), _(todo_msg).format(self.name))
 
         elif curr == WF_REVISION_CANCELLED:
             # Draft revision abandoned. Terminal: the record is retained for
@@ -1343,7 +1582,15 @@ class GMPDocument(NestedSet):
                     actor, self.revision_of or _("the approved predecessor")
                 ),
             )
-            for assignee in (self.prepared_by, self.reviewer, self.qa_approver):
+            self._supersede_open_qa_rows()
+            for assignee in (
+                self.prepared_by,
+                self.supervisor,
+                self.reviewer,
+                self.qa_supervisor,
+                self.regulatory_manager,
+                self.qa_approver,
+            ):
                 _close_open_todos(self, allocated_to=assignee)
             if self.revision_of:
                 try:
@@ -1370,6 +1617,103 @@ class GMPDocument(NestedSet):
             "Workflow",
             _("Revision requested by {0}: {1}").format(actor, reason or _("(no reason given)")),
         )
+
+    # ------------------------------------------------------------------ #
+    #  Sequential QA review queue engine                                 #
+    # ------------------------------------------------------------------ #
+    # The queue lives in the qa_reviews child table; row order within the
+    # highest `round` IS the review order. The engine (not manual workflow
+    # actions) moves the document out of 'QA Review In Progress': forward to
+    # 'Pending Manager Approval' once every row of the round is closed with
+    # at least one actual approval, or back to 'Pending QA Supervisor' when
+    # a reviewer requests a return (or a round ends all-skipped). Server-
+    # driven state changes go through _server_transition (db_set + comment)
+    # — deliberately outside apply_workflow, which models single-actor
+    # role-gated actions and cannot express "advance when the queue drains".
+
+    def _server_transition(self, next_state, comment):
+        """Engine-driven state change + audit comment. db_set keeps it out of
+        the Workflow engine's transition validation (there is intentionally no
+        manual transition for these edges)."""
+        self.db_set("workflow_status", next_state, update_modified=False)
+        self.add_comment("Workflow", comment)
+
+    def _current_qa_round(self):
+        return max((cint(r.round) for r in self.qa_reviews), default=0)
+
+    def _current_round_rows(self):
+        rnd = self._current_qa_round()
+        return [r for r in self.qa_reviews if cint(r.round) == rnd]
+
+    def _qa_queue_head(self):
+        """The single row currently awaiting review, or None."""
+        for row in self._current_round_rows():
+            if row.status == QA_AWAITING:
+                return row
+        return None
+
+    def _supersede_open_qa_rows(self):
+        """Close every open queue row (any round) and its reviewer's task.
+        Rows are retained with status Superseded — the audit record of a
+        recalled or cancelled delegation."""
+        for row in self.qa_reviews:
+            if row.status in QA_OPEN_STATUSES:
+                _unassign_queue_reviewer(self, row.reviewer)
+                frappe.db.set_value(
+                    "GMP QA Review", row.name,
+                    {"status": QA_SUPERSEDED, "completed_on": now_datetime()},
+                    update_modified=False,
+                )
+                row.status = QA_SUPERSEDED
+
+    def _activate_next_qa_reviewer(self):
+        """Hand the task to the next Queued row of the current round. Returns
+        the activated row, or None when the queue is drained."""
+        for row in self._current_round_rows():
+            if row.status == QA_QUEUED:
+                frappe.db.set_value(
+                    "GMP QA Review", row.name,
+                    {"status": QA_AWAITING, "assigned_on": now_datetime()},
+                    update_modified=False,
+                )
+                row.status = QA_AWAITING
+                _assign_queue_reviewer(
+                    self, row.reviewer,
+                    _("QA review (sequential queue) — GMP Document {0}").format(self.name),
+                )
+                self.add_comment(
+                    "Workflow",
+                    _("QA review task handed to {0}").format(row.reviewer),
+                )
+                return row
+        return None
+
+    def _finish_qa_queue(self):
+        """The current round has no Queued/Awaiting rows left. Advance to the
+        Manager if at least one reviewer actually approved; a round that ended
+        with zero approvals (everyone skipped) goes back to the QA Supervisor
+        — a skipped-out queue must never count as a completed review."""
+        rows = self._current_round_rows()
+        approvals = [r for r in rows if r.status == QA_APPROVED]
+        if approvals:
+            self.db_set("qa_review_complete", 1, update_modified=False)
+            self._server_transition(
+                WF_PENDING_MANAGER,
+                _("All delegated QA reviews completed ({0} approved, {1} skipped) — forwarded to Manager {2}").format(
+                    len(approvals),
+                    len([r for r in rows if r.status == QA_SKIPPED]),
+                    self.reviewer,
+                ),
+            )
+            _create_todo(self, self.reviewer, _("Manager approval — GMP Document {0}").format(self.name))
+        else:
+            self._server_transition(
+                WF_PENDING_QA_SUPERVISOR,
+                _("QA review round ended without any completed review — returned to QA Supervisor {0}").format(
+                    self.qa_supervisor
+                ),
+            )
+            _create_todo(self, self.qa_supervisor, _("QA Supervisor — approve or delegate review of {0}").format(self.name))
 
     def _repoint_references_to_self(self):
         """Swing dependents' reference rows from the superseded version to this
@@ -1896,38 +2240,53 @@ def _resolve_deliverable_path(doc):
 #  Workflow                                                              #
 # ---------------------------------------------------------------------- #
 #
-# Transitions are driven entirely by Frappe's native Workflow engine (the
-# form "Actions" menu). The state machine, per-actor authorisation
-# `condition`s, and roles are declared in install.py:
+# Human transitions are driven by Frappe's native Workflow engine (the form
+# "Actions" menu). The state machine, per-actor authorisation `condition`s,
+# and roles are declared in install.py. Forward chain:
 #
-#   Draft / Revision Requested ── Submit for Review ──► Under Review
-#   Under Review ── Approve as Reviewer ──► Pending QA Approval
-#   Under Review ── Request Revision (Reviewer) ──► Revision Requested
-#   Pending QA Approval ── Approve as QA ──► Approved (docstatus=1)
-#   Pending QA Approval ── Request Revision (QA) ──► Under Review
+#   Draft / Revision Requested ── Submit for Approval ──► Pending Supervisor Approval
+#   Pending Supervisor Approval ── Approve (Supervisor) ──► Under Review
+#   Under Review ── Approve as Reviewer ──► Pending QA Supervisor
+#   Pending QA Supervisor ── Approve (QA Supervisor) ──► Pending Manager Approval
+#   Pending QA Supervisor ── delegate_qa_review() ──► QA Review In Progress
+#   QA Review In Progress ── queue engine (all reviews done) ──► Pending Manager Approval
+#   Pending Manager Approval ── Approve (Manager) ──► Pending Regulatory Validation
+#   Pending Regulatory Validation ── Validate (Regulatory) ──► Pending Final QA Approval
+#   Pending Final QA Approval ── Publish ──► Approved (docstatus=1)
+#
+# Every stage also has a one-level "Return …" transition (see _RETURN_EDGES
+# for the audit bookkeeping on the reverse path). The sequential QA queue is
+# driven by the whitelisted endpoints below, not by manual transitions.
 #
 # Audit stamping and ToDo hand-off run in GMPDocument._apply_workflow_side_effects
-# (invoked from on_update / on_submit). There are deliberately no custom
-# transition endpoints here — the controller reacts to workflow_status
-# changes instead of owning the transitions.
+# (invoked from on_update / on_submit). The controller reacts to
+# workflow_status changes instead of owning the human transitions.
 
 
 @frappe.whitelist()
 def get_my_pending_count(user=None):
-    """Used by the workspace pending-count badge."""
+    """Used by the workspace pending-count badge: how many documents are
+    waiting on this user at each stage of the chain, including the QA queue
+    (counted only when the user is the row currently awaiting review)."""
     user = user or frappe.session.user
-    counts = {
-        "to_review": frappe.db.count("GMP Document", filters={
-            "docstatus": 0, "workflow_status": WF_UNDER_REVIEW, "reviewer": user,
-        }),
-        "to_approve": frappe.db.count("GMP Document", filters={
-            "docstatus": 0, "workflow_status": WF_PENDING_QA, "qa_approver": user,
-        }),
-        "to_revise": frappe.db.count("GMP Document", filters={
-            "docstatus": 0, "workflow_status": WF_REVISION, "prepared_by": user,
-        }),
-    }
-    counts["total"] = counts["to_review"] + counts["to_approve"] + counts["to_revise"]
+    stage_actor = (
+        ("supervisor_approval", WF_PENDING_SUPERVISOR, "supervisor"),
+        ("to_review", WF_UNDER_REVIEW, "reviewer"),
+        ("qa_supervisor", WF_PENDING_QA_SUPERVISOR, "qa_supervisor"),
+        ("manager_approval", WF_PENDING_MANAGER, "reviewer"),
+        ("regulatory", WF_PENDING_REGULATORY, "regulatory_manager"),
+        ("to_approve", WF_PENDING_FINAL_QA, "qa_approver"),
+        ("to_revise", WF_REVISION, "prepared_by"),
+    )
+    counts = {}
+    for key, state, actor_field in stage_actor:
+        counts[key] = frappe.db.count("GMP Document", filters={
+            "docstatus": 0, "workflow_status": state, actor_field: user,
+        })
+    counts["qa_queue"] = frappe.db.count("GMP QA Review", filters={
+        "parenttype": "GMP Document", "reviewer": user, "status": QA_AWAITING,
+    })
+    counts["total"] = sum(counts.values())
     return counts
 
 
@@ -1960,6 +2319,205 @@ def _close_open_todos(doc, allocated_to):
     )
     for t in open_todos:
         frappe.db.set_value("ToDo", t, "status", "Closed")
+
+
+def _assign_queue_reviewer(doc, user, description):
+    """Native assignment (updates `_assign` + creates the ToDo) so the queued
+    reviewer sees the document under 'Assigned to me'. Falls back to a plain
+    ToDo if the assignment API refuses (e.g. the user already holds one)."""
+    from frappe.desk.form.assign_to import add as assign_add
+
+    try:
+        assign_add(
+            {
+                "assign_to": [user],
+                "doctype": doc.doctype,
+                "name": doc.name,
+                "description": description,
+            },
+            ignore_permissions=True,
+        )
+    except Exception:
+        _create_todo(doc, user, description)
+
+
+def _unassign_queue_reviewer(doc, user):
+    """Mirror of _assign_queue_reviewer: clears `_assign` and the ToDo."""
+    from frappe.desk.form.assign_to import remove as assign_remove
+
+    if not user:
+        return
+    try:
+        assign_remove(doc.doctype, doc.name, user, ignore_permissions=True)
+    except Exception:
+        pass
+    _close_open_todos(doc, allocated_to=user)
+
+
+# ---------------------------------------------------------------------- #
+#  Sequential QA review queue: whitelisted endpoints                     #
+# ---------------------------------------------------------------------- #
+
+
+def _get_doc_for_qa_action(docname, expected_state):
+    doc = frappe.get_doc("GMP Document", docname)
+    if doc.workflow_status != expected_state:
+        frappe.throw(
+            _("This action requires the document to be in state {0} (it is {1}).").format(
+                frappe.bold(_(expected_state)), frappe.bold(_(doc.workflow_status))
+            )
+        )
+    return doc
+
+
+def _require_qa_supervisor(doc):
+    user = frappe.session.user
+    if (
+        user == doc.qa_supervisor
+        or user == "Administrator"
+        or {"DMS Manager", "System Manager"} & set(frappe.get_roles(user))
+    ):
+        return
+    frappe.throw(
+        _("Only the QA Supervisor assigned to this document may perform this action."),
+        frappe.PermissionError,
+    )
+
+
+@frappe.whitelist()
+def delegate_qa_review(docname, reviewers):
+    """QA Supervisor hands the document to a SEQUENTIAL queue of reviewers.
+
+    ``reviewers`` is an ordered list of User ids (JSON string or list); order
+    is the review order. Only the first reviewer receives the task; each
+    completion hands it to the next. The document leaves 'Pending QA
+    Supervisor' for 'QA Review In Progress' and only proceeds to the Manager
+    once every queued reviewer has completed (or been skipped with reason —
+    at least one real approval is required)."""
+    doc = _get_doc_for_qa_action(docname, WF_PENDING_QA_SUPERVISOR)
+    _require_qa_supervisor(doc)
+
+    reviewers = frappe.parse_json(reviewers) if isinstance(reviewers, str) else reviewers
+    reviewers = [r for r in (reviewers or []) if r]
+    if not reviewers:
+        frappe.throw(_("Select at least one reviewer to delegate to."))
+    if len(reviewers) != len(set(reviewers)):
+        frappe.throw(_("The same reviewer appears more than once in the queue."))
+
+    for user in reviewers:
+        if not frappe.db.get_value("User", user, "enabled"):
+            frappe.throw(_("User {0} does not exist or is disabled.").format(frappe.bold(user)))
+        # Separation of duties: the author must never QA-review their own
+        # document.
+        if user == doc.prepared_by:
+            frappe.throw(_("The preparer ({0}) cannot be a QA reviewer of their own document.").format(frappe.bold(user)))
+
+    # Retire any leftover open rows of earlier rounds, then append the new
+    # round. Old rows are kept — the delegation history is audit data.
+    doc._supersede_open_qa_rows()
+    rnd = doc._current_qa_round() + 1
+    for user in reviewers:
+        doc.append("qa_reviews", {"reviewer": user, "status": QA_QUEUED, "round": rnd})
+    doc.db_set("qa_review_complete", 0, update_modified=False)
+    doc.save(ignore_permissions=True)
+
+    _close_open_todos(doc, allocated_to=doc.qa_supervisor)
+    doc._server_transition(
+        WF_QA_IN_PROGRESS,
+        _("QA Supervisor {0} delegated sequential review (round {1}) to: {2}").format(
+            frappe.session.user, rnd, " → ".join(reviewers)
+        ),
+    )
+    doc._activate_next_qa_reviewer()
+    return {"round": rnd, "reviewers": reviewers}
+
+
+@frappe.whitelist()
+def complete_qa_review(docname, decision, comments=None):
+    """The reviewer currently holding the queue head records their outcome.
+
+    decision 'Approve' → the task passes to the next reviewer in the queue
+    (or, when the queue drains, the document moves on to the Manager).
+    decision 'Return' → the queue halts and the document goes back to the QA
+    Supervisor; a reason is mandatory."""
+    doc = _get_doc_for_qa_action(docname, WF_QA_IN_PROGRESS)
+    head = doc._qa_queue_head()
+    if not head:
+        frappe.throw(_("No QA reviewer is currently awaiting review on this document."))
+    user = frappe.session.user
+    if user not in (head.reviewer, "Administrator"):
+        frappe.throw(
+            _("It is {0}'s turn in the review queue — only they can complete this review.").format(
+                frappe.bold(head.reviewer)
+            ),
+            frappe.PermissionError,
+        )
+    if decision not in ("Approve", "Return"):
+        frappe.throw(_("Decision must be Approve or Return."))
+    comments = (comments or "").strip()
+    if decision == "Return" and not comments:
+        frappe.throw(_("A reason is mandatory when returning the document."))
+
+    status = QA_APPROVED if decision == "Approve" else QA_RETURNED
+    frappe.db.set_value(
+        "GMP QA Review", head.name,
+        {"status": status, "completed_on": now_datetime(), "comments": comments},
+        update_modified=False,
+    )
+    head.status = status
+    _unassign_queue_reviewer(doc, head.reviewer)
+    doc.add_comment(
+        "Workflow",
+        _("QA review by {0}: {1}{2}").format(
+            head.reviewer, _(status), " — {0}".format(comments) if comments else ""
+        ),
+    )
+
+    if status == QA_RETURNED:
+        doc._server_transition(
+            WF_PENDING_QA_SUPERVISOR,
+            _("QA reviewer {0} returned the document to the QA Supervisor").format(head.reviewer),
+        )
+        _create_todo(doc, doc.qa_supervisor, _("QA Supervisor — reviewer returned {0}").format(doc.name))
+        return {"status": status, "next": None}
+
+    nxt = doc._activate_next_qa_reviewer()
+    if not nxt:
+        doc._finish_qa_queue()
+    return {"status": status, "next": nxt.reviewer if nxt else None}
+
+
+@frappe.whitelist()
+def skip_qa_reviewer(docname, reason):
+    """QA Supervisor skips the reviewer currently holding the queue head
+    (absence cover). The skip and its mandatory reason are logged; the task
+    passes to the next reviewer in the queue. A round in which everyone was
+    skipped returns to the QA Supervisor instead of advancing."""
+    doc = _get_doc_for_qa_action(docname, WF_QA_IN_PROGRESS)
+    _require_qa_supervisor(doc)
+    reason = (reason or "").strip()
+    if not reason:
+        frappe.throw(_("A reason is mandatory when skipping a reviewer."))
+    head = doc._qa_queue_head()
+    if not head:
+        frappe.throw(_("No QA reviewer is currently awaiting review on this document."))
+
+    frappe.db.set_value(
+        "GMP QA Review", head.name,
+        {"status": QA_SKIPPED, "completed_on": now_datetime(), "skip_reason": reason},
+        update_modified=False,
+    )
+    head.status = QA_SKIPPED
+    _unassign_queue_reviewer(doc, head.reviewer)
+    doc.add_comment(
+        "Workflow",
+        _("QA reviewer {0} skipped by {1}: {2}").format(head.reviewer, frappe.session.user, reason),
+    )
+
+    nxt = doc._activate_next_qa_reviewer()
+    if not nxt:
+        doc._finish_qa_queue()
+    return {"skipped": head.reviewer, "next": nxt.reviewer if nxt else None}
 
 
 # ---------------------------------------------------------------------- #
@@ -2024,11 +2582,41 @@ def _visibility_scope(user=None):
     return set(_user_departments(user)), True
 
 
+# Fields naming a workflow participant on the document. Any user in one of
+# them (or in the QA review queue) may read the document throughout its
+# lifecycle — restricted access during the pipeline, but participants are
+# never locked out.
+_PARTICIPANT_FIELDS = (
+    "prepared_by",
+    "supervisor",
+    "reviewer",
+    "qa_supervisor",
+    "regulatory_manager",
+    "qa_approver",
+)
+
+# Which participant may WRITE while the document sits in each state: the
+# preparer while authoring, otherwise the actor the state is waiting on
+# (apply_workflow saves as the acting user, so the current actor needs write).
+_STATE_WRITE_ACTOR = {
+    WF_DRAFT: "prepared_by",
+    WF_REVISION: "prepared_by",
+    WF_PENDING_SUPERVISOR: "supervisor",
+    WF_UNDER_REVIEW: "reviewer",
+    WF_PENDING_QA_SUPERVISOR: "qa_supervisor",
+    WF_QA_IN_PROGRESS: "qa_supervisor",
+    WF_PENDING_MANAGER: "reviewer",
+    WF_PENDING_REGULATORY: "regulatory_manager",
+    WF_PENDING_FINAL_QA: "qa_approver",
+}
+
+
 def get_permission_query_conditions(user=None):
     """SQL visibility filter for GMP Document lists, reports and search.
 
     Empty string = no restriction (unrestricted roles). Restricted users get
-    their department's approved/active documents OR any document naming them."""
+    their department's approved/active documents OR any document naming them
+    as a workflow participant (including the delegated QA review queue)."""
     user = user or frappe.session.user
     if _is_unrestricted(user):
         return ""
@@ -2044,21 +2632,40 @@ def get_permission_query_conditions(user=None):
         )
 
     u = frappe.db.escape(user)
-    conditions.append("`tabGMP Document`.prepared_by = {0}".format(u))
-    conditions.append("`tabGMP Document`.reviewer = {0}".format(u))
-    conditions.append("`tabGMP Document`.qa_approver = {0}".format(u))
+    for fieldname in _PARTICIPANT_FIELDS:
+        conditions.append("`tabGMP Document`.{0} = {1}".format(fieldname, u))
+    conditions.append(
+        "exists (select 1 from `tabGMP QA Review` qr "
+        "where qr.parenttype = 'GMP Document' "
+        "and qr.parent = `tabGMP Document`.name "
+        "and qr.reviewer = {0})".format(u)
+    )
 
     return "(" + " or ".join(conditions) + ")"
+
+
+def _in_qa_queue(doc, user):
+    if doc.get("qa_reviews") is not None:
+        return any(r.reviewer == user for r in doc.qa_reviews)
+    return bool(
+        doc.get("name")
+        and frappe.db.exists(
+            "GMP QA Review",
+            {"parenttype": "GMP Document", "parent": doc.get("name"), "reviewer": user},
+        )
+    )
 
 
 def has_permission(doc, ptype="read", user=None):
     """Per-document gate mirroring get_permission_query_conditions().
 
-    Returning False denies; True/None defers to the role permission. Unrestricted
-    roles always pass. A plain member may read (and print) an approved, active
-    document of their department, or any document naming them; everything else
-    is denied for them here (role perms already withhold write/create/etc. — this
-    is defence in depth)."""
+    Returning False denies; True/None defers to the role permission.
+    Unrestricted roles always pass. A workflow participant may always read
+    (and print) the document; write is granted only to the participant the
+    current state is waiting on (that's what apply_workflow saves as). A
+    plain member may read an approved, active document of their department.
+    Everything else is denied here (role perms already withhold
+    create/delete/etc. — this is defence in depth)."""
     if doc is None:
         return None  # doctype-level check; leave to role perms + query conditions
 
@@ -2066,9 +2673,23 @@ def has_permission(doc, ptype="read", user=None):
     if _is_unrestricted(user):
         return True
 
+    if getattr(doc, "is_new", None) and doc.is_new():
+        return None  # creation is governed by role perms (DMS Initiator)
+
     read_like = ptype in ("read", "print")
-    named = user in (doc.get("prepared_by"), doc.get("reviewer"), doc.get("qa_approver"))
+    named = user in tuple(doc.get(f) for f in _PARTICIPANT_FIELDS)
     if named:
+        if read_like:
+            return True
+        write_actor_field = _STATE_WRITE_ACTOR.get(doc.get("workflow_status"))
+        return bool(
+            ptype == "write"
+            and cint(doc.get("docstatus")) == 0
+            and write_actor_field
+            and doc.get(write_actor_field) == user
+        )
+
+    if _in_qa_queue(doc, user):
         return read_like
 
     in_scope = (

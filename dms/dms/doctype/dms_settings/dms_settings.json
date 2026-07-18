@@ -1,0 +1,91 @@
+{
+ "actions": [],
+ "creation": "2026-07-18 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "section_global_actors",
+  "qa_supervisor",
+  "column_break_ga_1",
+  "regulatory_manager",
+  "qa_approver",
+  "section_department_actors",
+  "department_actors"
+ ],
+ "fields": [
+  {
+   "description": "Global defaults for the workflow actors that cannot be derived from the Employee reporting chain. A GMP Document cannot be submitted for approval until these resolve for its department.",
+   "fieldname": "section_global_actors",
+   "fieldtype": "Section Break",
+   "label": "Workflow Actors (Global Defaults)"
+  },
+  {
+   "fieldname": "qa_supervisor",
+   "fieldtype": "Link",
+   "ignore_user_permissions": 1,
+   "label": "QA Supervisor",
+   "options": "User"
+  },
+  {
+   "fieldname": "column_break_ga_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "regulatory_manager",
+   "fieldtype": "Link",
+   "ignore_user_permissions": 1,
+   "label": "Regulatory Manager (Technical Lead)",
+   "options": "User"
+  },
+  {
+   "fieldname": "qa_approver",
+   "fieldtype": "Link",
+   "ignore_user_permissions": 1,
+   "label": "QA Approver (Final Authorization)",
+   "options": "User"
+  },
+  {
+   "description": "Optional per-department overrides. An empty cell falls back to the global default above.",
+   "fieldname": "section_department_actors",
+   "fieldtype": "Section Break",
+   "label": "Per-Department Overrides"
+  },
+  {
+   "fieldname": "department_actors",
+   "fieldtype": "Table",
+   "label": "Department Actors",
+   "options": "DMS Department Actors"
+  }
+ ],
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-07-18 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "DMS",
+ "name": "DMS Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "DMS Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "read": 1,
+   "role": "QA Manager"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC"
+}
