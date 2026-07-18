@@ -40,6 +40,8 @@ USER root
 RUN apt-get update && apt-get install --no-install-recommends -y \
         libreoffice-core \
         libreoffice-writer \
+        libreoffice-calc \
+        libreoffice-draw \
     && rm -rf /var/lib/apt/lists/*
 USER frappe
 
@@ -52,7 +54,10 @@ USER root
 RUN apt-get update && apt-get install --no-install-recommends -y \
         libreoffice-core \
         libreoffice-writer \
+        libreoffice-calc \
+        libreoffice-draw \
         fonts-dejavu \
+        fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 USER frappe
