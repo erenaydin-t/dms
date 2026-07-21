@@ -523,11 +523,23 @@ class TestGMPPermissions(FrappeTestCase):
         _sync_gmp_workflow()
         wf = frappe.get_doc("Workflow", "GMP Document Workflow")
         allow = {s.state: s.allow_edit for s in wf.states}
-        self.assertEqual(allow.get("Draft"), "QA Manager")
-        self.assertEqual(allow.get("Revision Requested"), "QA Manager")
-        self.assertEqual(allow.get("Under Review"), "DMS Manager")
-        self.assertEqual(allow.get("Pending QA Approval"), "DMS Manager")
-        self.assertEqual(allow.get("Approved"), "DMS Manager")
+        # Preparer states belong to the authoring role (v1.3 approval chain).
+        self.assertEqual(allow.get("Draft"), "DMS Initiator")
+        self.assertEqual(allow.get("Revision Requested"), "DMS Initiator")
+        # In-pipeline and submitted states belong to the module-owner role.
+        for state in (
+            "Pending Supervisor Approval",
+            "Under Review",
+            "Pending QA Supervisor",
+            "QA Review In Progress",
+            "Pending Manager Approval",
+            "Pending Regulatory Validation",
+            "Pending Final QA Approval",
+            "Approved",
+        ):
+            self.assertEqual(allow.get(state), "DMS Manager", state)
+        # The retired pre-v1.3 state must be gone after sync.
+        self.assertNotIn("Pending QA Approval", allow)
 
     def test_obsolete_state_allows_qa_manager_amend(self):
         """Regression: after a document is cancelled (workflow state Obsolete),
