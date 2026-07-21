@@ -44,6 +44,12 @@ QC_MGR = "gmp-e2e-qc@example.com"
 DEPT_MGR = "gmp-e2e-deptmgr@example.com"
 EMP = "gmp-e2e-emp@example.com"
 OUTSIDER = "gmp-e2e-outsider@example.com"
+# Dedicated reports_to chain above OWNER (the preparer) for the v1.3 dynamic
+# routing: supervisor = OWNER's Employee.reports_to, reviewer = the
+# supervisor's own manager. Kept separate from DEPT_MGR/EMP so the role-access
+# assertions in Section 9 are not affected by workflow-actor access.
+CHAIN_SUP = "gmp-e2e-chain-sup@example.com"
+CHAIN_MGR = "gmp-e2e-chain-mgr@example.com"
 
 
 def _ensure_department(name, abbr):
@@ -173,6 +179,25 @@ class TestE2EPDF(FrappeTestCase):
         # reviewer/qa_approver are Administrator in these tests; the signature
         # validation requires Administrator to have a signature image.
         _ensure_signature("Administrator", DEPT_QA)
+        # Dynamic routing (v1.3): the preparer needs a two-level reports_to
+        # chain, the resolved reviewer (CHAIN_MGR) needs a signature, and the
+        # QA-stage actors come from DMS Settings.
+        _ensure_user(CHAIN_SUP, ["Employee"])
+        _ensure_user(CHAIN_MGR, ["Employee"])
+        mgr_emp = _ensure_employee(CHAIN_MGR, DEPT_QA)
+        sup_emp = _ensure_employee(CHAIN_SUP, DEPT_QA)
+        own_emp = _ensure_employee(OWNER, DEPT_QA)
+        admin_emp = frappe.db.get_value("Employee", {"user_id": "Administrator"}, "name")
+        frappe.db.set_value("Employee", sup_emp, "reports_to", mgr_emp)
+        frappe.db.set_value("Employee", own_emp, "reports_to", sup_emp)
+        frappe.db.set_value("Employee", admin_emp, "reports_to", sup_emp)
+        _ensure_signature(CHAIN_MGR, DEPT_QA)
+        settings = frappe.get_doc("DMS Settings")
+        settings.qa_supervisor = "Administrator"
+        settings.regulatory_manager = "Administrator"
+        settings.qa_approver = "Administrator"
+        settings.save(ignore_permissions=True)
+        frappe.db.commit()
         _purge_docs()
 
     @classmethod
@@ -330,9 +355,18 @@ class TestE2EPDF(FrappeTestCase):
         ).insert(ignore_permissions=True)
 
     def _approve(self, doc):
-        apply_workflow(doc, "Submit for Review")
-        apply_workflow(doc, "Approve as Reviewer")
-        apply_workflow(doc, "Approve as QA")
+        # v1.3 approval chain (see install.py). Runs as Administrator, which
+        # every transition role and per-actor condition accepts as escape hatch.
+        for action in (
+            "Submit for Approval",
+            "Approve (Supervisor)",
+            "Approve as Reviewer",
+            "Approve (QA Supervisor)",
+            "Approve (Manager)",
+            "Validate (Regulatory)",
+            "Publish",
+        ):
+            apply_workflow(doc, action)
         doc.reload()
         return doc
 

@@ -135,6 +135,46 @@ def _ensure_signature(user, dept):
     frappe.db.commit()
 
 
+# The v1.3 approval chain resolves actors dynamically on Submit for Approval:
+# supervisor = the preparer's Employee.reports_to, reviewer = the supervisor's
+# own manager, and the QA-stage actors come from DMS Settings. Tests run as
+# Administrator (the preparer), so Administrator's Employee needs a two-level
+# reports_to chain above it and DMS Settings must name the QA-stage actors.
+UNIT_SUPERVISOR = "gmp-unit-supervisor@example.com"
+UNIT_MANAGER = "gmp-unit-manager@example.com"
+
+
+def _ensure_routing_user(email):
+    if not frappe.db.exists("User", email):
+        u = frappe.new_doc("User")
+        u.email = email
+        u.first_name = email.split("@")[0]
+        u.user_type = "System User"
+        u.send_welcome_email = 0
+        u.insert(ignore_permissions=True)
+
+
+def _ensure_routing_chain():
+    for email in (UNIT_SUPERVISOR, UNIT_MANAGER):
+        _ensure_routing_user(email)
+    # _ensure_signature creates the Employee record if missing. The manager
+    # resolves as Reviewer, so the signature validation applies to them too.
+    _ensure_signature(UNIT_MANAGER, TEST_DEPT)
+    _ensure_signature(UNIT_SUPERVISOR, TEST_DEPT)
+    mgr_emp = frappe.db.get_value("Employee", {"user_id": UNIT_MANAGER}, "name")
+    sup_emp = frappe.db.get_value("Employee", {"user_id": UNIT_SUPERVISOR}, "name")
+    admin_emp = frappe.db.get_value("Employee", {"user_id": "Administrator"}, "name")
+    frappe.db.set_value("Employee", sup_emp, "reports_to", mgr_emp)
+    frappe.db.set_value("Employee", admin_emp, "reports_to", sup_emp)
+
+    settings = frappe.get_doc("DMS Settings")
+    settings.qa_supervisor = "Administrator"
+    settings.regulatory_manager = "Administrator"
+    settings.qa_approver = "Administrator"
+    settings.save(ignore_permissions=True)
+    frappe.db.commit()
+
+
 def _purge_test_documents():
     for name in frappe.get_all(
         "GMP Document",
@@ -166,6 +206,7 @@ class TestGMPDocument(FrappeTestCase):
         # reviewer/qa_approver default to Administrator in _build_doc; the new
         # signature validation requires them to have a signature image.
         _ensure_signature("Administrator", TEST_DEPT)
+        _ensure_routing_chain()
         _purge_test_documents()
 
     @classmethod
@@ -227,14 +268,24 @@ class TestGMPDocument(FrappeTestCase):
     def _approve_via_workflow(self, doc):
         """Drive a draft through the native Workflow to Approved (submitted).
 
-        Transitions go through Frappe's apply_workflow (the same path the
-        "Actions" menu uses). Tests run as Administrator, which satisfies every
-        transition role and the per-actor conditions' Administrator escape."""
+        Transitions follow the v1.3 approval chain (see install.py) through
+        Frappe's apply_workflow (the same path the "Actions" menu uses). Tests
+        run as Administrator, which satisfies every transition role and the
+        per-actor conditions' Administrator escape; the fixtures from
+        _ensure_routing_chain() let actor resolution succeed on the first
+        transition."""
         from frappe.model.workflow import apply_workflow
 
-        apply_workflow(doc, "Submit for Review")
-        apply_workflow(doc, "Approve as Reviewer")
-        apply_workflow(doc, "Approve as QA")
+        for action in (
+            "Submit for Approval",
+            "Approve (Supervisor)",
+            "Approve as Reviewer",
+            "Approve (QA Supervisor)",
+            "Approve (Manager)",
+            "Validate (Regulatory)",
+            "Publish",
+        ):
+            apply_workflow(doc, action)
         doc.reload()
         return doc
 
