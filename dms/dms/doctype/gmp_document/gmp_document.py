@@ -2997,9 +2997,18 @@ def _apply_watermark(pdf_path, watermark_text, footer_text=None):
     """Merge a diagonal watermark and/or a footer line onto every page.
 
     ``watermark_text=None`` skips the diagonal stamp (plain variant); both
-    strings must stay WinAnsi-encodable (built-in Helvetica)."""
+    strings must stay WinAnsi-encodable (built-in Helvetica).
+
+    The stamp size adapts to the text and page: the font is scaled so the
+    string spans ~60% of the page diagonal, capped at 60pt — a long text like
+    "UNCONTROLLED COPY" shrinks to fit instead of overrunning the page edges,
+    while short texts ("OBSOLETE") don't balloon. Opacity is kept light so the
+    document stays readable under the stamp."""
+    import math
+
     from pypdf import PdfReader, PdfWriter
     from reportlab.lib.colors import Color
+    from reportlab.pdfbase.pdfmetrics import stringWidth
     from reportlab.pdfgen import canvas
 
     reader = PdfReader(pdf_path)
@@ -3012,12 +3021,17 @@ def _apply_watermark(pdf_path, watermark_text, footer_text=None):
         overlay_buffer = BytesIO()
         c = canvas.Canvas(overlay_buffer, pagesize=(width, height))
         if watermark_text:
+            font_size = 60.0
+            max_span = math.hypot(width, height) * 0.60
+            text_span = stringWidth(watermark_text, "Helvetica-Bold", font_size)
+            if text_span > max_span:
+                font_size *= max_span / text_span
             c.saveState()
             c.translate(width / 2, height / 2)
-            c.rotate(45)
-            c.setFillColor(Color(0.85, 0.10, 0.10, alpha=0.30))
-            c.setFont("Helvetica-Bold", 80)
-            c.drawCentredString(0, 0, watermark_text)
+            c.rotate(math.degrees(math.atan2(height, width)))
+            c.setFillColor(Color(0.85, 0.10, 0.10, alpha=0.15))
+            c.setFont("Helvetica-Bold", font_size)
+            c.drawCentredString(0, -font_size / 3, watermark_text)
             c.restoreState()
 
         if footer_text:

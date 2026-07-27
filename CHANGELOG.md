@@ -4,6 +4,18 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-07-27
+
+### Fixed
+- **Watermark size and opacity.** The diagonal watermark was a fixed 80pt at 30% opacity — "UNCONTROLLED COPY" overran the page edges and darkened the content. The font now scales to span ~60% of the page diagonal (capped at 60pt, so long texts shrink to fit and short ones don't balloon), the stamp aligns to the page diagonal, and opacity is reduced to 15% so the document stays readable.
+- **Excel-sourced PDFs cut wide sheets into part-pages.** Sheets whose author configured no print scaling exported at 100% scale on the template's stored paper size. `render_xlsx` now sets A4 + fit-to-width (unlimited pages tall) on such sheets; templates with explicit fitToPage or a custom print scale are respected untouched.
+
+### Changed
+- **Removed the "Download PDF (Controlled Copy)" button** from the Get PDF menu. The menu now offers Uncontrolled Copy, Plain, and (managers) the clean Word file.
+
+### Upgrade notes
+- Rebuild the app assets (`bench build`) so the form UI picks up the button change; no migrate-side changes in this release.
+
 ## [2.4.0] - 2026-07-27
 
 ### Changed
