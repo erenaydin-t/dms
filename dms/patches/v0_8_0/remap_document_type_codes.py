@@ -18,9 +18,9 @@ workflow side effects fire.
 
 import frappe
 
-from dms.install import _ensure_document_types
-
-# Legacy stored value -> new master code.
+# Legacy stored value -> new master code (and the seed label the master row
+# carried at v0.8.0 — the app no longer seeds document types, so the patch
+# creates its own remap targets, and only when legacy rows actually exist).
 LEGACY_TO_CODE = {
     "Form": "FORM",
     "Protocol": "PROT",
@@ -32,13 +32,19 @@ def execute():
     if not frappe.db.has_column("GMP Document", "document_type"):
         return
 
-    # The post_model_sync patch phase runs before after_migrate seeds the
-    # master, so make sure the target GMP Document Type records exist before we
-    # point links at them. Idempotent.
-    if frappe.db.exists("DocType", "GMP Document Type"):
-        _ensure_document_types()
-
     for legacy_value, code in LEGACY_TO_CODE.items():
+        if not frappe.db.exists("GMP Document", {"document_type": legacy_value}):
+            continue
+        if (
+            frappe.db.exists("DocType", "GMP Document Type")
+            and not frappe.db.exists("GMP Document Type", code)
+            and not frappe.db.exists("GMP Document Type", {"type_name": legacy_value})
+        ):
+            frappe.get_doc({
+                "doctype": "GMP Document Type",
+                "code": code,
+                "type_name": legacy_value,
+            }).insert(ignore_permissions=True)
         frappe.db.sql(
             """
             UPDATE `tabGMP Document`

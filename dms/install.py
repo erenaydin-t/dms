@@ -39,33 +39,10 @@ EMPLOYEE_SIGNATURE_FIELD = {
 }
 
 
-# GMP Document Type master seed: (type_name, code). `code` becomes the record
-# name and the type segment of every GMP Document ID, so it must be filesystem
-# /name safe (no spaces or slashes) — hence "Master Formula/BMR" -> "BMR".
-GMP_DOCUMENT_TYPES = [
-    ("Policy", "POL"),
-    ("Manual", "MAN"),
-    ("SOP", "SOP"),
-    ("Work Instruction", "WI"),
-    ("Specification", "SPEC"),
-    ("Master Formula/BMR", "BMR"),
-    ("Protocol", "PROT"),
-    ("Schedule/Plan", "PLAN"),
-    ("Form", "FORM"),
-    ("Record", "REC"),
-    ("Report", "REP"),
-    ("Certificate", "CERT"),
-    ("Log Book", "LOG"),
-    ("Register", "REG"),
-    ("List", "LIST"),
-    ("Map", "MAP"),
-    ("Chart", "CHART"),
-    ("Drawing", "DWG"),
-    ("Matrix", "MTX"),
-    ("Checklist", "CHK"),
-]
-
-
+# The GMP Document Type master is NOT seeded: users create their own types
+# (patch v1_4_0.remove_seeded_document_types cleans up the ones an earlier
+# version shipped). A type's `code` becomes the record name and the type
+# segment of every GMP Document ID, so it must be filesystem/name safe.
 GMP_WORKFLOW_NAME = "GMP Document Workflow"
 
 # State.doc_status:
@@ -232,7 +209,6 @@ def after_install():
     _ensure_department_abbr_field()
     _ensure_employee_signature_field()
     _ensure_amend_naming_rule()
-    _ensure_document_types()
     _ensure_gmp_workflow()
     _sync_gmp_workflow()
 
@@ -244,7 +220,6 @@ def after_migrate():
     _ensure_department_abbr_field()
     _ensure_employee_signature_field()
     _ensure_amend_naming_rule()
-    _ensure_document_types()
     _ensure_gmp_workflow()
     _sync_gmp_workflow()
 
@@ -303,29 +278,6 @@ def _ensure_amend_naming_rule():
         "document_type": "GMP Document",
         "action": "Default Naming",
     }).insert(ignore_permissions=True)
-
-
-def _ensure_document_types():
-    """Seed the GMP Document Type master. Idempotent: inserts missing rows by
-    code (the record name) and keeps the label in step; never deletes types the
-    user may have added or relabelled by hand."""
-    for type_name, code in GMP_DOCUMENT_TYPES:
-        if frappe.db.exists("GMP Document Type", code):
-            if frappe.db.get_value("GMP Document Type", code, "type_name") != type_name:
-                frappe.db.set_value("GMP Document Type", code, "type_name", type_name)
-            continue
-        # type_name is a unique field. An earlier version of this seed may have
-        # created the same label under a different code (record name); inserting
-        # it again would raise IntegrityError(1062, "Duplicate entry … for key
-        # 'type_name'") and abort the whole migration. Skip when the label
-        # already exists so re-seeding stays idempotent.
-        if frappe.db.exists("GMP Document Type", {"type_name": type_name}):
-            continue
-        frappe.get_doc({
-            "doctype": "GMP Document Type",
-            "code": code,
-            "type_name": type_name,
-        }).insert(ignore_permissions=True)
 
 
 def _sync_gmp_workflow():
