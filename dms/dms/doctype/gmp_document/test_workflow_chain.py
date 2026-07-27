@@ -22,8 +22,8 @@ from dms.dms.doctype.gmp_document.gmp_document import (
     QA_RETURNED,
     QA_SKIPPED,
     QA_SUPERSEDED,
-    WF_PENDING_MANAGER,
     WF_PENDING_QA_SUPERVISOR,
+    WF_PENDING_REGULATORY,
     WF_PENDING_SUPERVISOR,
     WF_QA_IN_PROGRESS,
     complete_qa_review,
@@ -329,7 +329,7 @@ class TestWorkflowChain(FrappeTestCase):
             [(QA_R1, QA_AWAITING), (QA_R2, QA_QUEUED), (QA_R3, QA_QUEUED)],
         )
 
-    def test_sequential_completion_advances_to_manager(self):
+    def test_sequential_completion_advances_to_regulatory(self):
         doc = self._make_delegation_ready("GMP-Chain-Seq")
         delegate_qa_review(doc.name, [QA_R1, QA_R2])
 
@@ -340,7 +340,7 @@ class TestWorkflowChain(FrappeTestCase):
 
         complete_qa_review(doc.name, "Approve")
         doc.reload()
-        self.assertEqual(doc.workflow_status, WF_PENDING_MANAGER)
+        self.assertEqual(doc.workflow_status, WF_PENDING_REGULATORY)
         self.assertEqual(int(doc.qa_review_complete), 1)
 
     def test_only_queue_head_may_complete(self):
@@ -377,7 +377,7 @@ class TestWorkflowChain(FrappeTestCase):
         # One real approval remains → the queue may still complete forward.
         complete_qa_review(doc.name, "Approve")
         doc.reload()
-        self.assertEqual(doc.workflow_status, WF_PENDING_MANAGER)
+        self.assertEqual(doc.workflow_status, WF_PENDING_REGULATORY)
 
     def test_all_skipped_round_returns_to_qa_supervisor(self):
         doc = self._make_delegation_ready("GMP-Chain-AllSkip")

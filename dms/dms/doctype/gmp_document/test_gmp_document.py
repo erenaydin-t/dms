@@ -281,8 +281,8 @@ class TestGMPDocument(FrappeTestCase):
             "Approve (Supervisor)",
             "Approve as Reviewer",
             "Approve (QA Supervisor)",
-            "Approve (Manager)",
             "Validate (Regulatory)",
+            "Approve (Manager)",
             "Publish",
         ):
             apply_workflow(doc, action)

@@ -85,16 +85,16 @@ GMP_WORKFLOW_NAME = "GMP Document Workflow"
 #   Draft → Pending Supervisor Approval → Under Review (supervisor's manager)
 #   → Pending QA Supervisor → [QA Review In Progress: sequential delegated
 #   queue, driven by the controller's queue engine, not by manual transitions]
-#   → Pending Manager Approval (the same manager who reviewed) → Pending
-#   Regulatory Validation → Pending Final QA Approval → Approved (Publish).
+#   → Pending Regulatory Validation → Pending Manager Approval (the same
+#   manager who reviewed) → Pending Final QA Approval → Approved (Publish).
 GMP_WORKFLOW_STATES = [
     {"state": "Draft",                         "doc_status": 0, "allow_edit": "DMS Initiator", "style": "Warning"},
     {"state": "Pending Supervisor Approval",   "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
     {"state": "Under Review",                  "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
     {"state": "Pending QA Supervisor",         "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
     {"state": "QA Review In Progress",         "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Info"},
-    {"state": "Pending Manager Approval",      "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
     {"state": "Pending Regulatory Validation", "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
+    {"state": "Pending Manager Approval",      "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
     {"state": "Pending Final QA Approval",     "doc_status": 0, "allow_edit": "DMS Manager",   "style": "Primary"},
     {"state": "Approved",                      "doc_status": 1, "allow_edit": "DMS Manager",   "style": "Success"},
     {"state": "Revision Requested",            "doc_status": 0, "allow_edit": "DMS Initiator", "style": "Danger"},
@@ -161,20 +161,20 @@ GMP_WORKFLOW_TRANSITIONS = [
     {"state": "Under Review",                  "action": "Return to Supervisor",    "next_state": "Pending Supervisor Approval",   "allowed": "DMS Approver",  "condition": _REVIEWER, "allow_self_approval": 1},
     {"state": "Under Review",                  "action": "Return to Preparer",      "next_state": "Revision Requested",            "allowed": "DMS Approver",  "condition": _REVIEWER, "allow_self_approval": 1},
 
-    {"state": "Pending QA Supervisor",         "action": "Approve (QA Supervisor)", "next_state": "Pending Manager Approval",      "allowed": "DMS Approver",  "condition": _QA_SUPERVISOR, "allow_self_approval": 1},
+    {"state": "Pending QA Supervisor",         "action": "Approve (QA Supervisor)", "next_state": "Pending Regulatory Validation", "allowed": "DMS Approver",  "condition": _QA_SUPERVISOR, "allow_self_approval": 1},
     {"state": "Pending QA Supervisor",         "action": "Return to Reviewer",      "next_state": "Under Review",                  "allowed": "DMS Approver",  "condition": _QA_SUPERVISOR, "allow_self_approval": 1},
     {"state": "Pending QA Supervisor",         "action": "Return to Preparer",      "next_state": "Revision Requested",            "allowed": "DMS Approver",  "condition": _QA_SUPERVISOR, "allow_self_approval": 1},
 
     {"state": "QA Review In Progress",         "action": "Recall Delegation",       "next_state": "Pending QA Supervisor",         "allowed": "DMS Approver",  "condition": _QA_SUPERVISOR, "allow_self_approval": 1},
 
-    {"state": "Pending Manager Approval",      "action": "Approve (Manager)",       "next_state": "Pending Regulatory Validation", "allowed": "DMS Approver",  "condition": _REVIEWER, "allow_self_approval": 1},
-    {"state": "Pending Manager Approval",      "action": "Return to QA Supervisor", "next_state": "Pending QA Supervisor",         "allowed": "DMS Approver",  "condition": _REVIEWER, "allow_self_approval": 1},
+    {"state": "Pending Regulatory Validation", "action": "Validate (Regulatory)",   "next_state": "Pending Manager Approval",      "allowed": "DMS Approver",  "condition": _REGULATORY, "allow_self_approval": 1},
+    {"state": "Pending Regulatory Validation", "action": "Return to QA Supervisor", "next_state": "Pending QA Supervisor",         "allowed": "DMS Approver",  "condition": _REGULATORY, "allow_self_approval": 1},
 
-    {"state": "Pending Regulatory Validation", "action": "Validate (Regulatory)",   "next_state": "Pending Final QA Approval",     "allowed": "DMS Approver",  "condition": _REGULATORY, "allow_self_approval": 1},
-    {"state": "Pending Regulatory Validation", "action": "Return to Manager",       "next_state": "Pending Manager Approval",      "allowed": "DMS Approver",  "condition": _REGULATORY, "allow_self_approval": 1},
+    {"state": "Pending Manager Approval",      "action": "Approve (Manager)",       "next_state": "Pending Final QA Approval",     "allowed": "DMS Approver",  "condition": _REVIEWER, "allow_self_approval": 1},
+    {"state": "Pending Manager Approval",      "action": "Return to Regulatory",    "next_state": "Pending Regulatory Validation", "allowed": "DMS Approver",  "condition": _REVIEWER, "allow_self_approval": 1},
 
     {"state": "Pending Final QA Approval",     "action": "Publish",                 "next_state": "Approved",                      "allowed": "QA Manager",    "condition": _QA, "allow_self_approval": 1},
-    {"state": "Pending Final QA Approval",     "action": "Return to Regulatory",    "next_state": "Pending Regulatory Validation", "allowed": "QA Manager",    "condition": _QA, "allow_self_approval": 1},
+    {"state": "Pending Final QA Approval",     "action": "Return to Manager",       "next_state": "Pending Manager Approval",      "allowed": "QA Manager",    "condition": _QA, "allow_self_approval": 1},
 
     # Abandon a draft revision before the review chain gets past the
     # supervisor. Terminal: no transition leaves Revision Cancelled, and the
@@ -200,6 +200,10 @@ GMP_RETIRED_TRANSITIONS = {
     # Cancel Revision no longer offered once the supervisor has approved
     ("Under Review", "Cancel Revision"),
     ("Pending QA Supervisor", "Cancel Revision"),
+    # regulatory-before-manager reorder: one-level returns re-pointed
+    ("Pending Manager Approval", "Return to QA Supervisor"),
+    ("Pending Regulatory Validation", "Return to Manager"),
+    ("Pending Final QA Approval", "Return to Regulatory"),
 }
 GMP_RETIRED_STATES = {"Pending QA Approval"}
 

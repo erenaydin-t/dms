@@ -195,9 +195,9 @@ _RETURN_EDGES = {
     (WF_UNDER_REVIEW, WF_REVISION):                ("reviewer",           "prepared_by",        "Address revision request — {0}"),
     (WF_PENDING_QA_SUPERVISOR, WF_UNDER_REVIEW):   ("qa_supervisor",      "reviewer",           "Re-review — QA Supervisor returned {0}"),
     (WF_PENDING_QA_SUPERVISOR, WF_REVISION):       ("qa_supervisor",      "prepared_by",        "Address revision request — {0}"),
-    (WF_PENDING_MANAGER, WF_PENDING_QA_SUPERVISOR): ("reviewer",          "qa_supervisor",      "Re-assess — Manager returned {0} to QA"),
-    (WF_PENDING_REGULATORY, WF_PENDING_MANAGER):   ("regulatory_manager", "reviewer",           "Re-approve — Regulatory returned {0}"),
-    (WF_PENDING_FINAL_QA, WF_PENDING_REGULATORY):  ("qa_approver",        "regulatory_manager", "Re-validate — Final QA returned {0}"),
+    (WF_PENDING_REGULATORY, WF_PENDING_QA_SUPERVISOR): ("regulatory_manager", "qa_supervisor",  "Re-assess — Regulatory returned {0} to QA"),
+    (WF_PENDING_MANAGER, WF_PENDING_REGULATORY):   ("reviewer",           "regulatory_manager", "Re-validate — Manager returned {0}"),
+    (WF_PENDING_FINAL_QA, WF_PENDING_MANAGER):     ("qa_approver",        "reviewer",           "Re-approve — Final QA returned {0}"),
 }
 
 
@@ -1526,26 +1526,26 @@ class GMPDocument(NestedSet):
             _close_open_todos(self, allocated_to=self.reviewer)
             _create_todo(self, self.qa_supervisor, _("QA Supervisor — approve or delegate review of {0}").format(self.name))
 
-        elif curr == WF_PENDING_MANAGER and prev == WF_PENDING_QA_SUPERVISOR:
+        elif curr == WF_PENDING_REGULATORY and prev == WF_PENDING_QA_SUPERVISOR:
             # QA Supervisor approved directly, without delegating a queue (or
             # past a halted one — retire any rows still queued from it).
             self._supersede_open_qa_rows()
-            self.add_comment("Workflow", _("QA Supervisor approved — forwarded to Manager {0}").format(self.reviewer))
+            self.add_comment("Workflow", _("QA Supervisor approved — forwarded to Regulatory {0}").format(self.regulatory_manager))
             _close_open_todos(self, allocated_to=self.qa_supervisor)
-            _create_todo(self, self.reviewer, _("Manager approval — GMP Document {0}").format(self.name))
-
-        elif curr == WF_PENDING_REGULATORY and prev == WF_PENDING_MANAGER:
-            self.db_set("manager_approved_by", actor, update_modified=False)
-            self.db_set("manager_approved_on", now_datetime(), update_modified=False)
-            self.add_comment("Workflow", _("Manager approved — forwarded to Regulatory {0}").format(self.regulatory_manager))
-            _close_open_todos(self, allocated_to=self.reviewer)
             _create_todo(self, self.regulatory_manager, _("Regulatory validation — GMP Document {0}").format(self.name))
 
-        elif curr == WF_PENDING_FINAL_QA and prev == WF_PENDING_REGULATORY:
+        elif curr == WF_PENDING_MANAGER and prev == WF_PENDING_REGULATORY:
             self.db_set("regulatory_validated_by", actor, update_modified=False)
             self.db_set("regulatory_validated_on", now_datetime(), update_modified=False)
-            self.add_comment("Workflow", _("Regulatory validated — forwarded to QA Approver {0}").format(self.qa_approver))
+            self.add_comment("Workflow", _("Regulatory validated — forwarded to Manager {0}").format(self.reviewer))
             _close_open_todos(self, allocated_to=self.regulatory_manager)
+            _create_todo(self, self.reviewer, _("Manager approval — GMP Document {0}").format(self.name))
+
+        elif curr == WF_PENDING_FINAL_QA and prev == WF_PENDING_MANAGER:
+            self.db_set("manager_approved_by", actor, update_modified=False)
+            self.db_set("manager_approved_on", now_datetime(), update_modified=False)
+            self.add_comment("Workflow", _("Manager approved — forwarded to QA Approver {0}").format(self.qa_approver))
+            _close_open_todos(self, allocated_to=self.reviewer)
             _create_todo(self, self.qa_approver, _("Final QA authorization — publish GMP Document {0}").format(self.name))
 
         elif curr == WF_APPROVED:
@@ -1624,8 +1624,8 @@ class GMPDocument(NestedSet):
     # The queue lives in the qa_reviews child table; row order within the
     # highest `round` IS the review order. The engine (not manual workflow
     # actions) moves the document out of 'QA Review In Progress': forward to
-    # 'Pending Manager Approval' once every row of the round is closed with
-    # at least one actual approval, or back to 'Pending QA Supervisor' when
+    # 'Pending Regulatory Validation' once every row of the round is closed
+    # with at least one actual approval, or back to 'Pending QA Supervisor' when
     # a reviewer requests a return (or a round ends all-skipped). Server-
     # driven state changes go through _server_transition (db_set + comment)
     # — deliberately outside apply_workflow, which models single-actor
@@ -1689,23 +1689,24 @@ class GMPDocument(NestedSet):
         return None
 
     def _finish_qa_queue(self):
-        """The current round has no Queued/Awaiting rows left. Advance to the
-        Manager if at least one reviewer actually approved; a round that ended
-        with zero approvals (everyone skipped) goes back to the QA Supervisor
-        — a skipped-out queue must never count as a completed review."""
+        """The current round has no Queued/Awaiting rows left. Advance to
+        Regulatory if at least one reviewer actually approved; a round that
+        ended with zero approvals (everyone skipped) goes back to the QA
+        Supervisor — a skipped-out queue must never count as a completed
+        review."""
         rows = self._current_round_rows()
         approvals = [r for r in rows if r.status == QA_APPROVED]
         if approvals:
             self.db_set("qa_review_complete", 1, update_modified=False)
             self._server_transition(
-                WF_PENDING_MANAGER,
-                _("All delegated QA reviews completed ({0} approved, {1} skipped) — forwarded to Manager {2}").format(
+                WF_PENDING_REGULATORY,
+                _("All delegated QA reviews completed ({0} approved, {1} skipped) — forwarded to Regulatory {2}").format(
                     len(approvals),
                     len([r for r in rows if r.status == QA_SKIPPED]),
-                    self.reviewer,
+                    self.regulatory_manager,
                 ),
             )
-            _create_todo(self, self.reviewer, _("Manager approval — GMP Document {0}").format(self.name))
+            _create_todo(self, self.regulatory_manager, _("Regulatory validation — GMP Document {0}").format(self.name))
         else:
             self._server_transition(
                 WF_PENDING_QA_SUPERVISOR,
@@ -2247,11 +2248,11 @@ def _resolve_deliverable_path(doc):
 #   Draft / Revision Requested ── Submit for Approval ──► Pending Supervisor Approval
 #   Pending Supervisor Approval ── Approve (Supervisor) ──► Under Review
 #   Under Review ── Approve as Reviewer ──► Pending QA Supervisor
-#   Pending QA Supervisor ── Approve (QA Supervisor) ──► Pending Manager Approval
+#   Pending QA Supervisor ── Approve (QA Supervisor) ──► Pending Regulatory Validation
 #   Pending QA Supervisor ── delegate_qa_review() ──► QA Review In Progress
-#   QA Review In Progress ── queue engine (all reviews done) ──► Pending Manager Approval
-#   Pending Manager Approval ── Approve (Manager) ──► Pending Regulatory Validation
-#   Pending Regulatory Validation ── Validate (Regulatory) ──► Pending Final QA Approval
+#   QA Review In Progress ── queue engine (all reviews done) ──► Pending Regulatory Validation
+#   Pending Regulatory Validation ── Validate (Regulatory) ──► Pending Manager Approval
+#   Pending Manager Approval ── Approve (Manager) ──► Pending Final QA Approval
 #   Pending Final QA Approval ── Publish ──► Approved (docstatus=1)
 #
 # Every stage also has a one-level "Return …" transition (see _RETURN_EDGES
@@ -2273,8 +2274,8 @@ def get_my_pending_count(user=None):
         ("supervisor_approval", WF_PENDING_SUPERVISOR, "supervisor"),
         ("to_review", WF_UNDER_REVIEW, "reviewer"),
         ("qa_supervisor", WF_PENDING_QA_SUPERVISOR, "qa_supervisor"),
-        ("manager_approval", WF_PENDING_MANAGER, "reviewer"),
         ("regulatory", WF_PENDING_REGULATORY, "regulatory_manager"),
+        ("manager_approval", WF_PENDING_MANAGER, "reviewer"),
         ("to_approve", WF_PENDING_FINAL_QA, "qa_approver"),
         ("to_revise", WF_REVISION, "prepared_by"),
     )
