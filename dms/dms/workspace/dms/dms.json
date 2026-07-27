@@ -71,9 +71,20 @@
    "link_type": "DocType",
    "onboard": 0,
    "type": "Link"
+  },
+  {
+   "dependencies": "",
+   "hidden": 0,
+   "is_query_report": 0,
+   "label": "DMS Settings",
+   "link_count": 0,
+   "link_to": "DMS Settings",
+   "link_type": "DocType",
+   "onboard": 0,
+   "type": "Link"
   }
  ],
- "modified": "2026-04-26 00:00:00.000000",
+ "modified": "2026-07-27 14:00:00.000000",
  "modified_by": "Administrator",
  "module": "DMS",
  "name": "DMS",
