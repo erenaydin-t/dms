@@ -79,6 +79,28 @@ def _size_image(pic, width_px):
 # --------------------------------------------------------------------------- #
 #  Excel                                                                       #
 # --------------------------------------------------------------------------- #
+def _normalize_print_setup(ws):
+    """Deterministic PDF page geometry for sheets whose author configured no
+    print scaling: A4 paper, sheet width fitted to one page wide (any number of
+    pages tall). Without this, LibreOffice exports at 100% scale on the
+    template's stored paper (usually US Letter), slicing wide sheets into extra
+    part-pages with cut-off columns. A template that already opts into
+    fitToPage or a custom print scale is the author's explicit layout — leave
+    it untouched."""
+    setup = ws.page_setup
+    props = ws.sheet_properties.pageSetUpPr
+    if props is not None and props.fitToPage:
+        return
+    if setup.scale not in (None, 100):
+        return
+    from openpyxl.worksheet.properties import PageSetupProperties
+
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    setup.fitToWidth = 1
+    setup.fitToHeight = 0  # 0 = as many pages tall as the content needs
+    setup.paperSize = ws.PAPERSIZE_A4
+
+
 def render_xlsx(source_path, out_path, context, images=None, stamp_width_px=150):
     """Render an .xlsx template to ``out_path``.
 
@@ -112,6 +134,7 @@ def render_xlsx(source_path, out_path, context, images=None, stamp_width_px=150)
             pic = XLImage(path)
             _size_image(pic, stamp_width_px)
             ws.add_image(pic, coord)
+        _normalize_print_setup(ws)
     wb.save(out_path)
     return out_path
 
