@@ -176,28 +176,30 @@ GMP_WORKFLOW_TRANSITIONS = [
     {"state": "Pending Final QA Approval",     "action": "Publish",                 "next_state": "Approved",                      "allowed": "QA Manager",    "condition": _QA, "allow_self_approval": 1},
     {"state": "Pending Final QA Approval",     "action": "Return to Regulatory",    "next_state": "Pending Regulatory Validation", "allowed": "QA Manager",    "condition": _QA, "allow_self_approval": 1},
 
-    # Abandon a draft revision at any pre-QA-delegation stage. Terminal: no
-    # transition leaves Revision Cancelled, and the revised document remains
-    # the effective version untouched.
+    # Abandon a draft revision before the review chain gets past the
+    # supervisor. Terminal: no transition leaves Revision Cancelled, and the
+    # revised document remains the effective version untouched.
     {"state": "Draft",                         "action": "Cancel Revision",         "next_state": "Revision Cancelled",            "allowed": "DMS Initiator", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
     {"state": "Revision Requested",            "action": "Cancel Revision",         "next_state": "Revision Cancelled",            "allowed": "DMS Initiator", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
     {"state": "Pending Supervisor Approval",   "action": "Cancel Revision",         "next_state": "Revision Cancelled",            "allowed": "DMS Initiator", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
-    {"state": "Under Review",                  "action": "Cancel Revision",         "next_state": "Revision Cancelled",            "allowed": "DMS Initiator", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
-    {"state": "Pending QA Supervisor",         "action": "Cancel Revision",         "next_state": "Revision Cancelled",            "allowed": "DMS Initiator", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
 ]
 
-# Rows of the pre-v1.3 short chain that the module used to own and now
-# actively removes on migrate (states are only removed when no transition
-# still references them and no document sits in them — see
-# _sync_gmp_workflow). Documents parked in a retired state are remapped by
-# patch v1_3_0.upgrade_workflow_chain BEFORE the state row disappears.
+# Rows the module used to own and now actively removes on migrate (states
+# are only removed when no transition still references them and no document
+# sits in them — see _sync_gmp_workflow). Documents parked in a retired
+# state are remapped by patch v1_3_0.upgrade_workflow_chain BEFORE the state
+# row disappears.
 GMP_RETIRED_TRANSITIONS = {
+    # pre-v1.3 short chain
     ("Draft", "Submit for Review"),
     ("Revision Requested", "Submit for Review"),
     ("Under Review", "Request Revision (Reviewer)"),
     ("Pending QA Approval", "Approve as QA"),
     ("Pending QA Approval", "Request Revision (QA)"),
     ("Pending QA Approval", "Cancel Revision"),
+    # Cancel Revision no longer offered once the supervisor has approved
+    ("Under Review", "Cancel Revision"),
+    ("Pending QA Supervisor", "Cancel Revision"),
 }
 GMP_RETIRED_STATES = {"Pending QA Approval"}
 
