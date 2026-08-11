@@ -101,7 +101,7 @@ def _normalize_print_setup(ws):
     setup.paperSize = ws.PAPERSIZE_A4
 
 
-def render_xlsx(source_path, out_path, context, images=None, stamp_width_px=150):
+def render_xlsx(source_path, out_path, context, images=None, stamp_width_px=150, font=None):
     """Render an .xlsx template to ``out_path``.
 
     Text ``{{ tag }}`` cells are rendered in place. Any cell whose text contains
@@ -109,9 +109,16 @@ def render_xlsx(source_path, out_path, context, images=None, stamp_width_px=150)
     and the PNG anchored as a floating picture over the cell — so ``{{ qa_stamp }}``
     becomes the actual approved/rejected stamp, and signature tags become the
     actual signature images. Returns ``out_path``.
+
+    ``font``, when given, is the enforced-font policy
+    ``{"family": str, "preserve_symbols": bool}``: every populated cell is
+    restyled to that family after the text pass, so the sheet prints in the
+    site's standard font whatever the template author chose.
     """
     from openpyxl import load_workbook
     from openpyxl.drawing.image import Image as XLImage
+
+    from .font_enforcement import enforce_xlsx_font
 
     images = {t: p for t, p in (images or {}).items() if p and os.path.exists(p)}
     wb = load_workbook(source_path)
@@ -135,6 +142,10 @@ def render_xlsx(source_path, out_path, context, images=None, stamp_width_px=150)
             _size_image(pic, stamp_width_px)
             ws.add_image(pic, coord)
         _normalize_print_setup(ws)
+    # After the text pass, so cells that only just received their value are
+    # restyled too.
+    if font and font.get("family"):
+        enforce_xlsx_font(wb, font["family"], font.get("preserve_symbols", True))
     wb.save(out_path)
     return out_path
 

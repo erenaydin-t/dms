@@ -25,6 +25,8 @@ from frappe.core.doctype.file.utils import get_content_hash
 from docx.shared import Mm
 from docxtpl import DocxTemplate, InlineImage
 
+from .font_enforcement import enforce_docx_font, enforce_vsdx_font, shape_rtl
+
 
 # Delegated-approval role: may perform any stage's workflow action on behalf of
 # the assigned role-holder (install.py ships a proxy twin of every actor-gated
@@ -75,6 +77,22 @@ STAMP_REJECTED = "qarejected.png"
 def _stamp_asset_path(filename):
     """Absolute path to a packaged QA stamp image (dms/stamps/<filename>)."""
     return frappe.get_app_path("dms", "stamps", filename)
+
+
+def _document_font_policy():
+    """The enforced-font policy, or None when enforcement is off/unconfigured.
+
+    Isolated here so every render path asks the same question, and so a broken
+    or missing DMS Settings can never take the render down with it — an
+    unresolvable policy simply means "leave the template's own fonts alone"."""
+    try:
+        from dms.dms.doctype.dms_settings.dms_settings import resolve_document_font
+
+        policy = resolve_document_font()
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "GMP Document: font policy lookup failed")
+        return None
+    return policy if policy.get("enforce") else None
 
 
 def document_type_label(code):
@@ -1424,6 +1442,32 @@ class GMPDocument(NestedSet):
                 images[alias] = images[row.system_field]
         return images
 
+    def _enforce_font_on(self, path):
+        """Rewrite every font reference in a rendered .docx/.vsdx to the family
+        configured in DMS Settings, so the output is standardised regardless of
+        what the template author chose.
+
+        Runs after the template render and before the PDF conversion, so both
+        the distributed source file and the PDF come out in the same font.
+        Never fatal: a font pass that fails leaves a document in the template's
+        own font, which is strictly better than blocking an approval."""
+        policy = _document_font_policy()
+        if not policy:
+            return
+        try:
+            if path.lower().endswith(".docx"):
+                enforce_docx_font(path, policy["family"], policy["preserve_symbols"])
+            elif path.lower().endswith(".vsdx"):
+                # Visio rewrites into a second file; swap it over the original.
+                tmp = f"{path}.font.vsdx"
+                enforce_vsdx_font(path, tmp, policy["family"], policy["preserve_symbols"])
+                os.replace(tmp, path)
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"GMP Document: font enforcement failed for {os.path.basename(path)}",
+            )
+
     def _render_docx(self, source_path, field_mappings, soffice, tmpdir):
         """DOCX: two docxtpl passes (clean deliverable + with-images source)."""
         clean_path = os.path.join(tmpdir, f"{self.name}.docx")
@@ -1453,6 +1497,11 @@ class GMPDocument(NestedSet):
             )
             frappe.throw(_("Failed to render Word template with signatures. Check Error Log."))
 
+        # Both files: the clean .docx is distributed to authors, so it must
+        # carry the standard font too — not just the PDF people read.
+        self._enforce_font_on(clean_path)
+        self._enforce_font_on(sig_path)
+
         pdf_bytes = self._convert_to_pdf(soffice, sig_path, tmpdir)
         with open(clean_path, "rb") as fh:
             return fh.read(), pdf_bytes
@@ -1466,11 +1515,13 @@ class GMPDocument(NestedSet):
         text_context = self._build_template_context(field_mappings=field_mappings)
         clean_path = os.path.join(tmpdir, f"{self.name}.xlsx")
         img_path = os.path.join(tmpdir, f"{self.name}-with-images.xlsx")
+        font = _document_font_policy()
         try:
-            render_xlsx(source_path, clean_path, text_context, images={})
+            render_xlsx(source_path, clean_path, text_context, images={}, font=font)
             render_xlsx(
                 source_path, img_path, text_context,
                 images=self._resolve_render_images(field_mappings),
+                font=font,
             )
         except Exception:
             frappe.log_error(frappe.get_traceback(), "GMP Document: Excel render failed")
@@ -1493,6 +1544,8 @@ class GMPDocument(NestedSet):
         except Exception:
             frappe.log_error(frappe.get_traceback(), "GMP Document: Visio render failed")
             frappe.throw(_("Failed to render Visio template. Check Error Log for details."))
+
+        self._enforce_font_on(clean_path)
 
         pdf_bytes = self._convert_to_pdf(soffice, clean_path, tmpdir)
 
@@ -2472,9 +2525,15 @@ def download_watermarked_pdf(docname, variant=None):
 
     # 21 CFR Part 11: a reference print outside change control is only
     # meaningful with a print timestamp. GMP sites in Iran expect the Jalali
-    # calendar. Deliberately NOT translated: the footer is drawn with
-    # reportlab's built-in Helvetica (WinAnsi-only), which cannot encode
-    # Persian script — a translated string would crash or render as boxes.
+    # calendar.
+    #
+    # Left untranslated by default. It is no longer *impossible* to translate —
+    # with a font configured in DMS Settings the overlay embeds a real TTF and
+    # shape_rtl() supplies the joining and bidi reportlab lacks, so a Persian
+    # footer renders correctly. But with no font configured the overlay is still
+    # built-in Helvetica (WinAnsi-only), where a Persian string would draw as
+    # boxes. Translate these via Translation records once the font is in place
+    # and verified on a real download.
     footer_text = None
     if variant == "uncontrolled":
         footer_text = f"Uncontrolled copy - printed {_jalali_now_stamp()} (Jalali) - not subject to change control"
@@ -3348,11 +3407,58 @@ def _jalali_now_stamp():
     return f"{jy:04d}/{jm:02d}/{jd:02d} {now.hour:02d}:{now.minute:02d}:{now.second:02d}"
 
 
+def _register_overlay_font():
+    """Register the configured font with reportlab and return (bold, regular)
+    font names, falling back to ``("Helvetica-Bold", "Helvetica")``.
+
+    Why this matters: reportlab's built-in fonts are WinAnsi-encoded and cannot
+    encode Persian at all, so without a registered TTF the watermark and footer
+    are limited to Latin. Registering the site's font is what allows them to be
+    Persian — combined with shape_rtl(), which supplies the joining and bidi
+    reportlab itself does not do.
+
+    Registration is per-process and idempotent; reportlab keeps its own registry
+    so a recycled worker re-registers on first use. Any failure degrades to
+    Helvetica rather than breaking the download."""
+    policy = _document_font_policy()
+    if not policy:
+        return "Helvetica-Bold", "Helvetica"
+
+    family = policy["family"]
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+
+        if family in pdfmetrics.getRegisteredFontNames():
+            return family, family
+
+        from dms.dms.doctype.dms_settings.dms_settings import resolve_font_file
+
+        path = resolve_font_file(family)
+        if not path:
+            return "Helvetica-Bold", "Helvetica"
+        pdfmetrics.registerFont(TTFont(family, path))
+        # One TTF, used for both weights: synthesising a bold face is not worth
+        # a second font file, and the watermark is sized for impact anyway.
+        return family, family
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(), "GMP Document: overlay font registration failed"
+        )
+        return "Helvetica-Bold", "Helvetica"
+
+
 def _apply_watermark(pdf_path, watermark_text, footer_text=None):
     """Merge a diagonal watermark and/or a footer line onto every page.
 
-    ``watermark_text=None`` skips the diagonal stamp (plain variant); both
-    strings must stay WinAnsi-encodable (built-in Helvetica).
+    ``watermark_text=None`` skips the diagonal stamp (plain variant).
+
+    Text is drawn in the font configured in DMS Settings when one is registered,
+    which is what lets these strings be Persian; with no configured font they
+    fall back to reportlab's built-in Helvetica and must stay WinAnsi-encodable.
+    Either way the strings run through shape_rtl(), which applies the Arabic
+    joining and bidi reordering reportlab does not do — without it Persian draws
+    as disconnected, mirrored letterforms.
 
     The stamp size adapts to the text and page: the font is scaled so the
     string spans ~60% of the page diagonal, capped at 60pt — a long text like
@@ -3366,6 +3472,10 @@ def _apply_watermark(pdf_path, watermark_text, footer_text=None):
     from reportlab.pdfbase.pdfmetrics import stringWidth
     from reportlab.pdfgen import canvas
 
+    bold_font, regular_font = _register_overlay_font()
+    watermark_text = shape_rtl(watermark_text) if watermark_text else watermark_text
+    footer_text = shape_rtl(footer_text) if footer_text else footer_text
+
     reader = PdfReader(pdf_path)
     writer = PdfWriter()
 
@@ -3378,21 +3488,21 @@ def _apply_watermark(pdf_path, watermark_text, footer_text=None):
         if watermark_text:
             font_size = 60.0
             max_span = math.hypot(width, height) * 0.60
-            text_span = stringWidth(watermark_text, "Helvetica-Bold", font_size)
+            text_span = stringWidth(watermark_text, bold_font, font_size)
             if text_span > max_span:
                 font_size *= max_span / text_span
             c.saveState()
             c.translate(width / 2, height / 2)
             c.rotate(math.degrees(math.atan2(height, width)))
             c.setFillColor(Color(0.85, 0.10, 0.10, alpha=0.15))
-            c.setFont("Helvetica-Bold", font_size)
+            c.setFont(bold_font, font_size)
             c.drawCentredString(0, -font_size / 3, watermark_text)
             c.restoreState()
 
         if footer_text:
             c.saveState()
             c.setFillColor(Color(0.20, 0.20, 0.20, alpha=0.85))
-            c.setFont("Helvetica", 8)
+            c.setFont(regular_font, 8)
             c.drawCentredString(width / 2, 18, footer_text)
             c.restoreState()
 

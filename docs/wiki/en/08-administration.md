@@ -31,6 +31,24 @@ Two consequences worth knowing:
 
 The controller keys off `workflow_status` *values*, so renaming a state in the workflow without remapping the `WF_*` constants in `gmp_document.py` will break the audit stamping for that stage. Adding states, actions and routing of your own is safe.
 
+## Document font (Persian / RTL)
+
+The module **enforces** one font across everything it generates — it does not ship one. Install the font yourself, then name it in **DMS Settings → Document Font**.
+
+1. **Install it in every container that runs `soffice`** — the backend *and* the queue workers. A font present in only one container produces documents that render differently depending on which worker picked up the job. Verify in each:
+   ```bash
+   fc-list : family | grep -i vazir
+   ```
+2. **Set the family name exactly as the server reports it.** Recent Vazir releases are named **`Vazirmatn`**, not `Vazir`. A name fontconfig cannot resolve falls back to a substitute — silently, which is why the module verifies the match and writes to the Error Log when it fails.
+3. Leave **Preserve Symbol Fonts** ticked unless you have a reason not to: GMP forms often draw checkboxes as Wingdings glyphs, and replacing those with a text font turns every ☑ into a stray letter.
+4. Only if the font cannot be located automatically, attach a **`.ttf`** under *Font File for Watermarks*. TrueType only — reportlab cannot embed OpenType/CFF (`.otf`).
+
+What enforcement covers: the body, `docDefaults`, headers, footers, footnotes, numbering and the theme of the `.docx`; every populated cell of an `.xlsx`; the FaceNames table of a `.vsdx` (best-effort — Visio support in LibreOffice is thin); and the PDF watermark and footer.
+
+**Why this is needed for Persian.** OOXML gives every run three font slots — Latin, East Asian, and **complex script** (`w:cs`). Persian is complex-script, so `w:cs` is the slot that decides its font, and Word's ordinary font box only writes the Latin one. That mismatch is the usual reason a template "has the font set" yet still renders Persian in something else. The module writes all four slots and strips the theme attributes that would otherwise override them.
+
+**Direction is left alone on purpose.** LibreOffice handles shaping, ligatures and RTL correctly once the font resolves, and the paragraph direction comes from the template. Forcing direction globally would break Latin paragraphs, so the module fixes the font and nothing else.
+
 ## Required setup checklist
 
 1. **Roles** — give authors/approvers **QA Manager**; module owners **DMS Manager**. (Administrator implicitly passes all role gates — always verify workflows with a *real* user.)

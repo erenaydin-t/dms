@@ -11,7 +11,13 @@
   "qa_approver",
   "ceo",
   "section_department_actors",
-  "department_actors"
+  "department_actors",
+  "section_document_font",
+  "enforce_document_font",
+  "document_font",
+  "column_break_font_1",
+  "preserve_symbol_fonts",
+  "document_font_file"
  ],
  "fields": [
   {
@@ -64,6 +70,47 @@
    "fieldtype": "Table",
    "label": "Department Actors",
    "options": "DMS Department Actors"
+  },
+  {
+   "description": "The font every generated document and PDF is rendered in, regardless of what the source template specifies. Install the font on the server first (it must be visible to LibreOffice in the backend AND worker containers) — this setting only tells the module which family to enforce.",
+   "fieldname": "section_document_font",
+   "fieldtype": "Section Break",
+   "label": "Document Font"
+  },
+  {
+   "default": "1",
+   "description": "Rewrite the font of every generated document to the family below. Untick to honour whatever each template specifies.",
+   "fieldname": "enforce_document_font",
+   "fieldtype": "Check",
+   "label": "Enforce Document Font"
+  },
+  {
+   "default": "Vazir",
+   "depends_on": "enforce_document_font",
+   "description": "Must match the installed font family EXACTLY as the server reports it — check with <code>fc-list : family | grep -i vazir</code> in the container. Recent releases of Vazir are named <b>Vazirmatn</b>. A name the server cannot resolve silently falls back to a substitute font.",
+   "fieldname": "document_font",
+   "fieldtype": "Data",
+   "label": "Font Family",
+   "mandatory_depends_on": "enforce_document_font"
+  },
+  {
+   "fieldname": "column_break_font_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "1",
+   "depends_on": "enforce_document_font",
+   "description": "Leave Wingdings, Symbol and Webdings text alone. GMP forms often draw checkboxes as Wingdings glyphs, and rewriting those to a text font turns every ☑ into a stray letter. Untick only if you want a literal every-font-replaced pass.",
+   "fieldname": "preserve_symbol_fonts",
+   "fieldtype": "Check",
+   "label": "Preserve Symbol Fonts"
+  },
+  {
+   "depends_on": "enforce_document_font",
+   "description": "Optional. Only needed for the PDF watermark and footer, and only when the font cannot be located on the server automatically. Must be a <b>.ttf</b> — reportlab cannot embed OpenType/CFF (.otf) fonts.",
+   "fieldname": "document_font_file",
+   "fieldtype": "Attach",
+   "label": "Font File (.ttf) for Watermarks"
   }
  ],
  "issingle": 1,

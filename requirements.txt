@@ -1,3 +1,9 @@
 docxtpl>=0.16.0
 pypdf>=4.0.0
 reportlab>=4.0.0
+# Persian/Arabic text in the PDF watermark and footer. reportlab applies no
+# contextual joining and no bidi, so without these a Persian string draws as
+# disconnected, mirrored letterforms. Both are optional at runtime — shape_rtl()
+# degrades to returning the text unchanged — but Persian overlays need them.
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2

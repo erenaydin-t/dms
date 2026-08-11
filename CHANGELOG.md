@@ -4,6 +4,29 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-08-11
+
+### Added
+- **Enforced document font — first-class Persian support.** A single family, set in **DMS Settings → Document Font**, is now applied to everything the module generates, *regardless of what each Word/Excel/Visio template specifies*. Templates no longer have to be re-authored, and one careless upload can no longer produce a document in Calibri.
+  - **DOCX**: every font reference is rewritten after the template render and before PDF conversion — body, `docDefaults` in `styles.xml` (which is what runs with no explicit font inherit from), **headers and footers**, footnotes, endnotes, numbering and the DrawingML theme. Applied to the distributed clean `.docx` as well as the PDF source, so both come out in the same font.
+  - **All four OOXML font slots** are set — `w:ascii`, `w:hAnsi`, `w:eastAsia` and, critically, **`w:cs` (complex script)**. Persian and Arabic are complex-script, so `w:cs` is the slot that actually decides their font; Word's normal font box only writes `w:ascii`, which is the usual reason "I set the font but the Persian text didn't change". Theme attributes (`w:asciiTheme`, `w:cstheme`, …) are **removed** rather than rewritten, because they outrank the explicit family and would silently win.
+  - **XLSX**: every populated cell is restyled to the family after the text pass. **VSDX**: best-effort rewrite of the FaceNames table shapes reference — unverified against libvisio's PDF export, like the rest of the Visio path.
+  - **Watermarks and footers** are drawn in the configured font too: the overlay registers the TTF with reportlab instead of using built-in Helvetica, so Persian is now renderable there at all. Since reportlab applies neither contextual joining nor bidi, text passes through a new `shape_rtl()` (arabic-reshaper + python-bidi) first — without it Persian draws as disconnected, mirrored letterforms.
+  - **Symbol fonts are preserved by default** (`Preserve Symbol Fonts`). GMP forms routinely draw checkboxes as Wingdings glyphs, and rewriting those to a text font turns every ☑ into a stray letter. Untick for a literal every-font-replaced pass.
+  - Nothing is hardcoded: family, enforcement on/off, symbol preservation and an optional `.ttf` are all DMS Settings fields.
+
+### Notes on behaviour
+- **Paragraph direction is deliberately not touched.** Shaping, ligatures and RTL in the document body are LibreOffice's job and it does them correctly once the font resolves; forcing direction would wreck Latin paragraphs, and correctly-authored Persian already carries its own direction marks. This release makes the *font* right, which is what was missing.
+- The watermark/footer strings stay English. They are now *translatable* — with a font configured they render correctly — but flipping them is left to Translation records so a site without a font configured cannot end up with unreadable boxes on a controlled PDF.
+- `fc-match` never fails: asked for a font that is not installed it silently returns a substitute. The resolver therefore **verifies the family it got back** and refuses a mismatch, logging to the Error Log, rather than registering DejaVu Sans under the name "Vazir".
+
+### Upgrade notes
+- **Install the font on the server yourself** — the module enforces a family, it does not ship one. It must be visible to LibreOffice in **every container that runs `soffice`** (backend *and* the queue workers), not just one. Verify with `fc-list : family | grep -i vazir` inside each.
+- Set **DMS Settings → Font Family** to the family name **exactly as the server reports it**. Note that recent Vazir releases are named **`Vazirmatn`**, not `Vazir`.
+- `bench --site <site> migrate` then `bench restart`. New Python dependencies (`arabic-reshaper`, `python-bidi`) install with the app; if you build a custom image, rebuild it.
+- Only needed if the font cannot be located automatically: attach a **`.ttf`** under *Font File for Watermarks*. It must be TrueType — reportlab cannot embed OpenType/CFF (`.otf`), and the setting rejects it rather than silently falling back.
+- Existing approved documents keep the PDF they were approved with; the font applies to documents rendered from now on.
+
 ## [2.6.1] - 2026-08-11
 
 ### Fixed
