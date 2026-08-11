@@ -102,10 +102,39 @@ can also reference resolved human-readable names (`*_name`) where useful.
 | ---------------------------- | ---------------------------------------------------------- |
 | `{{ prepared_by }}`          | Login email of the user who created the doc                |
 | `{{ prepared_by_name }}`     | That user's full name                                      |
+| `{{ supervisor }}`           | Login email of the assigned supervisor                     |
+| `{{ supervisor_name }}`      | Supervisor's full name                                     |
 | `{{ reviewer }}`             | Login email of the assigned reviewer                       |
 | `{{ reviewer_name }}`        | Reviewer's full name                                       |
+| `{{ qa_supervisor }}`        | Login email of the assigned QA supervisor                  |
+| `{{ qa_supervisor_name }}`   | QA supervisor's full name                                  |
+| `{{ regulatory_manager }}`   | Login email of the assigned regulatory manager             |
+| `{{ regulatory_manager_name }}` | Regulatory manager's full name                          |
 | `{{ qa_approver }}`          | Login email of the assigned QA approver                    |
 | `{{ qa_approver_name }}`     | QA approver's full name                                    |
+| `{{ ceo }}`                  | Login email of the CEO (from DMS Settings, stamped at publication) |
+| `{{ ceo_name }}`             | CEO's full name as captured at publication                 |
+
+### Approval timeline
+
+One date per stage, stamped as the chain advances — designed for the
+signature block and for turnaround reporting.
+
+| Placeholder                  | Description                                                |
+| ---------------------------- | ---------------------------------------------------------- |
+| `{{ preparer_date }}`        | Date the preparer submitted the draft for approval         |
+| `{{ supervisor_date }}`      | Date the supervisor approved                               |
+| `{{ reviewer_date }}`        | Date the reviewer approved                                 |
+| `{{ qa_supervisor_date }}`   | Date QA supervision cleared (direct approval or queue completion) |
+| `{{ regulatory_date }}`      | Date regulatory validated                                  |
+| `{{ manager_date }}`         | Date the manager approved                                  |
+| `{{ qa_approver_date }}`     | Date final QA authorization was granted (the Publish action) |
+| `{{ ceo_date }}`             | Date the CEO authorization was recorded                    |
+| `{{ publish_date }}`         | Date the document actually became the effective version    |
+| `{{ current_date }}`         | Today's date, resolved when the file is generated — a "printed on" box |
+
+Every stage also exposes `{{ <stage>_on_behalf_of_name }}` for delegated
+approvals; see *Delegated approvals* under Signature placeholders below.
 
 ### Workflow actuals (set during the approval cycle)
 
@@ -123,14 +152,33 @@ can also reference resolved human-readable names (`*_name`) where useful.
 
 ## 3. Signature placeholders
 
-Three special placeholders insert PNG signatures **only in the PDF
-output** (they render as nothing in the Word output):
+These placeholders insert PNG signatures **only in the PDF output** (they
+render as nothing in the Word output):
 
 | Placeholder                    | Source                                                                    |
 | ------------------------------ | ------------------------------------------------------------------------- |
 | `{{ preparer_signature }}`     | `prepared_by`'s Employee → *Signature (PNG)*                              |
+| `{{ supervisor_signature }}`   | frozen on the document when the supervisor approved (falls back to the assigned supervisor) |
 | `{{ reviewer_signature }}`     | `reviewed_by`'s Employee → *Signature (PNG)* (falls back to assigned reviewer pre-approval) |
 | `{{ qa_signature }}`           | `approved_by`'s Employee → *Signature (PNG)* (falls back to assigned QA approver pre-approval) |
+| `{{ ceo_signature }}`          | frozen on the document at publication, from the CEO configured in DMS Settings |
+
+### Delegated ("on behalf of") approvals
+
+When a **DMS Proxy Approver** performs a stage for the assigned role-holder,
+the signature that renders is the **role-holder's** — the block reads as the
+approver whose slot it is. The delegation is never hidden: the document
+records who actually acted (`<stage>_approved_by`) alongside who they acted
+for (`<stage>_on_behalf_of`), and every stage exposes a tag so the printed
+form can disclose it too:
+
+```
+Reviewed by: {{ reviewer_name }}   {{ reviewer_signature }}   {{ reviewer_date }}
+{% if reviewer_on_behalf_of_name %}(signed on their behalf by {{ reviewed_by_name }}){% endif %}
+```
+
+The `{{ ..._on_behalf_of_name }}` tags are empty on a normally-approved
+document, so the line collapses to nothing.
 
 ### How signatures get registered
 

@@ -12,6 +12,7 @@ frappe.ui.form.on("GMP Document", {
         add_create_revision_button(frm);
         show_revision_banner(frm);
         show_pending_effective_banner(frm);
+        show_delegated_approval_banner(frm);
         toggle_effective_date_controls(frm);
         add_qa_queue_ui(frm);
         render_reference_tree(frm);
@@ -186,6 +187,49 @@ function show_pending_effective_banner(frm) {
             ]
         ),
         "orange"
+    );
+}
+
+
+/**
+ * Stages a DMS Proxy Approver can have performed for the assigned role-holder.
+ * [on-behalf-of field, actual-actor field, stage date field, label]
+ */
+const DELEGATED_STAGES = [
+    ["supervisor_on_behalf_of", "supervisor_approved_by", "supervisor_date", "Supervisor"],
+    ["reviewer_on_behalf_of", "reviewed_by", "reviewer_date", "Reviewer"],
+    ["qa_supervisor_on_behalf_of", "qa_supervisor_approved_by", "qa_supervisor_date", "QA Supervisor"],
+    ["regulatory_on_behalf_of", "regulatory_validated_by", "regulatory_date", "Regulatory"],
+    ["manager_on_behalf_of", "manager_approved_by", "manager_date", "Manager"],
+    ["qa_approver_on_behalf_of", "approved_by", "qa_approver_date", "QA Approver"],
+];
+
+
+/**
+ * Surface delegated approvals on the document itself, not just in the
+ * collapsed section: a reader must be able to see at a glance that a stage was
+ * signed by a stand-in, who they stood in for, and when. Rendered as a
+ * dashboard comment rather than frm.set_intro so it coexists with the revision
+ * and pending-effective banners instead of replacing them.
+ */
+function show_delegated_approval_banner(frm) {
+    if (frm.is_new()) return;
+
+    const lines = DELEGATED_STAGES.filter(([on_behalf]) => frm.doc[on_behalf]).map(
+        ([on_behalf, actor, date, label]) =>
+            __("{0}: {1} on behalf of {2}{3}", [
+                __(label),
+                frm.doc[actor] || __("(unknown)"),
+                frm.doc[on_behalf],
+                frm.doc[date] ? ` — ${frappe.datetime.str_to_user(frm.doc[date])}` : "",
+            ])
+    );
+    if (!lines.length) return;
+
+    frm.dashboard.add_comment(
+        `${__("Delegated approval — performed by a proxy approver:")}<br>${lines.join("<br>")}`,
+        "orange",
+        true
     );
 }
 

@@ -2,9 +2,10 @@
 # License: MIT
 """Single doctype holding the workflow actors that cannot be derived from the
 Employee reporting chain: the QA Supervisor, the Regulatory Manager (Technical
-Lead) and the final QA Approver. Global defaults with optional per-department
-overrides; resolution happens in GMPDocument._resolve_workflow_actors() when a
-draft is submitted for approval."""
+Lead), the final QA Approver and the (optional) CEO. Global defaults with
+optional per-department overrides; the three routing actors are resolved in
+GMPDocument._resolve_workflow_actors_on_submit_for_approval() when a draft is
+submitted for approval, the CEO in _stamp_ceo_authorization() at publication."""
 
 import frappe
 from frappe import _
@@ -25,9 +26,13 @@ class DMSSettings(Document):
 
 
 def resolve_department_actors(department):
-    """Return {qa_supervisor, regulatory_manager, qa_approver} for a
+    """Return {qa_supervisor, regulatory_manager, qa_approver, ceo} for a
     department: the override row's value when set, else the global default.
-    Missing values come back as None — the caller decides whether to throw."""
+    Missing values come back as None — the caller decides whether to throw.
+
+    `ceo` is deliberately optional: unlike the three routing actors it gates
+    no transition, it only supplies the CEO authorization block stamped at
+    publication, so a site with no CEO sign-off simply leaves it empty."""
     settings = frappe.get_cached_doc("DMS Settings")
     override = None
     for row in settings.department_actors:
@@ -44,4 +49,5 @@ def resolve_department_actors(department):
         "qa_supervisor": pick("qa_supervisor"),
         "regulatory_manager": pick("regulatory_manager"),
         "qa_approver": pick("qa_approver"),
+        "ceo": pick("ceo"),
     }

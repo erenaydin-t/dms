@@ -4,6 +4,35 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-08-11
+
+### Added
+- **Approval timeline.** Every stage of the chain now stamps a report-friendly `Date` alongside the precise timestamp it already recorded: `preparer_date`, `supervisor_date`, `reviewer_date`, `qa_supervisor_date`, `regulatory_date`, `manager_date`, `qa_approver_date` and `publish_date`, grouped in a new collapsible **Approval Timeline** section. Turnaround between any two stages is now a plain subtraction in the report builder instead of datetime arithmetic. All eight are exposed to Word templates as `{{ ..._date }}` tags, together with `{{ current_date }}` (the date the copy is printed, resolved at render time rather than stored).
+- **The QA Supervisor stage now records who cleared it and when** — `qa_supervisor_approved_by` / `qa_supervisor_approved_on`. That step previously stamped nothing at all, leaving a hole in the middle of the audit trail. When QA is cleared through the delegated review queue rather than a direct approval, the stage is credited to the QA Supervisor who owns the delegation; the individual reviewers and their verdicts stay on the queue rows.
+- **`submitted_on`** — the moment a draft entered the approval chain.
+- **CEO authorization block.** An optional `ceo` actor in DMS Settings (global default plus per-department override, like the QA Approver) is stamped onto the document at publication as `ceo`, `ceo_name`, `ceo_date` and `ceo_signature`, and is available to templates as `{{ ceo_name }}`, `{{ ceo_date }}` and `{{ ceo_signature }}`. The name is captured as text so the record keeps the name that was in force at publication. Leave the setting empty and the block stays empty and hidden — no workflow stage is added.
+- **`DMS Proxy Approver` role — delegated approval.** A named, auditable alternative to sharing the Administrator account when an approver is unavailable. The role holder may perform **any** stage's action on **any** document: `install.py` ships a proxy twin of every actor-gated workflow transition, so the single role grant is enough on its own — none of the other DMS roles are needed. Cancelling a draft revision is deliberately *not* delegated.
+  - Each delegated action is recorded on both sides: `<stage>_approved_by` names the account that actually acted (what 21 CFR Part 11 §11.200 requires of an electronic signature), and the new `<stage>_on_behalf_of` names the role-holder it was performed for. A **Delegated Approvals** section and an orange form banner show "X on behalf of Y — date" at a glance.
+  - The **signature** follows the represented person, so the printed signature block reads as the assigned approver's, with `{{ <stage>_on_behalf_of_name }}` available to disclose the delegation beside it.
+  - Administrator's long-standing escape-hatch approvals are now recorded the same way instead of silently.
+- **Signature snapshots.** `supervisor_signature` and `ceo_signature` freeze the image that was applied when the stage completed, so a later change to someone's Employee signature cannot retroactively alter an approved document. Both are also rendered into the PDF, joining the preparer/reviewer/QA signatures.
+- **More template tags:** `supervisor`, `qa_supervisor`, `regulatory_manager` and `ceo` (with matching `_name` variants), plus `{{ supervisor_signature }}` and `{{ ceo_signature }}`.
+
+### Changed
+- **The workflow is now seeded once and then owned by the site.** `GMP Document Workflow` is created on first install with the full chain; from then on it is yours to edit from the standard **Workflow** page, and **no upgrade will overwrite your changes**. Previously every `bench migrate` re-asserted the shipped states, transitions, conditions, roles and `allow_edit`, silently undoing deliberate customisation. `after_install`/`after_migrate` now only create the workflow when it is missing.
+  - **This removes the automatic repair.** A transition whose `allowed` role is lost — most often by *renaming a Role record*, which rewrites every link and locks real users out of the Actions menu — no longer heals itself on migrate. The repair is now explicit: `bench --site <site> execute dms.install.restore_workflow_defaults` (the former `_sync_gmp_workflow`). It re-asserts the shipped definition and will overwrite your customisations to those rows, which is the point of running it; rows you added by hand are left alone.
+  - **Releases that genuinely need new workflow rows now ship a one-time additive patch** instead of continuous synchronisation. This release does exactly that for the delegated-approval transitions, below.
+
+### Fixed
+- **Signature resolution could disagree between output formats.** The `.docx`/PDF pass and the `.xlsx`/`.vsdx` overlay each resolved signatures independently; both now share one `_signature_paths()` resolution, so the same image is applied whatever the source format.
+
+### Upgrade notes
+- Run `bench --site <site> migrate`, then `bench build` and `bench restart`.
+- Patch `v2_6_0.backfill_approval_timeline` fills the new Date fields on existing documents from the timestamps each stage already recorded, and sets `publish_date` from `effective_date` on documents that are the effective version. Two stages are left blank because no historical source exists: `preparer_date` (nothing recorded when a draft entered the chain before this release) and `qa_supervisor_date` (the stage stamped nothing at all). The CEO block is **not** backfilled — inventing a CEO authorization for documents approved without one would fabricate a controlled record; already-approved documents show an empty CEO block until they are next revised.
+- Patch `v2_6_0.add_proxy_transitions` adds the delegated-approval transitions to an **existing** workflow (a fresh install gets them from the seed). It is strictly additive and one-time: it only appends rows, never edits or deletes one, it mirrors the transitions your site actually has — copying each row's own `next_state`, so a re-routed chain gets twins following *your* routing — it skips steps you removed, and it skips any row whose `condition` you rewrote rather than guessing at it. Don't want delegated approval? Never grant the role, or delete the twin rows afterwards; nothing will put them back.
+- To use delegated approval: grant **DMS Proxy Approver** to the standing-in user. Grant it sparingly — it confers approval authority at every stage, in every department.
+- To use the CEO block: set **DMS Settings → CEO** (and/or a per-department override), and upload that user's signature on their Employee record. Documents already approved keep an empty block.
+
 ## [2.5.0] - 2026-07-27
 
 ### Fixed

@@ -35,7 +35,7 @@ from dms.dms.doctype.gmp_document.gmp_document import (
     get_permission_query_conditions,
     has_permission,
 )
-from dms.install import _sync_gmp_workflow
+from dms.install import restore_workflow_defaults
 
 QA_DEPT = "GMP-Perm-QA Department"
 PROD_DEPT = "GMP-Perm-PROD Department"
@@ -520,7 +520,7 @@ class TestGMPPermissions(FrappeTestCase):
     # ------------------------------------------------------------------ #
 
     def test_workflow_allow_edit_grants_dms_manager(self):
-        _sync_gmp_workflow()
+        restore_workflow_defaults()
         wf = frappe.get_doc("Workflow", "GMP Document Workflow")
         allow = {s.state: s.allow_edit for s in wf.states}
         # Preparer states belong to the authoring role (v1.3 approval chain).
@@ -549,7 +549,7 @@ class TestGMPPermissions(FrappeTestCase):
         Obsolete state must allow QA Manager *and* QA Manager must hold amend
         permission — together that's exactly Frappe's can_amend() condition
         (docstatus == 2 and perm.amend and not workflow-read-only)."""
-        _sync_gmp_workflow()
+        restore_workflow_defaults()
         wf = frappe.get_doc("Workflow", "GMP Document Workflow")
         obsolete_roles = [s.allow_edit for s in wf.states if s.state == "Obsolete"]
         self.assertIn(

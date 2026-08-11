@@ -9,6 +9,7 @@
   "column_break_ga_1",
   "regulatory_manager",
   "qa_approver",
+  "ceo",
   "section_department_actors",
   "department_actors"
  ],
@@ -42,6 +43,14 @@
    "fieldtype": "Link",
    "ignore_user_permissions": 1,
    "label": "QA Approver (Final Authorization)",
+   "options": "User"
+  },
+  {
+   "description": "Optional. When set, publishing a GMP Document stamps this user as the CEO authority on the record — name, date and signature — for the printed signature block. Leave empty if your documents carry no CEO authorization.",
+   "fieldname": "ceo",
+   "fieldtype": "Link",
+   "ignore_user_permissions": 1,
+   "label": "CEO",
    "options": "User"
   },
   {

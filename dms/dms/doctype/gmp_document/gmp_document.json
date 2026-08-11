@@ -47,10 +47,14 @@
   "revision_of",
   "reason_for_change",
   "section_review_history",
+  "submitted_on",
   "supervisor_approved_by",
   "supervisor_approved_on",
+  "supervisor_signature",
   "reviewed_by",
   "reviewed_on",
+  "qa_supervisor_approved_by",
+  "qa_supervisor_approved_on",
   "column_break_rh_1",
   "approved_by",
   "approved_on",
@@ -59,6 +63,30 @@
   "manager_approved_on",
   "regulatory_validated_by",
   "regulatory_validated_on",
+  "section_approval_timeline",
+  "preparer_date",
+  "supervisor_date",
+  "reviewer_date",
+  "qa_supervisor_date",
+  "column_break_at_1",
+  "regulatory_date",
+  "manager_date",
+  "qa_approver_date",
+  "publish_date",
+  "section_ceo",
+  "ceo",
+  "ceo_name",
+  "column_break_ceo_1",
+  "ceo_date",
+  "ceo_signature",
+  "section_delegated_approval",
+  "supervisor_on_behalf_of",
+  "reviewer_on_behalf_of",
+  "qa_supervisor_on_behalf_of",
+  "column_break_da_1",
+  "regulatory_on_behalf_of",
+  "manager_on_behalf_of",
+  "qa_approver_on_behalf_of",
   "section_revision",
   "last_revision_by",
   "last_revision_on",
@@ -318,7 +346,7 @@
    "fieldtype": "Section Break",
    "label": "Review History",
    "collapsible": 1,
-   "depends_on": "eval:doc.reviewed_by || doc.approved_by"
+   "depends_on": "eval:doc.submitted_on || doc.supervisor_approved_by || doc.reviewed_by || doc.qa_supervisor_approved_by || doc.approved_by"
   },
   {
    "fieldname": "reviewed_by",
@@ -554,6 +582,219 @@
   {
    "fieldname": "column_break_rh_2",
    "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "submitted_on",
+   "fieldtype": "Datetime",
+   "label": "Submitted On",
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "When the preparer submitted the draft into the approval chain."
+  },
+  {
+   "fieldname": "supervisor_signature",
+   "fieldtype": "Attach Image",
+   "label": "Supervisor Signature",
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "Signature applied at supervisor approval, frozen at that moment. Resolved from the signing user's Employee record — or, for a delegated approval, from the supervisor it was performed on behalf of."
+  },
+  {
+   "fieldname": "qa_supervisor_approved_by",
+   "fieldtype": "Link",
+   "label": "QA Supervisor Approved By",
+   "options": "User",
+   "read_only": 1,
+   "no_copy": 1,
+   "ignore_user_permissions": 1
+  },
+  {
+   "fieldname": "qa_supervisor_approved_on",
+   "fieldtype": "Datetime",
+   "label": "QA Supervisor Approved On",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "section_approval_timeline",
+   "fieldtype": "Section Break",
+   "label": "Approval Timeline",
+   "collapsible": 1,
+   "description": "One Date per stage, stamped as the chain advances — built for reporting and turnaround analysis. The precise timestamps stay in Review History above."
+  },
+  {
+   "fieldname": "preparer_date",
+   "fieldtype": "Date",
+   "label": "Preparer Date",
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "Date the preparer submitted the draft for approval."
+  },
+  {
+   "fieldname": "supervisor_date",
+   "fieldtype": "Date",
+   "label": "Supervisor Date",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "reviewer_date",
+   "fieldtype": "Date",
+   "label": "Reviewer Date",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "qa_supervisor_date",
+   "fieldtype": "Date",
+   "label": "QA Supervisor Date",
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "Date the QA Supervisor cleared the document — whether by approving directly or by the delegated QA review queue completing."
+  },
+  {
+   "fieldname": "column_break_at_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "regulatory_date",
+   "fieldtype": "Date",
+   "label": "Regulatory Date",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "manager_date",
+   "fieldtype": "Date",
+   "label": "Manager Date",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "qa_approver_date",
+   "fieldtype": "Date",
+   "label": "QA Approver Date",
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "Date final QA authorization was granted (the Publish action)."
+  },
+  {
+   "fieldname": "publish_date",
+   "fieldtype": "Date",
+   "label": "Publish Date",
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "Date the document actually became the effective version. Equals the QA Approver Date for an immediately-effective document; for a future-dated one it is stamped by the daily activation sweep when the Effective Date arrives."
+  },
+  {
+   "fieldname": "section_ceo",
+   "fieldtype": "Section Break",
+   "label": "CEO Authorization",
+   "collapsible": 1,
+   "depends_on": "eval:doc.ceo || doc.ceo_name"
+  },
+  {
+   "fieldname": "ceo",
+   "fieldtype": "Link",
+   "label": "CEO",
+   "options": "User",
+   "read_only": 1,
+   "no_copy": 1,
+   "ignore_user_permissions": 1,
+   "description": "Resolved from DMS Settings (per-department override, else the global default) when the document is published."
+  },
+  {
+   "fieldname": "ceo_name",
+   "fieldtype": "Data",
+   "label": "CEO Name",
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "Full name captured at publication, so the record keeps the name in force at the time even if the user is later renamed or replaced."
+  },
+  {
+   "fieldname": "column_break_ceo_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "ceo_date",
+   "fieldtype": "Date",
+   "label": "CEO Date",
+   "read_only": 1,
+   "no_copy": 1
+  },
+  {
+   "fieldname": "ceo_signature",
+   "fieldtype": "Attach Image",
+   "label": "CEO Signature",
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "Signature applied at publication, frozen at that moment. Resolved from the CEO's Employee record."
+  },
+  {
+   "fieldname": "section_delegated_approval",
+   "fieldtype": "Section Break",
+   "label": "Delegated Approvals",
+   "collapsible": 1,
+   "depends_on": "eval:doc.supervisor_on_behalf_of || doc.reviewer_on_behalf_of || doc.qa_supervisor_on_behalf_of || doc.regulatory_on_behalf_of || doc.manager_on_behalf_of || doc.qa_approver_on_behalf_of",
+   "description": "Filled only where a DMS Proxy Approver acted for the assigned role-holder. The stage's 'Approved By' field records who actually performed the action; the field here records who it was performed on behalf of."
+  },
+  {
+   "fieldname": "supervisor_on_behalf_of",
+   "fieldtype": "Link",
+   "label": "Supervisor — On Behalf Of",
+   "options": "User",
+   "read_only": 1,
+   "no_copy": 1,
+   "ignore_user_permissions": 1
+  },
+  {
+   "fieldname": "reviewer_on_behalf_of",
+   "fieldtype": "Link",
+   "label": "Reviewer — On Behalf Of",
+   "options": "User",
+   "read_only": 1,
+   "no_copy": 1,
+   "ignore_user_permissions": 1
+  },
+  {
+   "fieldname": "qa_supervisor_on_behalf_of",
+   "fieldtype": "Link",
+   "label": "QA Supervisor — On Behalf Of",
+   "options": "User",
+   "read_only": 1,
+   "no_copy": 1,
+   "ignore_user_permissions": 1
+  },
+  {
+   "fieldname": "column_break_da_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "regulatory_on_behalf_of",
+   "fieldtype": "Link",
+   "label": "Regulatory — On Behalf Of",
+   "options": "User",
+   "read_only": 1,
+   "no_copy": 1,
+   "ignore_user_permissions": 1
+  },
+  {
+   "fieldname": "manager_on_behalf_of",
+   "fieldtype": "Link",
+   "label": "Manager — On Behalf Of",
+   "options": "User",
+   "read_only": 1,
+   "no_copy": 1,
+   "ignore_user_permissions": 1
+  },
+  {
+   "fieldname": "qa_approver_on_behalf_of",
+   "fieldtype": "Link",
+   "label": "QA Approver — On Behalf Of",
+   "options": "User",
+   "read_only": 1,
+   "no_copy": 1,
+   "ignore_user_permissions": 1
   }
  ],
  "is_submittable": 1,
@@ -634,6 +875,16 @@
    "print": 1,
    "email": 1,
    "report": 1
+  },
+  {
+   "role": "DMS Proxy Approver",
+   "read": 1,
+   "write": 1,
+   "submit": 1,
+   "print": 1,
+   "email": 1,
+   "report": 1,
+   "share": 1
   }
  ],
  "search_fields": "document_name_en,document_name_fa,document_type,department",

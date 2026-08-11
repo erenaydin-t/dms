@@ -26,13 +26,22 @@ from docx.shared import Mm
 from docxtpl import DocxTemplate, InlineImage
 
 
+# Delegated-approval role: may perform any stage's workflow action on behalf of
+# the assigned role-holder (install.py ships a proxy twin of every actor-gated
+# transition). It is the named, auditable alternative to sharing the
+# Administrator account when an approver is unavailable — every action it takes
+# is recorded on the document as "<actor> on behalf of <role-holder>" via the
+# `*_on_behalf_of` fields.
+PROXY_ROLE = "DMS Proxy Approver"
+
 # Roles that read and operate on every GMP Document regardless of department or
 # creator. "DMS Manager" is the module-owner/admin role (full CRUD + cancel);
 # "QA Manager" drives the review/approval workflow; "System Manager" is the
-# Frappe super-admin. Everyone else (a plain "Employee") is a read-only
+# Frappe super-admin; the proxy approver must reach every document to be able
+# to stand in for any actor. Everyone else (a plain "Employee") is a read-only
 # consumer scoped to their own department's approved, active documents — see
 # get_permission_query_conditions() / has_permission().
-UNRESTRICTED_ROLES = frozenset({"System Manager", "QA Manager", "DMS Manager"})
+UNRESTRICTED_ROLES = frozenset({"System Manager", "QA Manager", "DMS Manager", PROXY_ROLE})
 
 # Upper bound on get_document_reference_tree recursion, so a hand-crafted depth
 # argument over the whitelisted endpoint can't drive runaway traversal of a
@@ -102,10 +111,18 @@ TEMPLATE_FIELDS = [
     ("reason_for_change", "Reason for Change"),
     ("prepared_by", "Prepared By (user)"),
     ("prepared_by_name", "Prepared By (name)"),
+    ("supervisor", "Supervisor (user)"),
+    ("supervisor_name", "Supervisor (name)"),
     ("reviewer", "Reviewer (user)"),
     ("reviewer_name", "Reviewer (name)"),
+    ("qa_supervisor", "QA Supervisor (user)"),
+    ("qa_supervisor_name", "QA Supervisor (name)"),
+    ("regulatory_manager", "Regulatory Manager (user)"),
+    ("regulatory_manager_name", "Regulatory Manager (name)"),
     ("qa_approver", "QA Approver (user)"),
     ("qa_approver_name", "QA Approver (name)"),
+    ("ceo", "CEO (user)"),
+    ("ceo_name", "CEO Name"),
     ("reviewed_by", "Reviewed By (user)"),
     ("reviewed_by_name", "Reviewed By (name)"),
     ("reviewed_on", "Reviewed On"),
@@ -113,9 +130,30 @@ TEMPLATE_FIELDS = [
     ("approved_by_name", "Approved By (name)"),
     ("approved_on", "Approved On"),
     ("workflow_status", "Workflow Status"),
+    # ----- approval timeline (one Date per stage) -----
+    ("preparer_date", "Preparer Date"),
+    ("supervisor_date", "Supervisor Date"),
+    ("reviewer_date", "Reviewer Date"),
+    ("qa_supervisor_date", "QA Supervisor Date"),
+    ("regulatory_date", "Regulatory Date"),
+    ("manager_date", "Manager Date"),
+    ("qa_approver_date", "QA Approver Date"),
+    ("ceo_date", "CEO Date"),
+    ("publish_date", "Publish Date"),
+    ("current_date", "Current Date (date of printing)"),
+    # ----- delegated approvals ("on behalf of") -----
+    ("supervisor_on_behalf_of_name", "Supervisor — On Behalf Of (name)"),
+    ("reviewer_on_behalf_of_name", "Reviewer — On Behalf Of (name)"),
+    ("qa_supervisor_on_behalf_of_name", "QA Supervisor — On Behalf Of (name)"),
+    ("regulatory_on_behalf_of_name", "Regulatory — On Behalf Of (name)"),
+    ("manager_on_behalf_of_name", "Manager — On Behalf Of (name)"),
+    ("qa_approver_on_behalf_of_name", "QA Approver — On Behalf Of (name)"),
+    # ----- images -----
     ("preparer_signature", "Preparer Signature (image)"),
+    ("supervisor_signature", "Supervisor Signature (image)"),
     ("reviewer_signature", "Reviewer Signature (image)"),
     ("qa_signature", "QA Approver Signature (image)"),
+    ("ceo_signature", "CEO Signature (image)"),
     ("qa_stamp", "QA Status Stamp (image)"),
 ]
 
@@ -199,6 +237,98 @@ _RETURN_EDGES = {
     (WF_PENDING_MANAGER, WF_PENDING_REGULATORY):   ("reviewer",           "regulatory_manager", "Re-validate — Manager returned {0}"),
     (WF_PENDING_FINAL_QA, WF_PENDING_MANAGER):     ("qa_approver",        "reviewer",           "Re-approve — Final QA returned {0}"),
 }
+
+
+# Per-stage audit wiring — the single source of truth for the approval
+# timeline. For each stage of the chain:
+#   actor     — field naming the user the stage is assigned to
+#   by        — field recording who ACTUALLY performed it (None for the
+#               preparer, whose assignment field already is that record)
+#   on        — precise timestamp
+#   date      — report-friendly Date mirror of `on`, so turnaround between
+#               stages can be filtered and grouped without datetime maths
+#   on_behalf — filled only when a delegated approver acted for `actor`
+#   signature — optional field snapshotting the signature image applied here
+_STAGE_STAMPS = {
+    "preparer": {
+        "actor": "prepared_by",
+        "by": None,
+        "on": "submitted_on",
+        "date": "preparer_date",
+        "on_behalf": None,
+        "signature": None,
+        "label": "Preparer",
+    },
+    "supervisor": {
+        "actor": "supervisor",
+        "by": "supervisor_approved_by",
+        "on": "supervisor_approved_on",
+        "date": "supervisor_date",
+        "on_behalf": "supervisor_on_behalf_of",
+        "signature": "supervisor_signature",
+        "label": "Supervisor",
+    },
+    "reviewer": {
+        "actor": "reviewer",
+        "by": "reviewed_by",
+        "on": "reviewed_on",
+        "date": "reviewer_date",
+        "on_behalf": "reviewer_on_behalf_of",
+        "signature": None,
+        "label": "Reviewer",
+    },
+    "qa_supervisor": {
+        "actor": "qa_supervisor",
+        "by": "qa_supervisor_approved_by",
+        "on": "qa_supervisor_approved_on",
+        "date": "qa_supervisor_date",
+        "on_behalf": "qa_supervisor_on_behalf_of",
+        "signature": None,
+        "label": "QA Supervisor",
+    },
+    "regulatory": {
+        "actor": "regulatory_manager",
+        "by": "regulatory_validated_by",
+        "on": "regulatory_validated_on",
+        "date": "regulatory_date",
+        "on_behalf": "regulatory_on_behalf_of",
+        "signature": None,
+        "label": "Regulatory Manager",
+    },
+    # The Manager step is performed by the same user who reviewed earlier —
+    # hence actor "reviewer" — but it is a distinct stage with its own stamps.
+    "manager": {
+        "actor": "reviewer",
+        "by": "manager_approved_by",
+        "on": "manager_approved_on",
+        "date": "manager_date",
+        "on_behalf": "manager_on_behalf_of",
+        "signature": None,
+        "label": "Manager",
+    },
+    "qa_approver": {
+        "actor": "qa_approver",
+        "by": "approved_by",
+        "on": "approved_on",
+        "date": "qa_approver_date",
+        "on_behalf": "qa_approver_on_behalf_of",
+        "signature": None,
+        "label": "QA Approver",
+    },
+}
+
+
+def _acts_on_behalf(user):
+    """True when ``user`` may act for another role-holder.
+
+    Two accounts can: a holder of the delegated-approval role, and
+    Administrator — the long-standing escape hatch, which is the same
+    situation and is now recorded the same way rather than silently."""
+    if not user:
+        return False
+    if user == "Administrator":
+        return True
+    return PROXY_ROLE in frappe.get_roles(user)
 
 
 class GMPDocument(NestedSet):
@@ -396,10 +526,13 @@ class GMPDocument(NestedSet):
         self.qa_approver = None
         self.qa_reviews = []
         self.qa_review_complete = 0
+        self.submitted_on = None
         self.supervisor_approved_by = None
         self.supervisor_approved_on = None
         self.reviewed_by = None
         self.reviewed_on = None
+        self.qa_supervisor_approved_by = None
+        self.qa_supervisor_approved_on = None
         self.manager_approved_by = None
         self.manager_approved_on = None
         self.regulatory_validated_by = None
@@ -409,6 +542,20 @@ class GMPDocument(NestedSet):
         self.last_revision_request = None
         self.last_revision_by = None
         self.last_revision_on = None
+        # The approval timeline, the delegation record and the signature
+        # snapshots all belong to the predecessor's approval cycle; this
+        # revision earns its own.
+        for spec in _STAGE_STAMPS.values():
+            self.set(spec["date"], None)
+            if spec["on_behalf"]:
+                self.set(spec["on_behalf"], None)
+            if spec["signature"]:
+                self.set(spec["signature"], None)
+        self.publish_date = None
+        self.ceo = None
+        self.ceo_name = None
+        self.ceo_date = None
+        self.ceo_signature = None
 
     def _guard_successor_creation(self, predecessor_name):
         """Integrity guards for creating a successor (revision or amendment).
@@ -734,6 +881,9 @@ class GMPDocument(NestedSet):
         # same save and can be skipped — guarantees approved_by is populated when
         # _render_and_generate_pdf() builds the signature context.
         self._stamp_approver()
+        # Before the render, so the CEO's signature is resolved and embedded in
+        # the same pass as the other actors' signatures.
+        self._stamp_ceo_authorization()
 
         if not self.effective_date:
             self.effective_date = today()
@@ -741,6 +891,14 @@ class GMPDocument(NestedSet):
             self.db_set("effective_date", self.effective_date, update_modified=False)
             self.db_set("expiry_date", self.expiry_date, update_modified=False)
             self.db_set("next_revision_date", self.next_revision_date, update_modified=False)
+
+        # Publication date = the day the document actually enters force in the
+        # system. A future-dated document is approved but NOT yet published, so
+        # it is left blank here and stamped by activate_effective_documents()
+        # on the day it goes live; a backdated one still publishes today, since
+        # that is when it became the version people are handed.
+        if not _is_pending_effective_date(self.effective_date):
+            self.db_set("publish_date", today(), update_modified=False)
 
         self._render_and_generate_pdf()
 
@@ -814,17 +972,26 @@ class GMPDocument(NestedSet):
         """Record the QA approver (and timestamp) if not already set.
 
         Idempotent: when the on_update workflow side-effect already stamped
-        approved_by, this is a no-op; otherwise it fills it from the submitting
-        session user. Either way approved_by is guaranteed populated before the
-        signature render so the approver's signature is embedded in the PDF."""
+        approved_by, this only tops up the Date mirror; otherwise it stamps the
+        whole stage from the submitting session user. Either way approved_by is
+        guaranteed populated before the signature render so the approver's
+        signature is embedded in the PDF."""
+        if not self.approved_by and not self.is_new():
+            self._stamp_stage("qa_approver", frappe.session.user)
+            return
+
+        # Fallbacks for the paths db_set cannot serve (a brand-new document) and
+        # for documents whose approval predates the timeline fields.
         if not self.approved_by:
             self.approved_by = frappe.session.user
-            if not self.is_new():
-                self.db_set("approved_by", self.approved_by, update_modified=False)
         if not self.approved_on:
             self.approved_on = now_datetime()
-            if not self.is_new():
-                self.db_set("approved_on", self.approved_on, update_modified=False)
+        if not self.qa_approver_date:
+            self.qa_approver_date = getdate(self.approved_on)
+        if not self.is_new():
+            self.db_set("approved_by", self.approved_by, update_modified=False)
+            self.db_set("approved_on", self.approved_on, update_modified=False)
+            self.db_set("qa_approver_date", self.qa_approver_date, update_modified=False)
 
     def before_cancel(self):
         # A controlled document is routinely listed in the `references` child
@@ -1199,24 +1366,58 @@ class GMPDocument(NestedSet):
         with open(generated_pdf, "rb") as fh:
             return fh.read()
 
+    def _signature_paths(self):
+        """``{template_tag: absolute_image_path}`` for every signature the
+        current state resolves — the single source used by BOTH render paths
+        (docxtpl's InlineImage pass and the xlsx/vsdx image overlay), so the
+        two can never drift apart. Tags that resolve to nothing are omitted,
+        which is what makes an unsigned stage render as empty space.
+
+        Priority per stage:
+          1. the person the stage was performed ON BEHALF OF — a delegated
+             approval prints the assigned approver's signature block, with the
+             delegation disclosed by the *_on_behalf_of_name tags beside it;
+          2. the actual actor;
+          3. the assigned role-holder — a step performed by someone else may
+             leave the actor without a signature, and without this fallback
+             nothing would render at all.
+        Supervisor and CEO prefer the snapshot frozen on the document when the
+        stage completed; their live lookup only serves documents approved
+        before those fields existed."""
+        paths = {
+            "preparer_signature": _resolve_signature_path(self.prepared_by),
+            "supervisor_signature": (
+                _signature_path_from_url(self.supervisor_signature)
+                or _resolve_signature_path(
+                    self.supervisor_on_behalf_of or self.supervisor_approved_by or self.supervisor
+                )
+            ),
+            "reviewer_signature": (
+                _resolve_signature_path(self.reviewer_on_behalf_of)
+                or _resolve_signature_path(self.reviewed_by)
+                or _resolve_signature_path(self.reviewer)
+            ),
+            "qa_signature": (
+                _resolve_signature_path(self.qa_approver_on_behalf_of)
+                or _resolve_signature_path(self.approved_by)
+                or _resolve_signature_path(self.qa_approver)
+            ),
+            "ceo_signature": (
+                _signature_path_from_url(self.ceo_signature) or _resolve_signature_path(self.ceo)
+            ),
+        }
+        return {tag: path for tag, path in paths.items() if path}
+
     def _resolve_render_images(self, field_mappings=None):
         """Map of ``{tag: absolute_png_path}`` for the image placeholders, from
-        current state — the QA status stamp plus the three signatures. Mirrors
-        the actor-then-assigned signature resolution used by the .docx image
-        pass. User-defined aliases (custom_tag -> an image system_field) are
+        current state — the QA status stamp plus every resolved signature.
+        User-defined aliases (custom_tag -> an image system_field) are
         propagated so an aliased image tag resolves in xlsx/vsdx too."""
         images = {}
         stamp = self._resolve_stamp_path()
         if stamp:
             images["qa_stamp"] = stamp
-        for tag, actor, assigned in (
-            ("preparer_signature", self.prepared_by, self.prepared_by),
-            ("reviewer_signature", self.reviewed_by, self.reviewer),
-            ("qa_signature", self.approved_by, self.qa_approver),
-        ):
-            path = _resolve_signature_path(actor) or _resolve_signature_path(assigned)
-            if path:
-                images[tag] = path
+        images.update(self._signature_paths())
         for row in (field_mappings or []):
             alias = (row.custom_tag or "").strip()
             if alias and row.system_field in images:
@@ -1384,10 +1585,18 @@ class GMPDocument(NestedSet):
             # ----- workflow assignments -----
             "prepared_by": self.prepared_by or "",
             "prepared_by_name": user_full_name(self.prepared_by),
+            "supervisor": self.supervisor or "",
+            "supervisor_name": user_full_name(self.supervisor),
             "reviewer": self.reviewer or "",
             "reviewer_name": user_full_name(self.reviewer),
+            "qa_supervisor": self.qa_supervisor or "",
+            "qa_supervisor_name": user_full_name(self.qa_supervisor),
+            "regulatory_manager": self.regulatory_manager or "",
+            "regulatory_manager_name": user_full_name(self.regulatory_manager),
             "qa_approver": self.qa_approver or "",
             "qa_approver_name": user_full_name(self.qa_approver),
+            "ceo": self.ceo or "",
+            "ceo_name": self.ceo_name or "",
             # ----- workflow actuals -----
             "reviewed_by": self.reviewed_by or "",
             "reviewed_by_name": user_full_name(self.reviewed_by),
@@ -1396,36 +1605,44 @@ class GMPDocument(NestedSet):
             "approved_by_name": user_full_name(self.approved_by),
             "approved_on": cstr(self.approved_on) if self.approved_on else "",
             "workflow_status": self.workflow_status or "",
+            # ----- approval timeline -----
+            # One Date per stage plus current_date, which is resolved at render
+            # time rather than stored: it is the date the copy in the reader's
+            # hand was produced, which is exactly what a "printed on" box means.
+            "preparer_date": cstr(self.preparer_date) if self.preparer_date else "",
+            "supervisor_date": cstr(self.supervisor_date) if self.supervisor_date else "",
+            "reviewer_date": cstr(self.reviewer_date) if self.reviewer_date else "",
+            "qa_supervisor_date": cstr(self.qa_supervisor_date) if self.qa_supervisor_date else "",
+            "regulatory_date": cstr(self.regulatory_date) if self.regulatory_date else "",
+            "manager_date": cstr(self.manager_date) if self.manager_date else "",
+            "qa_approver_date": cstr(self.qa_approver_date) if self.qa_approver_date else "",
+            "ceo_date": cstr(self.ceo_date) if self.ceo_date else "",
+            "publish_date": cstr(self.publish_date) if self.publish_date else "",
+            "current_date": today(),
+            # ----- delegated approvals -----
+            # Empty unless a proxy approver acted, so a template can print
+            # "on behalf of {{ ..._on_behalf_of_name }}" under the signature and
+            # simply collapse to nothing on a normally-approved document.
+            "supervisor_on_behalf_of_name": user_full_name(self.supervisor_on_behalf_of),
+            "reviewer_on_behalf_of_name": user_full_name(self.reviewer_on_behalf_of),
+            "qa_supervisor_on_behalf_of_name": user_full_name(self.qa_supervisor_on_behalf_of),
+            "regulatory_on_behalf_of_name": user_full_name(self.regulatory_on_behalf_of),
+            "manager_on_behalf_of_name": user_full_name(self.manager_on_behalf_of),
+            "qa_approver_on_behalf_of_name": user_full_name(self.qa_approver_on_behalf_of),
             # ----- signatures (default: empty for clean DOCX) -----
             "preparer_signature": "",
+            "supervisor_signature": "",
             "reviewer_signature": "",
             "qa_signature": "",
+            "ceo_signature": "",
             # ----- QA status stamp (default: empty for clean DOCX) -----
             "qa_stamp": "",
         }
 
         if template_for_images is not None:
-            # Resolve the actual signer's signature first, then fall back to the
-            # assigned reviewer / QA approver. The two are usually the same, but
-            # when a workflow step is performed by someone else (e.g. an admin
-            # via the escape-hatch) the actor (reviewed_by/approved_by) may have
-            # no signature — so without the fallback no signature would render at
-            # all. _validate_signatures guarantees the assigned reviewer/
-            # qa_approver have a signature, so this fallback always resolves.
-            preparer_path = _resolve_signature_path(self.prepared_by)
-            reviewer_path = _resolve_signature_path(self.reviewed_by) or _resolve_signature_path(self.reviewer)
-            qa_path = _resolve_signature_path(self.approved_by) or _resolve_signature_path(self.qa_approver)
-            if preparer_path:
-                context["preparer_signature"] = InlineImage(
-                    template_for_images, preparer_path, width=Mm(SIGNATURE_WIDTH_MM)
-                )
-            if reviewer_path:
-                context["reviewer_signature"] = InlineImage(
-                    template_for_images, reviewer_path, width=Mm(SIGNATURE_WIDTH_MM)
-                )
-            if qa_path:
-                context["qa_signature"] = InlineImage(
-                    template_for_images, qa_path, width=Mm(SIGNATURE_WIDTH_MM)
+            for key, path in self._signature_paths().items():
+                context[key] = InlineImage(
+                    template_for_images, path, width=Mm(SIGNATURE_WIDTH_MM)
                 )
 
             # QA status stamp — approved while active, rejected once obsolete.
@@ -1505,6 +1722,7 @@ class GMPDocument(NestedSet):
         if curr == WF_PENDING_SUPERVISOR and prev in (WF_DRAFT, WF_REVISION):
             # Preparer submitted for approval; actors were resolved in
             # validate() during this same save.
+            self._stamp_stage("preparer", actor)
             self.add_comment(
                 "Workflow",
                 _("Submitted for approval by {0} — routed to supervisor {1}").format(actor, self.supervisor),
@@ -1513,15 +1731,13 @@ class GMPDocument(NestedSet):
             _create_todo(self, self.supervisor, _("Supervisor approval — GMP Document {0}").format(self.name))
 
         elif curr == WF_UNDER_REVIEW and prev == WF_PENDING_SUPERVISOR:
-            self.db_set("supervisor_approved_by", actor, update_modified=False)
-            self.db_set("supervisor_approved_on", now_datetime(), update_modified=False)
+            self._stamp_stage("supervisor", actor)
             self.add_comment("Workflow", _("Supervisor approved — forwarded to reviewer {0}").format(self.reviewer))
             _close_open_todos(self, allocated_to=self.supervisor)
             _create_todo(self, self.reviewer, _("Review GMP Document {0}").format(self.name))
 
         elif curr == WF_PENDING_QA_SUPERVISOR and prev == WF_UNDER_REVIEW:
-            self.db_set("reviewed_by", actor, update_modified=False)
-            self.db_set("reviewed_on", now_datetime(), update_modified=False)
+            self._stamp_stage("reviewer", actor)
             self.add_comment("Workflow", _("Reviewer approved — forwarded to QA Supervisor {0}").format(self.qa_supervisor))
             _close_open_todos(self, allocated_to=self.reviewer)
             _create_todo(self, self.qa_supervisor, _("QA Supervisor — approve or delegate review of {0}").format(self.name))
@@ -1529,29 +1745,27 @@ class GMPDocument(NestedSet):
         elif curr == WF_PENDING_REGULATORY and prev == WF_PENDING_QA_SUPERVISOR:
             # QA Supervisor approved directly, without delegating a queue (or
             # past a halted one — retire any rows still queued from it).
+            self._stamp_stage("qa_supervisor", actor)
             self._supersede_open_qa_rows()
             self.add_comment("Workflow", _("QA Supervisor approved — forwarded to Regulatory {0}").format(self.regulatory_manager))
             _close_open_todos(self, allocated_to=self.qa_supervisor)
             _create_todo(self, self.regulatory_manager, _("Regulatory validation — GMP Document {0}").format(self.name))
 
         elif curr == WF_PENDING_MANAGER and prev == WF_PENDING_REGULATORY:
-            self.db_set("regulatory_validated_by", actor, update_modified=False)
-            self.db_set("regulatory_validated_on", now_datetime(), update_modified=False)
+            self._stamp_stage("regulatory", actor)
             self.add_comment("Workflow", _("Regulatory validated — forwarded to Manager {0}").format(self.reviewer))
             _close_open_todos(self, allocated_to=self.regulatory_manager)
             _create_todo(self, self.reviewer, _("Manager approval — GMP Document {0}").format(self.name))
 
         elif curr == WF_PENDING_FINAL_QA and prev == WF_PENDING_MANAGER:
-            self.db_set("manager_approved_by", actor, update_modified=False)
-            self.db_set("manager_approved_on", now_datetime(), update_modified=False)
+            self._stamp_stage("manager", actor)
             self.add_comment("Workflow", _("Manager approved — forwarded to QA Approver {0}").format(self.qa_approver))
             _close_open_todos(self, allocated_to=self.reviewer)
             _create_todo(self, self.qa_approver, _("Final QA authorization — publish GMP Document {0}").format(self.name))
 
         elif curr == WF_APPROVED:
             # Final QA published (this save also auto-submits the document).
-            self.db_set("approved_by", actor, update_modified=False)
-            self.db_set("approved_on", now_datetime(), update_modified=False)
+            self._stamp_stage("qa_approver", actor)
             self.add_comment("Workflow", _("Final QA authorization granted — document published"))
             _close_open_todos(self, allocated_to=self.qa_approver)
 
@@ -1605,6 +1819,80 @@ class GMPDocument(NestedSet):
                         frappe.get_traceback(),
                         "GMP Document: revision-cancelled comment on predecessor failed",
                     )
+
+    def _stamp_stage(self, stage, actor):
+        """Record the completion of one approval stage: who performed it, the
+        precise timestamp, the report-friendly Date mirror, and — when the
+        actor stood in for the assigned role-holder — the delegation.
+
+        `<stage>_approved_by` always names the user who ACTUALLY acted, which
+        is what 21 CFR Part 11 requires of an electronic signature record;
+        `<stage>_on_behalf_of` names the role-holder they acted for. Only the
+        signature follows the represented person, so the printed signature
+        block reads as the assigned approver's — with the delegation stated on
+        the document beside it, never in place of it."""
+        spec = _STAGE_STAMPS[stage]
+        stamped_at = now_datetime()
+        if spec["by"]:
+            self.db_set(spec["by"], actor, update_modified=False)
+        self.db_set(spec["on"], stamped_at, update_modified=False)
+        self.db_set(spec["date"], getdate(stamped_at), update_modified=False)
+
+        signer = actor
+        assigned = self.get(spec["actor"])
+        if assigned and assigned != actor and _acts_on_behalf(actor):
+            signer = assigned
+            if spec["on_behalf"]:
+                self.db_set(spec["on_behalf"], assigned, update_modified=False)
+            self.add_comment(
+                "Workflow",
+                _("{0} acted as {1} on behalf of {2}.").format(
+                    actor, _(spec["label"]), assigned
+                ),
+            )
+
+        if spec["signature"]:
+            self._snapshot_signature(spec["signature"], signer)
+
+    def _snapshot_signature(self, fieldname, user):
+        """Freeze the signature image applied at a stage onto the document.
+
+        The stored value is the File's URL, not a copy of its bytes: the record
+        then points at the exact image that was in force when the stage was
+        completed, and a later change to that Employee's signature cannot
+        retroactively alter an already-approved document. A user without a
+        usable signature leaves the field empty — the same graceful degradation
+        the PDF render has always had."""
+        signature = _resolve_signature_file(user)
+        if signature:
+            self.db_set(fieldname, signature.url, update_modified=False)
+
+    def _stamp_ceo_authorization(self):
+        """Stamp the CEO authorization block at publication.
+
+        The CEO is resolved from DMS Settings (per-department override, else
+        the global default) and is entirely optional — a site whose documents
+        carry no CEO sign-off simply leaves it unset and the block stays empty
+        and hidden. The name is captured as text alongside the User link so the
+        controlled record keeps the name that was in force at publication even
+        if the user is later renamed, replaced or disabled."""
+        if self.ceo:
+            return  # already stamped (re-render / re-submit)
+
+        from dms.dms.doctype.dms_settings.dms_settings import resolve_department_actors
+
+        ceo = resolve_department_actors(self.department).get("ceo")
+        if not ceo:
+            return
+
+        self.db_set("ceo", ceo, update_modified=False)
+        self.db_set(
+            "ceo_name",
+            frappe.db.get_value("User", ceo, "full_name") or ceo,
+            update_modified=False,
+        )
+        self.db_set("ceo_date", getdate(now_datetime()), update_modified=False)
+        self._snapshot_signature("ceo_signature", ceo)
 
     def _stamp_revision_request(self, actor):
         """Record who/when on a revision request. The reason text is captured
@@ -1698,6 +1986,12 @@ class GMPDocument(NestedSet):
         approvals = [r for r in rows if r.status == QA_APPROVED]
         if approvals:
             self.db_set("qa_review_complete", 1, update_modified=False)
+            # QA clearance came from the delegated queue rather than a single
+            # click, so the stage is stamped to the QA Supervisor who owns the
+            # delegation — not to the session user, who is merely the last
+            # reviewer in the queue. The individual reviewers and their verdicts
+            # stay on the qa_reviews rows.
+            self._stamp_stage("qa_supervisor", self.qa_supervisor)
             self._server_transition(
                 WF_PENDING_REGULATORY,
                 _("All delegated QA reviews completed ({0} approved, {1} skipped) — forwarded to Regulatory {2}").format(
@@ -1821,7 +2115,35 @@ def _signature_issue(user_email):
 
 
 def _resolve_signature_path(user_email):
-    """Return the on-disk path of a user's signature image, or None.
+    """The on-disk path of a user's signature image, or None.
+
+    Thin wrapper over _resolve_signature_file for the render paths, which only
+    ever need the path."""
+    signature = _resolve_signature_file(user_email)
+    return signature.path if signature else None
+
+
+def _signature_path_from_url(file_url):
+    """The on-disk path behind a stored signature URL, or None.
+
+    Used for the snapshotted `*_signature` fields: they hold the URL of the
+    image that was in force when a stage was completed, and the render needs
+    the file it points at. Returns None (rather than throwing) when the File
+    row or the image itself has since gone, so the render degrades the same way
+    a never-uploaded signature does."""
+    if not file_url:
+        return None
+    file_name = frappe.db.get_value("File", {"file_url": file_url}, "name")
+    if not file_name:
+        return None
+    path = frappe.get_doc("File", file_name).get_full_path()
+    if not os.path.exists(path) or not path.lower().endswith(ALLOWED_SIGNATURE_EXTENSIONS):
+        return None
+    return path
+
+
+def _resolve_signature_file(user_email):
+    """Return frappe._dict(url=..., path=...) for a user's signature, or None.
 
     Resolution chain:
         User (user_email) -> Employee.user_id -> Employee.custom_signature_image
@@ -1910,7 +2232,7 @@ def _resolve_signature_path(user_email):
         )
         return None
 
-    return physical_path
+    return frappe._dict(url=sig_url, path=physical_path)
 
 
 # ---------------------------------------------------------------------- #
@@ -1945,6 +2267,10 @@ def activate_effective_documents():
         try:
             doc = frappe.get_doc("GMP Document", name)
             doc.db_set("is_active", 1, update_modified=False)
+            # on_submit left publish_date blank for a future-dated document
+            # precisely so it could be stamped here: today is the day it
+            # actually entered force.
+            doc.db_set("publish_date", today(), update_modified=False)
             doc.add_comment(
                 "Info",
                 _("Effective Date {0} reached — this document is now the effective version.").format(

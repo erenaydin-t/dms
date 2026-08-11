@@ -9,7 +9,8 @@
   "department",
   "qa_supervisor",
   "regulatory_manager",
-  "qa_approver"
+  "qa_approver",
+  "ceo"
  ],
  "fields": [
   {
@@ -42,6 +43,14 @@
    "ignore_user_permissions": 1,
    "in_list_view": 1,
    "label": "QA Approver",
+   "options": "User"
+  },
+  {
+   "fieldname": "ceo",
+   "fieldtype": "Link",
+   "ignore_user_permissions": 1,
+   "in_list_view": 1,
+   "label": "CEO",
    "options": "User"
   }
  ],

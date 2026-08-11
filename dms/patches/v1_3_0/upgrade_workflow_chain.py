@@ -5,9 +5,10 @@ Approval → Approved) becomes the full GMP approval chain (supervisor →
 reviewer → QA supervisor [+ sequential delegated queue] → manager →
 regulatory → final QA → publish).
 
-This patch prepares existing sites BEFORE install.after_migrate re-syncs the
-workflow (which retires the old transitions and, once empty, the 'Pending QA
-Approval' state):
+This patch remaps existing sites onto the new chain and then installs it via
+restore_workflow_defaults() (which retires the old transitions and, once empty,
+the 'Pending QA Approval' state). Ordering matters: documents must leave the
+retired state before the state row can go.
 
 1. Documents parked in 'Pending QA Approval' move to 'Pending Final QA
    Approval' — in both chains that is the state acted on by the already-
@@ -62,3 +63,14 @@ def execute():
         user_doc = frappe.get_doc("User", user)
         user_doc.append("roles", {"role": "DMS Initiator"})
         user_doc.save(ignore_permissions=True)
+
+    # Install the v1.3 chain itself. This used to be left to
+    # install.after_migrate, which re-synced the workflow on every migrate;
+    # since v2.6.0 the workflow is seeded once and then owned by the site, so
+    # this one-time upgrade has to carry out its own half of the job — a site
+    # coming from pre-v1.3 would otherwise be left with documents remapped
+    # onto states its workflow does not have. Sites past v1.3 have long since
+    # run this patch and are untouched.
+    from dms.install import restore_workflow_defaults
+
+    restore_workflow_defaults()

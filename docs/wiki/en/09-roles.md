@@ -1,6 +1,6 @@
 # Roles & Permissions
 
-The DMS module uses **three module roles** plus the standard *Employee* role for read-only consumers. Role names are canonical **English** names — do not rename the Role records (see *Special considerations*).
+The DMS module ships its own roles plus the standard *Employee* role for read-only consumers. Role names are canonical **English** names — do not rename the Role records (see *Special considerations*).
 
 ## Role summary
 
@@ -9,9 +9,10 @@ The DMS module uses **three module roles** plus the standard *Employee* role for
 | **QA Manager** | ✅ Yes — the working role | Authors and workflow actors: everyone who prepares, reviews or QA-approves controlled documents |
 | **DMS Manager** | ✅ Yes (at least one holder recommended) | Module owner/administrator: full control incl. delete, cross-department oversight, source-file distribution |
 | **System Manager** | Built-in | IT administration; same unrestricted DMS access as DMS Manager |
+| **DMS Proxy Approver** | Optional | Delegated approval: acts for any role-holder, on any document, when an approver is unavailable |
 | **Employee** | Optional | Read-only consumers: see the *approved, active* documents of their own department |
 
-`Administrator` implicitly passes every role and per-actor gate (escape hatch) — fine for emergencies, wrong for daily use, since audit trails should name real actors.
+`Administrator` implicitly passes every role and per-actor gate (escape hatch) — fine for emergencies, wrong for daily use, since audit trails should name real actors. **DMS Proxy Approver exists to make that escape hatch unnecessary**: it grants the same reach through a named account, and every action it takes is recorded on the document as "acted on behalf of".
 
 ---
 
@@ -55,6 +56,30 @@ The DMS module uses **three module roles** plus the standard *Employee* role for
 ## System Manager
 
 Treated as unrestricted by the module (same as DMS Manager) and passes the effective-date and word-download role gates. Assign it for IT administration only, not as a substitute for the module roles.
+
+---
+
+## DMS Proxy Approver
+
+**Purpose:** keep documents moving when the assigned approver is unavailable — on leave, travelling, or no longer with the company — without anyone sharing the `Administrator` password.
+
+**What it can do:** every stage's workflow action, on every document, in every department. Each actor-gated transition ships a twin allowed to this role, so **the single role grant is enough on its own** — the holder needs none of QA Manager, DMS Initiator or DMS Approver. The one action it cannot take is *Cancel Revision*: abandoning a draft revision stays with the author and QA.
+
+**What it records.** A delegated action is never silent, and never disguised as the role-holder's own:
+
+| Field | Holds |
+|---|---|
+| `<stage>_approved_by` | the account that **actually acted** — the proxy |
+| `<stage>_on_behalf_of` | the role-holder it was performed **for** |
+| `<stage>_date` | when |
+
+The form shows an orange **Delegated approval** banner ("X on behalf of Y — date") and a *Delegated Approvals* section. The **signature** that prints is the represented approver's, so the signature block reads as the assigned approver's — with `{{ <stage>_on_behalf_of_name }}` available in Word templates to state the delegation beside it.
+
+Why both sides: 21 CFR Part 11 §11.200 requires an electronic signature to be unique to one individual and never reassigned, so the record of who actually pressed the button must survive. Recording the delegation alongside it — rather than instead of it — is what makes the signature block readable *and* the audit trail truthful.
+
+**Grant it sparingly.** It is approval authority over every controlled document in the company. Treat it like a key to the QA cabinet: few holders, and review who has it.
+
+> Administrator's escape-hatch approvals are recorded the same way from v2.6.0 — if Administrator approves for a supervisor, the document now says so.
 
 ---
 

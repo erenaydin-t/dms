@@ -7,6 +7,21 @@ Wired in hooks.py:
     after_install  -> seeds Department.custom_abbr (required by autoname)
     after_migrate  -> idempotently re-asserts Department.custom_abbr so a
                       missing column never silently breaks GMP Document.autoname()
+
+Two different contracts live in here, and the difference matters:
+
+* **Schema the code cannot run without** — the Department.custom_abbr and
+  Employee.custom_signature_image custom fields, the module roles, the amend
+  naming rule — is re-asserted on every migrate. Losing any of it breaks
+  autoname(), signature rendering or the permission rows outright.
+
+* **The workflow is only SEEDED.** `_ensure_gmp_workflow()` creates
+  `GMP Document Workflow` when it does not exist and returns immediately when
+  it does. Once created, the definition belongs to the site: states,
+  transitions, conditions, roles and `allow_edit` are all editable from the
+  standard Workflow page, and no upgrade will overwrite them. The shipped
+  definition is a starting point, not a specification the module keeps
+  enforcing. `restore_workflow_defaults()` puts it back deliberately, by hand.
 """
 
 import frappe
@@ -117,6 +132,43 @@ _REVISION_CANCEL = (
     'or frappe.session.user == "Administrator")'
 )
 
+# Delegated ("on behalf of") authority. Every actor-gated transition in
+# GMP_CHAIN_TRANSITIONS ships a twin row allowed to DMS_PROXY_ROLE, so one role
+# grant lets a standing-in user drive any stage of any document — the named
+# alternative to handing out the Administrator account, which is what sites
+# otherwise resort to when an approver is on leave.
+#
+# The twin's condition is the negation of the actor check: it offers the action
+# only to someone who is NOT the assigned actor (and is not Administrator, who
+# already passes the original row's escape hatch). Without that, a user holding
+# both DMS Approver and the proxy role would see the same action listed twice
+# in the Actions menu. Authorisation therefore comes from `allowed` alone —
+# that is the whole point of the role — while the controller records the
+# delegation: the stage's actual actor in `<stage>_approved_by` and the
+# role-holder it was performed for in `<stage>_on_behalf_of`.
+#
+# "Cancel Revision" deliberately has no twin: abandoning a draft revision is
+# the author's and QA's call, not a stand-in's.
+DMS_PROXY_ROLE = "DMS Proxy Approver"
+
+
+def _proxy_for(actor_field):
+    return f'doc.{actor_field} != frappe.session.user and frappe.session.user != "Administrator"'
+
+
+# Maps each actor-gated condition to the document field naming the actor it
+# pins to. Membership here is what earns a transition its proxy twin, so a new
+# actor-gated row gets delegated authority by adding its condition to this map
+# — the twins below are derived, never hand-maintained in parallel.
+_ACTOR_FIELD_BY_CONDITION = {
+    _PREPARER: "prepared_by",
+    _SUPERVISOR: "supervisor",
+    _REVIEWER: "reviewer",
+    _QA_SUPERVISOR: "qa_supervisor",
+    _REGULATORY: "regulatory_manager",
+    _QA: "qa_approver",
+}
+
 # allow_self_approval=1 on every transition: without it Frappe blocks a user
 # from acting on a document they *own* (doc.owner == user) — which is the
 # NORMAL case here: the preparer both creates the draft and submits it for
@@ -127,7 +179,7 @@ _REVISION_CANCEL = (
 # forward transition on purpose: it is entered by delegate_qa_review() and
 # left by the controller's queue engine when the last delegated reviewer
 # completes — only the emergency "Recall Delegation" is a human action.
-GMP_WORKFLOW_TRANSITIONS = [
+GMP_CHAIN_TRANSITIONS = [
     {"state": "Draft",                         "action": "Submit for Approval",     "next_state": "Pending Supervisor Approval",   "allowed": "DMS Initiator", "condition": _PREPARER, "allow_self_approval": 1},
     {"state": "Revision Requested",            "action": "Submit for Approval",     "next_state": "Pending Supervisor Approval",   "allowed": "DMS Initiator", "condition": _PREPARER, "allow_self_approval": 1},
 
@@ -161,11 +213,26 @@ GMP_WORKFLOW_TRANSITIONS = [
     {"state": "Pending Supervisor Approval",   "action": "Cancel Revision",         "next_state": "Revision Cancelled",            "allowed": "DMS Initiator", "condition": _REVISION_CANCEL, "allow_self_approval": 1},
 ]
 
-# Rows the module used to own and now actively removes on migrate (states
-# are only removed when no transition still references them and no document
-# sits in them — see _sync_gmp_workflow). Documents parked in a retired
-# state are remapped by patch v1_3_0.upgrade_workflow_chain BEFORE the state
-# row disappears.
+# The delegated twin of every actor-gated row above: same state/action/target,
+# allowed to DMS_PROXY_ROLE, offered only when the acting user is not already
+# the assigned actor.
+GMP_PROXY_TRANSITIONS = [
+    {
+        **tr,
+        "allowed": DMS_PROXY_ROLE,
+        "condition": _proxy_for(_ACTOR_FIELD_BY_CONDITION[tr["condition"]]),
+    }
+    for tr in GMP_CHAIN_TRANSITIONS
+    if tr["condition"] in _ACTOR_FIELD_BY_CONDITION
+]
+
+GMP_WORKFLOW_TRANSITIONS = GMP_CHAIN_TRANSITIONS + GMP_PROXY_TRANSITIONS
+
+# Rows of chains the module used to ship, removed by restore_workflow_defaults()
+# (states only once no transition still references them and no document sits in
+# them). Since v2.6.0 that function is manual, so these are cleaned up only when
+# a site deliberately asks for the shipped definition back — an upgrade leaves
+# them, and anything parked in them, exactly where they are.
 GMP_RETIRED_TRANSITIONS = {
     # pre-v1.3 short chain
     ("Draft", "Submit for Review"),
@@ -194,7 +261,13 @@ GMP_RETIRED_STATES = {"Pending QA Approval"}
 #                   each action to the specific User resolved on the document.
 #   QA Manager    — QA department staff; owns the final Publish.
 #   DMS Manager   — module owner / admin.
-DMS_ROLES = ("QA Manager", "DMS Manager", "DMS Initiator", "DMS Approver")
+#   DMS Proxy Approver — delegated authority: may perform any stage's action on
+#                   behalf of the assigned role-holder, on any document, in any
+#                   department. Grant it alone — the proxy transition twins
+#                   carry it, so it needs none of the other roles — and grant it
+#                   sparingly: every delegated action is recorded on the
+#                   document as "<actor> on behalf of <role-holder>".
+DMS_ROLES = ("QA Manager", "DMS Manager", "DMS Initiator", "DMS Approver", DMS_PROXY_ROLE)
 
 
 def before_install():
@@ -210,18 +283,22 @@ def after_install():
     _ensure_employee_signature_field()
     _ensure_amend_naming_rule()
     _ensure_gmp_workflow()
-    _sync_gmp_workflow()
 
 
 def after_migrate():
     # Idempotent re-assertion of custom fields; never touches user
     # preferences (default_workspace) so existing customizations stick.
+    #
+    # The workflow is SEEDED, not synchronised: _ensure_gmp_workflow() creates
+    # it only when it is missing and returns immediately when it exists, so an
+    # upgrade can never overwrite states, transitions, conditions or roles that
+    # a site has edited in the Workflow page. See restore_workflow_defaults()
+    # for the manual way back to the shipped definition.
     _ensure_roles()
     _ensure_department_abbr_field()
     _ensure_employee_signature_field()
     _ensure_amend_naming_rule()
     _ensure_gmp_workflow()
-    _sync_gmp_workflow()
 
 
 def _ensure_roles():
@@ -280,11 +357,52 @@ def _ensure_amend_naming_rule():
     }).insert(ignore_permissions=True)
 
 
-def _sync_gmp_workflow():
-    """Idempotently bring an existing GMP Document Workflow up to date with the
-    states/transitions this module owns: append any missing state or
-    transition and (re)assert the per-actor transition `condition`s. Never
-    removes rows the user added by hand. Safe on every migrate."""
+def _match_desired_transition(row, by_state_action):
+    """Identify which module-owned transition an existing workflow row descends
+    from, or None if it is not ours.
+
+    A (state, action) pair maps to a single module row in the common case, but
+    the delegated-authority twins mean it can map to two: the actor-gated row
+    and its DMS Proxy Approver copy. Disambiguate on `allowed` first, then fall
+    back to `condition` — that fallback is what keeps the role-rename repair
+    working, since a row whose role was renamed out from under it matches no
+    role name we ship. When both keys have drifted the row is left alone rather
+    than guessed at."""
+    variants = by_state_action.get((row.state, row.action))
+    if not variants:
+        return None
+    if len(variants) == 1:
+        return variants[0]
+    for variant in variants:
+        if variant["allowed"] == row.allowed:
+            return variant
+    for variant in variants:
+        if variant["condition"] == row.condition:
+            return variant
+    return None
+
+
+def restore_workflow_defaults():
+    """Bring an existing GMP Document Workflow back in line with the definition
+    this module ships: append any missing state or transition, (re)assert the
+    per-actor conditions, roles and routing, and drop the transitions of
+    retired chains.
+
+    **Opt-in — never called by install or migrate.** The workflow is the site's
+    to edit from the Workflow page once it exists; an upgrade that quietly
+    re-asserted our version would throw away deliberate customisation. Run this
+    only when you actually want the shipped definition back:
+
+        bench --site <site> execute dms.install.restore_workflow_defaults
+
+    The case that most often needs it: a site RENAMES a Role record, which
+    rewrites every link — including the `allowed` role on each transition — so
+    the workflow starts demanding a role name that nothing else in the system
+    uses, and every real user is silently locked out of the Actions menu. This
+    restores the canonical roles. (Rename roles for display via Translation
+    records, never by renaming the Role.)
+
+    Rows a site added by hand are left alone."""
     if not frappe.db.exists("Workflow", GMP_WORKFLOW_NAME):
         return
 
@@ -311,11 +429,29 @@ def _sync_gmp_workflow():
         })
         changed = True
 
-    # Append module-owned transitions that the install predates (e.g. the
-    # 'Cancel Revision' fan), seeding the Workflow Action Master as needed.
-    have_transitions = {(tr.state, tr.action) for tr in wf.transitions}
+    # Match every existing row to the module row it descends from, so the
+    # append and re-assert passes below agree on what is already installed.
+    # Since v2.6.0 a (state, action) pair can ship TWICE — the actor-gated row
+    # and its DMS Proxy Approver twin — so the pair alone no longer identifies
+    # a row; see _match_desired_transition for how the two are told apart.
+    matched = {}  # id(desired dict) -> True
+    desired_for_row = {}  # id(existing row) -> desired dict
+    by_state_action = {}
     for tr in GMP_WORKFLOW_TRANSITIONS:
-        if (tr["state"], tr["action"]) in have_transitions:
+        by_state_action.setdefault((tr["state"], tr["action"]), []).append(tr)
+
+    for row in wf.transitions:
+        desired = _match_desired_transition(row, by_state_action)
+        if desired is None:
+            continue
+        desired_for_row[id(row)] = desired
+        matched[id(desired)] = True
+
+    # Append module-owned transitions that the install predates (e.g. the
+    # 'Cancel Revision' fan or the proxy twins), seeding the Workflow Action
+    # Master as needed.
+    for tr in GMP_WORKFLOW_TRANSITIONS:
+        if matched.get(id(tr)):
             continue
         if not frappe.db.exists("Workflow Action Master", tr["action"]):
             frappe.get_doc({
@@ -333,8 +469,7 @@ def _sync_gmp_workflow():
         changed = True
 
     # Re-assert conditions, the allowed role and the self-approval flag on
-    # rows that exist but drifted. Keyed by (state, action) — the same action
-    # may fan out from several states.
+    # rows that exist but drifted.
     #
     # `allowed` drifts when a site admin RENAMES a role: rename_doc rewrites
     # every link, so the transition suddenly requires e.g. a Persian-named
@@ -342,9 +477,8 @@ def _sync_gmp_workflow():
     # canonical English name that migrate re-creates — silently locking every
     # real user out of the workflow. Re-asserting restores the canonical role
     # (rename roles for display via Translation, not by renaming the Role).
-    cond_by_key = {(tr["state"], tr["action"]): tr for tr in GMP_WORKFLOW_TRANSITIONS}
     for tr in wf.transitions:
-        desired = cond_by_key.get((tr.state, tr.action))
+        desired = desired_for_row.get(id(tr))
         if not desired:
             continue
         if tr.condition != desired["condition"]:
@@ -403,11 +537,15 @@ def _sync_gmp_workflow():
 
 
 def _ensure_gmp_workflow():
-    """Inject the Frappe Workflow that mirrors the controller's state machine.
+    """Seed the Frappe Workflow that mirrors the controller's state machine.
 
-    Idempotent: skipped if a workflow with this name already exists, so the
-    user can edit transitions in the desk UI without us clobbering them on
-    every migrate.
+    A SEED, not a synchronisation: if a workflow with this name already exists
+    this returns immediately, whatever state it is in. From the moment it is
+    created the definition belongs to the site — states, transitions,
+    conditions, roles and `allow_edit` can all be edited from the standard
+    Workflow page, and no install or migrate will touch them again. Use
+    restore_workflow_defaults() to deliberately return to the shipped
+    definition.
 
     Authorisation model: transitions are driven entirely by Frappe's native
     Workflow engine (the form "Actions" menu). apply_workflow() enforces the
@@ -415,7 +553,9 @@ def _ensure_gmp_workflow():
     tightens that to the specific assigned User (preparer / Reviewer / QA
     Approver). The controller reacts to the resulting workflow_status change
     in _apply_workflow_side_effects() to stamp audit fields and hand off
-    ToDos. _sync_gmp_workflow() keeps existing installs in step.
+    ToDos — and it keys off `workflow_status` values, not off this definition,
+    so a site that renames a state must remap the controller's WF_* constants
+    too. Adding states, actions and routing of your own is safe.
     """
     if frappe.db.exists("Workflow", GMP_WORKFLOW_NAME):
         return
