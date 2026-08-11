@@ -130,18 +130,30 @@ def _ensure_employee(email, reports_to=None):
     return e.name
 
 
+def _sig_png_for(email):
+    """A valid PNG whose trailing bytes differ per user, so a test can prove
+    WHICH person's signature was applied. Bytes after IEND are ignored by
+    readers, so this stays a decodable image."""
+    return _SIG_PNG + b"#" + email.encode()
+
+
 def _ensure_signature(email):
     emp = frappe.db.get_value("Employee", {"user_id": email}, "name")
-    if not frappe.db.get_value("Employee", emp, "custom_signature_image"):
-        f = frappe.get_doc(
-            {
-                "doctype": "File",
-                "file_name": f"sig-{frappe.generate_hash(length=6)}.png",
-                "is_private": 1,
-                "content": _SIG_PNG,
-            }
-        ).insert(ignore_permissions=True)
-        frappe.db.set_value("Employee", emp, "custom_signature_image", f.file_url)
+    url = frappe.db.get_value("Employee", emp, "custom_signature_image")
+    # Repair a dangling pointer too, not just an empty one: a URL whose File row
+    # has gone leaves the employee permanently unusable as an approver, and the
+    # fixture is the only thing that can put it back.
+    if url and frappe.db.exists("File", {"file_url": url}):
+        return
+    f = frappe.get_doc(
+        {
+            "doctype": "File",
+            "file_name": f"sig-{frappe.generate_hash(length=6)}.png",
+            "is_private": 1,
+            "content": _sig_png_for(email),
+        }
+    ).insert(ignore_permissions=True)
+    frappe.db.set_value("Employee", emp, "custom_signature_image", f.file_url)
 
 
 def _grant_role(email, role):
@@ -297,6 +309,20 @@ class TestWorkflowChain(FrappeTestCase):
     def _signature_of(self, email):
         return frappe.db.get_value(
             "Employee", {"user_id": email}, "custom_signature_image"
+        )
+
+    def _file_bytes(self, file_url):
+        path = frappe.get_doc("File", {"file_url": file_url}).get_full_path()
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    def _assert_snapshot_of(self, snapshot_url, email):
+        """The snapshot is a COPY owned by the document, so identity is proved
+        by content, not by URL."""
+        self.assertTrue(snapshot_url, "no signature was snapshotted")
+        self.assertNotEqual(snapshot_url, self._signature_of(email))
+        self.assertEqual(
+            self._file_bytes(snapshot_url), self._file_bytes(self._signature_of(email))
         )
 
     # ------------------------------------------------------------------ #
@@ -479,7 +505,7 @@ class TestWorkflowChain(FrappeTestCase):
         self.assertEqual(doc.supervisor_approved_by, SUPERVISOR)
         self.assertEqual(str(doc.supervisor_date), today)
         self.assertFalse(doc.supervisor_on_behalf_of)  # acted for themselves
-        self.assertEqual(doc.supervisor_signature, self._signature_of(SUPERVISOR))
+        self._assert_snapshot_of(doc.supervisor_signature, SUPERVISOR)
 
         doc = self._advance(doc, WF_PENDING_QA_SUPERVISOR, MANAGER)
         self.assertEqual(doc.reviewed_by, MANAGER)
@@ -577,13 +603,61 @@ class TestWorkflowChain(FrappeTestCase):
 
         # The signature block must read as the assigned supervisor's — that is
         # the whole point of approving on their behalf — never the proxy's own.
-        self.assertEqual(doc.supervisor_signature, self._signature_of(SUPERVISOR))
-        self.assertNotEqual(doc.supervisor_signature, self._signature_of(PROXY))
-        self.assertEqual(
-            doc._signature_paths().get("supervisor_signature"),
-            frappe.get_doc(
-                "File", {"file_url": self._signature_of(SUPERVISOR)}
-            ).get_full_path(),
+        self._assert_snapshot_of(doc.supervisor_signature, SUPERVISOR)
+        self.assertNotEqual(
+            self._file_bytes(doc.supervisor_signature),
+            self._file_bytes(self._signature_of(PROXY)),
+        )
+        # ...and that is the image the renderer picks up.
+        with open(doc._signature_paths()["supervisor_signature"], "rb") as fh:
+            self.assertEqual(fh.read(), self._file_bytes(self._signature_of(SUPERVISOR)))
+
+    def test_snapshot_never_claims_the_employees_signature_file(self):
+        """Regression (2.6.1): the snapshot must COPY the image into a file this
+        document owns.
+
+        Frappe's global `attach_files_to_document` hook claims any *unattached*
+        File named by an Attach Image field, re-parenting it to the document
+        being saved. Storing the employee's own signature URL therefore stole
+        their File on first approval — and deleting that document destroyed the
+        signature for every future document, leaving the employee unusable as an
+        approver with a dangling `custom_signature_image`."""
+        sig_url = self._signature_of(SUPERVISOR)
+        before = frappe.db.get_value(
+            "File",
+            {"file_url": sig_url},
+            ["name", "attached_to_doctype", "attached_to_name"],
+            as_dict=True,
+        )
+
+        doc = self._advance(
+            self._make_draft("GMP-Chain-SigOwnership"), WF_PENDING_SUPERVISOR, PREPARER
+        )
+        doc = self._advance(doc, WF_UNDER_REVIEW, SUPERVISOR)
+
+        # The snapshot is a distinct file belonging to this document...
+        self.assertNotEqual(doc.supervisor_signature, sig_url)
+        snapshot = frappe.db.get_value(
+            "File",
+            {"file_url": doc.supervisor_signature},
+            ["attached_to_doctype", "attached_to_name"],
+            as_dict=True,
+        )
+        self.assertEqual(snapshot.attached_to_doctype, "GMP Document")
+        self.assertEqual(snapshot.attached_to_name, doc.name)
+
+        # ...and the employee's own File was not re-parented.
+        after = frappe.db.get_value(
+            "File", before.name, ["attached_to_doctype", "attached_to_name"], as_dict=True
+        )
+        self.assertEqual(after.attached_to_doctype, before.attached_to_doctype)
+        self.assertEqual(after.attached_to_name, before.attached_to_name)
+
+        # Deleting the document must not take the employee's signature with it.
+        frappe.delete_doc("GMP Document", doc.name, force=True, ignore_permissions=True)
+        self.assertTrue(
+            frappe.db.exists("File", {"file_url": sig_url}),
+            "deleting the document destroyed the employee's signature file",
         )
 
     def test_proxy_reviewer_signature_beats_the_actual_actor(self):
@@ -617,7 +691,7 @@ class TestWorkflowChain(FrappeTestCase):
             self.assertEqual(doc.ceo, QA_R1)
             self.assertEqual(doc.ceo_name, frappe.db.get_value("User", QA_R1, "full_name"))
             self.assertEqual(str(doc.ceo_date), frappe.utils.today())
-            self.assertEqual(doc.ceo_signature, self._signature_of(QA_R1))
+            self._assert_snapshot_of(doc.ceo_signature, QA_R1)
         finally:
             _configure_settings()
 

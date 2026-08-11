@@ -1855,17 +1855,46 @@ class GMPDocument(NestedSet):
             self._snapshot_signature(spec["signature"], signer)
 
     def _snapshot_signature(self, fieldname, user):
-        """Freeze the signature image applied at a stage onto the document.
+        """Freeze the signature image applied at a stage onto the document, by
+        COPYING it into a file this document owns.
 
-        The stored value is the File's URL, not a copy of its bytes: the record
-        then points at the exact image that was in force when the stage was
-        completed, and a later change to that Employee's signature cannot
-        retroactively alter an already-approved document. A user without a
-        usable signature leaves the field empty — the same graceful degradation
-        the PDF render has always had."""
+        It must be a copy, never a reference to the Employee's own File.
+        Frappe's global `attach_files_to_document` hook runs on the on_update of
+        every doctype and claims any *unattached* File named by an Attach /
+        Attach Image field — rewriting its `attached_to_doctype` to this
+        document. Pointing these fields at the employee's signature therefore
+        re-parents it here on the first approval, and deleting this document
+        then deletes that employee's signature for every future document too.
+        (`attached_to_field` is set below for the same reason: without it the
+        hook re-inserts a duplicate File row for our own copy on every save.)
+
+        Copying is also the truthful thing for a controlled record: the bytes
+        that were actually applied at this stage stay with the document even
+        after the employee replaces their signature.
+
+        A user without a usable signature leaves the field empty — the same
+        graceful degradation the PDF render has always had."""
         signature = _resolve_signature_file(user)
-        if signature:
-            self.db_set(fieldname, signature.url, update_modified=False)
+        if not signature:
+            return
+
+        try:
+            with open(signature.path, "rb") as fh:
+                content = fh.read()
+        except OSError:
+            frappe.log_error(
+                f"Could not read signature {signature.path} for {user}",
+                "GMP Document: signature snapshot failed",
+            )
+            return
+
+        ext = os.path.splitext(signature.path)[1].lower() or ".png"
+        snapshot = self._own_private_file(content, f"{self.name}-{fieldname}{ext}")
+        if snapshot.get("attached_to_field") != fieldname:
+            frappe.db.set_value(
+                "File", snapshot.name, "attached_to_field", fieldname, update_modified=False
+            )
+        self.db_set(fieldname, snapshot.file_url, update_modified=False)
 
     def _stamp_ceo_authorization(self):
         """Stamp the CEO authorization block at publication.

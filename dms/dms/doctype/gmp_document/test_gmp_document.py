@@ -122,7 +122,11 @@ def _ensure_signature(user, dept):
         e.flags.ignore_mandatory = True
         e.db_insert()
         emp = e.name
-    if not frappe.db.get_value("Employee", emp, "custom_signature_image"):
+    url = frappe.db.get_value("Employee", emp, "custom_signature_image")
+    # Repair a dangling pointer too, not just an empty one: a URL whose File row
+    # has gone leaves the user permanently unusable as an approver, and every
+    # later save in the suite then fails validation.
+    if not (url and frappe.db.exists("File", {"file_url": url})):
         f = frappe.get_doc(
             {
                 "doctype": "File",

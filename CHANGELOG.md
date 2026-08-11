@@ -4,6 +4,24 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.1] - 2026-08-11
+
+### Fixed
+- **Approving a document could destroy an employee's signature image (data loss, introduced in 2.6.0).** The new `supervisor_signature` / `ceo_signature` snapshot fields stored the *URL of the employee's own signature File*. Frappe's global `attach_files_to_document` hook — which runs on the `on_update` of every doctype — claims any **unattached** File named by an `Attach`/`Attach Image` field and re-parents it to the document being saved. So the first supervisor approval silently re-attached that employee's signature to the GMP Document, and deleting or purging that document then deleted the signature outright: the Employee kept a `custom_signature_image` pointing at a File that no longer existed, and every later save naming them as Reviewer or QA Approver failed with "the signature file record is missing".
+  - The snapshot now **copies** the image into a private file owned by the document (via `_own_private_file`, with `attached_to_field` set so the hook does not insert duplicate rows either). The employee's own File is never touched. Copying is also the truthful thing for a controlled record: the bytes actually applied at that stage stay with the document even after the employee replaces their signature.
+  - **If you deployed 2.6.0 and approved anything, check for damage** before upgrading — see the upgrade notes.
+
+### Upgrade notes
+- Upgrade straight to 2.6.1; no new patch, no schema change. `bench migrate` → `bench build` → `bench restart`.
+- **2.6.0 deployments only.** Find employees whose signature pointer is now dangling:
+  ```sql
+  SELECT e.name, e.employee_name, e.user_id, e.custom_signature_image
+    FROM `tabEmployee` e
+   WHERE e.custom_signature_image IS NOT NULL AND e.custom_signature_image != ''
+     AND NOT EXISTS (SELECT 1 FROM `tabFile` f WHERE f.file_url = e.custom_signature_image);
+  ```
+  Re-upload the signature on each row returned (Employee → *Signature (PNG)*). Also check for signature Files wrongly re-parented to a GMP Document — `SELECT name, file_url, attached_to_name FROM \`tabFile\` WHERE attached_to_doctype = 'GMP Document' AND file_url LIKE '%sig%'` — and clear `attached_to_doctype`/`attached_to_name` on any that is an employee signature rather than a document's own snapshot.
+
 ## [2.6.0] - 2026-08-11
 
 ### Added
