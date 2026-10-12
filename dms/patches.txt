@@ -14,3 +14,4 @@ dms.patches.v1_3_0.upgrade_workflow_chain
 dms.patches.v1_4_0.remove_seeded_document_types
 dms.patches.v2_6_0.backfill_approval_timeline
 dms.patches.v2_6_0.add_proxy_transitions
+dms.patches.v2_7_1.pin_render_font

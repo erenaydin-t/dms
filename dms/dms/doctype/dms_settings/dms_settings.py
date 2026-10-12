@@ -9,21 +9,24 @@ submitted for approval, the CEO in _stamp_ceo_authorization() at publication."""
 
 import os
 import subprocess
+import time
 
 import frappe
 from frappe import _
 from frappe.model.document import Document
 
-_FONT_CACHE_KEY = "dms_document_font_file"
+# Font-file lookups, per process. The answer is a path on THIS container's
+# filesystem, so it must not be shared through Redis with containers that may
+# not have the file. Keyed by the DMS Settings version, so a save — a new family
+# or a newly attached .ttf — reaches every worker on its next render.
+_font_file_cache = {}
+# A failed lookup is retried after this long, so a font installed after the
+# first miss (or an fc-match that timed out on a busy host) is picked up without
+# anyone having to re-save DMS Settings.
+_FONT_MISS_RETRY_SECONDS = 300
 
 
 class DMSSettings(Document):
-    def on_update(self):
-        # The font-file lookup is cached per family (fc-match is a subprocess);
-        # drop it so a changed family or a newly attached .ttf takes effect on
-        # the next render instead of after a worker recycle.
-        frappe.cache.delete_key(_FONT_CACHE_KEY)
-
     def validate(self):
         if self.document_font_file and not self.document_font_file.lower().endswith(".ttf"):
             frappe.throw(
@@ -44,6 +47,26 @@ class DMSSettings(Document):
                     )
                 )
             seen.add(row.department)
+
+        self._warn_if_font_not_installed()
+
+    def _warn_if_font_not_installed(self):
+        # A warning, not a block: the font may legitimately be installed after
+        # the setting is saved. Until it is, approvals skip enforcement (see
+        # GMPDocument._pin_render_font) rather than render in a substitute.
+        family = (self.document_font or "").strip()
+        if not (self.enforce_document_font and family) or is_font_installed(family):
+            return
+        frappe.msgprint(
+            _(
+                "Font {0} is not installed on this server, so it is not enforced yet: "
+                "documents approved meanwhile keep their template's own fonts. Install "
+                "it in every container that runs LibreOffice and enter the family name "
+                "exactly as <code>fc-list : family</code> reports it."
+            ).format(frappe.bold(family)),
+            title=_("Document Font Not Installed"),
+            indicator="orange",
+        )
 
 
 def resolve_document_font():
@@ -71,24 +94,34 @@ def resolve_font_file(family):
     fails — asked for a font that is not installed it silently returns the best
     substitute — so matching on the file alone would happily register DejaVu
     Sans under the name "Vazir" and produce Persian-shaped boxes with no error
-    anywhere. We compare the returned family and reject a mismatch.
+    anywhere. We compare the returned family exactly — the same test
+    is_font_installed() applies for the document body, so the watermark does
+    not accept a font the body would not get.
 
-    Cached per family: this runs on every watermark render, and fc-match is a
-    subprocess. Cleared whenever DMS Settings is saved."""
+    Cached per process (this runs on every watermark render, and fc-match is a
+    subprocess), keyed by the DMS Settings version. A cached path that has
+    disappeared is looked up again; a miss is retried after a few minutes."""
     if not family:
         return None
 
-    cached = frappe.cache.hget(_FONT_CACHE_KEY, family)
-    if cached is not None:
-        return cached or None
+    settings = frappe.get_cached_doc("DMS Settings")
+    attached = settings.document_font_file or ""
+    key = (family, attached, str(settings.modified))
+    cached = _font_file_cache.get(key)
+    if cached:
+        path, looked_up_at = cached
+        if path and os.path.exists(path):
+            return path
+        if not path and time.monotonic() - looked_up_at < _FONT_MISS_RETRY_SECONDS:
+            return None
 
-    resolved = _resolve_font_file_uncached(family)
-    frappe.cache.hset(_FONT_CACHE_KEY, family, resolved or "")
-    return resolved
+    path = _resolve_font_file_uncached(family, attached)
+    _font_file_cache.clear()  # only the current settings version is ever asked for
+    _font_file_cache[key] = (path, time.monotonic())
+    return path
 
 
-def _resolve_font_file_uncached(family):
-    attached = frappe.db.get_single_value("DMS Settings", "document_font_file")
+def _resolve_font_file_uncached(family, attached):
     if attached:
         name = frappe.db.get_value("File", {"file_url": attached}, "name")
         if name:
@@ -101,6 +134,59 @@ def _resolve_font_file_uncached(family):
                 "DMS: document font",
             )
 
+    match = _fc_match(family)
+    if not match:
+        return None
+    matched_families, path = match
+    if not path or not os.path.exists(path):
+        return None
+    # fc-match returns a substitute rather than nothing; accept only a real hit.
+    # Exact, not a substring: "Sans" must not accept "DejaVu Sans", nor "Vazir"
+    # a "Vazirmatn" file that LibreOffice would never pick for the body.
+    if not _is_exact_match(family, matched_families):
+        frappe.log_error(
+            f"Font '{family}' is not installed on this host — fc-match fell back "
+            f"to '{', '.join(matched_families)}'. Install the font in every container that "
+            f"runs soffice, or attach a .ttf in DMS Settings.",
+            "DMS: document font",
+        )
+        return None
+    if not path.lower().endswith(".ttf"):
+        return None  # reportlab TTFont cannot embed CFF/OTF outlines
+    return path
+
+
+def is_font_installed(family):
+    """True when fontconfig on THIS host resolves ``family`` to that family
+    itself rather than to a substitute.
+
+    This is the question the document body depends on: LibreOffice asks
+    fontconfig for the family named in the file and draws with whatever comes
+    back, without complaint. Enforcing a family that is not installed therefore
+    does not fail — it silently re-sets every document in a fallback such as
+    DejaVu Sans. The comparison is exact, ignoring case and spaces as
+    fontconfig does, so an installed "Vazirmatn" does not satisfy "Vazir".
+
+    Uncached and host-local on purpose: it runs once per approval, next to a
+    LibreOffice conversion that costs far more, and each container has its own
+    fonts. An unverifiable font (fc-match missing) counts as not installed."""
+    match = _fc_match(family) if family else None
+    return bool(match) and _is_exact_match(family, match[0])
+
+
+def _is_exact_match(family, matched_families):
+    wanted = _normalize_family(family)
+    return any(_normalize_family(f) == wanted for f in matched_families)
+
+
+def _normalize_family(name):
+    return "".join((name or "").split()).lower()
+
+
+def _fc_match(family):
+    """``([family names], file)`` that fontconfig resolves ``family`` to, or
+    None when fc-match cannot run. fc-match never answers "not found" — it
+    returns its best substitute — so callers must check the families."""
     try:
         out = subprocess.run(
             ["fc-match", "-f", "%{family}|%{file}", family],
@@ -111,24 +197,8 @@ def _resolve_font_file_uncached(family):
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
-
     matched_family, _, path = out.partition("|")
-    if not path or not os.path.exists(path):
-        return None
-    # fc-match returns a substitute rather than nothing; accept only a real hit.
-    wanted = family.strip().lower()
-    families = [f.strip().lower() for f in matched_family.split(",")]
-    if not any(wanted == f or wanted in f for f in families):
-        frappe.log_error(
-            f"Font '{family}' is not installed on this host — fc-match fell back "
-            f"to '{matched_family}'. Install the font in every container that "
-            f"runs soffice, or attach a .ttf in DMS Settings.",
-            "DMS: document font",
-        )
-        return None
-    if not path.lower().endswith(".ttf"):
-        return None  # reportlab TTFont cannot embed CFF/OTF outlines
-    return path
+    return [f.strip() for f in matched_family.split(",") if f.strip()], path
 
 
 def resolve_department_actors(department):

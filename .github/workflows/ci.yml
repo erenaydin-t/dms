@@ -110,7 +110,7 @@ jobs:
           # visibility model, reference tree, and the LibreOffice DOCX->PDF
           # end-to-end pipeline). --skip-before-tests skips ERPNext's
           # setup-wizard bootstrap, which the DMS suite does not need.
-          for m in test_gmp_document test_permissions test_e2e_pdf; do
+          for m in test_gmp_document test_font_enforcement test_permissions test_e2e_pdf; do
             echo "::group::run-tests $m"
             docker compose exec -T backend bench --site test_site \
               run-tests --module "dms.dms.doctype.gmp_document.$m" --skip-before-tests

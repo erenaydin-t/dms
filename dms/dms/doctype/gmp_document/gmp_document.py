@@ -25,7 +25,7 @@ from frappe.core.doctype.file.utils import get_content_hash
 from docx.shared import Mm
 from docxtpl import DocxTemplate, InlineImage
 
-from .font_enforcement import enforce_docx_font, enforce_vsdx_font, shape_rtl
+from .font_enforcement import enforce_docx_font, enforce_vsdx_font, font_covers, shape_rtl
 
 
 # Delegated-approval role: may perform any stage's workflow action on behalf of
@@ -918,6 +918,9 @@ class GMPDocument(NestedSet):
         if not _is_pending_effective_date(self.effective_date):
             self.db_set("publish_date", today(), update_modified=False)
 
+        # The only point where DMS Settings decides the font: every later
+        # re-render of this version reuses what is frozen here.
+        self._pin_render_font()
         self._render_and_generate_pdf()
 
         # A future-dated document is QA-approved but PENDING: it must not
@@ -1273,16 +1276,76 @@ class GMPDocument(NestedSet):
             frappe.throw(_("Render source must be a .docx, .xlsx, or .vsdx file."))
 
         soffice = self._soffice_binary()
+        font = self._render_font_policy()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             if ext == ".docx":
-                clean_bytes, pdf_bytes = self._render_docx(source_path, field_mappings, soffice, tmpdir)
+                clean_bytes, pdf_bytes = self._render_docx(source_path, field_mappings, soffice, tmpdir, font)
             elif ext == ".xlsx":
-                clean_bytes, pdf_bytes = self._render_xlsx(source_path, field_mappings, soffice, tmpdir)
+                clean_bytes, pdf_bytes = self._render_xlsx(source_path, field_mappings, soffice, tmpdir, font)
             else:  # .vsdx
-                clean_bytes, pdf_bytes = self._render_vsdx(source_path, field_mappings, soffice, tmpdir)
+                clean_bytes, pdf_bytes = self._render_vsdx(source_path, field_mappings, soffice, tmpdir, font)
 
         self._persist_render_artifacts(clean_bytes, pdf_bytes)
+
+    def _pin_render_font(self):
+        """Freeze on the document the font policy this version is approved in.
+
+        An approved version is re-rendered later — on retirement, cancellation,
+        expiry and regeneration of a missing file — and each re-render rewrites
+        the deliverable, its SHA-256 and the base PDF. Reading DMS Settings at
+        those points would re-set the approved content in whatever font is
+        configured *then*, so the archived record would stop matching what QA
+        approved. Settings are therefore read once, here, at approval;
+        _render_font_policy() serves every render from the frozen values.
+
+        A configured family that is not installed on this host is not pinned:
+        LibreOffice would silently draw a substitute, so the document keeps its
+        template's own fonts instead and the miss goes to the Error Log."""
+        from dms.dms.doctype.dms_settings.dms_settings import is_font_installed
+
+        policy = _document_font_policy()
+        family = policy["family"] if policy else ""
+        if family and not is_font_installed(family):
+            frappe.log_error(
+                f"Document font '{family}' is enforced in DMS Settings but is not "
+                f"installed on this host, so {self.name} was approved in its "
+                f"template's own fonts. Install the font in every container that "
+                f"runs soffice (check with: fc-list : family).",
+                "DMS: document font",
+            )
+            family = ""
+        self.db_set(
+            {
+                "render_font_family": family,
+                "render_preserve_symbol_fonts": 1 if family and policy["preserve_symbols"] else 0,
+            },
+            update_modified=False,
+        )
+
+    def _render_font_policy(self):
+        """``{"family", "preserve_symbols"}`` for rendering THIS version — the
+        values pinned at approval, never the live DMS Settings — or None for the
+        template's own fonts (approved with enforcement off, or before 2.7.0;
+        2.7.0 approvals are backfilled by patches/v2_7_1/pin_render_font.py).
+
+        Logs, but does not block, when the pinned family is missing on this
+        host: refusing would leave an expired document active or a retired one
+        unstamped, which is worse than a PDF drawn in a substitute font."""
+        family = (self.render_font_family or "").strip()
+        if not family:
+            return None
+
+        from dms.dms.doctype.dms_settings.dms_settings import is_font_installed
+
+        if not is_font_installed(family):
+            frappe.log_error(
+                f"{self.name} was approved in '{family}', which is not installed on "
+                f"this host: its re-rendered PDF uses a substitute font. Install the "
+                f"font in every container that runs soffice.",
+                "DMS: document font",
+            )
+        return {"family": family, "preserve_symbols": bool(cint(self.render_preserve_symbol_fonts))}
 
     def _persist_render_artifacts(self, clean_bytes, pdf_bytes):
         """Common tail for every format: store the clean deliverable as its OWN
@@ -1442,33 +1505,30 @@ class GMPDocument(NestedSet):
                 images[alias] = images[row.system_field]
         return images
 
-    def _enforce_font_on(self, path):
+    def _enforce_font_on(self, path, font):
         """Rewrite every font reference in a rendered .docx/.vsdx to the family
-        configured in DMS Settings, so the output is standardised regardless of
-        what the template author chose.
+        pinned on this version (``font``, from _render_font_policy), so the
+        output is standardised regardless of what the template author chose.
 
         Runs after the template render and before the PDF conversion, so both
         the distributed source file and the PDF come out in the same font.
         Never fatal: a font pass that fails leaves a document in the template's
-        own font, which is strictly better than blocking an approval."""
-        policy = _document_font_policy()
-        if not policy:
+        own font — the rewrite only replaces the file once it is complete — which
+        is strictly better than blocking an approval."""
+        if not font:
             return
         try:
             if path.lower().endswith(".docx"):
-                enforce_docx_font(path, policy["family"], policy["preserve_symbols"])
+                enforce_docx_font(path, font["family"], font["preserve_symbols"])
             elif path.lower().endswith(".vsdx"):
-                # Visio rewrites into a second file; swap it over the original.
-                tmp = f"{path}.font.vsdx"
-                enforce_vsdx_font(path, tmp, policy["family"], policy["preserve_symbols"])
-                os.replace(tmp, path)
+                enforce_vsdx_font(path, path, font["family"], font["preserve_symbols"])
         except Exception:
             frappe.log_error(
                 frappe.get_traceback(),
                 f"GMP Document: font enforcement failed for {os.path.basename(path)}",
             )
 
-    def _render_docx(self, source_path, field_mappings, soffice, tmpdir):
+    def _render_docx(self, source_path, field_mappings, soffice, tmpdir, font):
         """DOCX: two docxtpl passes (clean deliverable + with-images source)."""
         clean_path = os.path.join(tmpdir, f"{self.name}.docx")
         try:
@@ -1499,14 +1559,14 @@ class GMPDocument(NestedSet):
 
         # Both files: the clean .docx is distributed to authors, so it must
         # carry the standard font too — not just the PDF people read.
-        self._enforce_font_on(clean_path)
-        self._enforce_font_on(sig_path)
+        self._enforce_font_on(clean_path, font)
+        self._enforce_font_on(sig_path, font)
 
         pdf_bytes = self._convert_to_pdf(soffice, sig_path, tmpdir)
         with open(clean_path, "rb") as fh:
             return fh.read(), pdf_bytes
 
-    def _render_xlsx(self, source_path, field_mappings, soffice, tmpdir):
+    def _render_xlsx(self, source_path, field_mappings, soffice, tmpdir, font):
         """XLSX: openpyxl renders text tags per cell; images are anchored as real
         pictures in the PDF-source pass. Calc rasterises anchored images on PDF
         export, so the stamp/signatures need no post-overlay."""
@@ -1515,7 +1575,6 @@ class GMPDocument(NestedSet):
         text_context = self._build_template_context(field_mappings=field_mappings)
         clean_path = os.path.join(tmpdir, f"{self.name}.xlsx")
         img_path = os.path.join(tmpdir, f"{self.name}-with-images.xlsx")
-        font = _document_font_policy()
         try:
             render_xlsx(source_path, clean_path, text_context, images={}, font=font)
             render_xlsx(
@@ -1531,7 +1590,7 @@ class GMPDocument(NestedSet):
         with open(clean_path, "rb") as fh:
             return fh.read(), pdf_bytes
 
-    def _render_vsdx(self, source_path, field_mappings, soffice, tmpdir):
+    def _render_vsdx(self, source_path, field_mappings, soffice, tmpdir, font):
         """VSDX: render text tags in the page XML (no in-package image embedding);
         the QA stamp is overlaid onto the converted PDF. The single text render
         is both the deliverable and the PDF source since no images are baked in."""
@@ -1545,7 +1604,7 @@ class GMPDocument(NestedSet):
             frappe.log_error(frappe.get_traceback(), "GMP Document: Visio render failed")
             frappe.throw(_("Failed to render Visio template. Check Error Log for details."))
 
-        self._enforce_font_on(clean_path)
+        self._enforce_font_on(clean_path, font)
 
         pdf_bytes = self._convert_to_pdf(soffice, clean_path, tmpdir)
 
@@ -3417,9 +3476,12 @@ def _register_overlay_font():
     Persian — combined with shape_rtl(), which supplies the joining and bidi
     reportlab itself does not do.
 
-    Registration is per-process and idempotent; reportlab keeps its own registry
-    so a recycled worker re-registers on first use. Any failure degrades to
-    Helvetica rather than breaking the download."""
+    Registration is per-process and idempotent. reportlab's registry lives as
+    long as the worker, so the font is registered under a name derived from the
+    FILE (path, size, mtime), not just the family: keyed on the family alone, a
+    corrected .ttf attached in DMS Settings would never replace the first file
+    a worker registered. Any failure degrades to Helvetica rather than breaking
+    the download."""
     policy = _document_font_policy()
     if not policy:
         return "Helvetica-Bold", "Helvetica"
@@ -3429,18 +3491,19 @@ def _register_overlay_font():
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.ttfonts import TTFont
 
-        if family in pdfmetrics.getRegisteredFontNames():
-            return family, family
-
         from dms.dms.doctype.dms_settings.dms_settings import resolve_font_file
 
         path = resolve_font_file(family)
         if not path:
             return "Helvetica-Bold", "Helvetica"
-        pdfmetrics.registerFont(TTFont(family, path))
+        stat = os.stat(path)
+        file_id = hashlib.sha1(f"{path}|{stat.st_size}|{stat.st_mtime_ns}".encode()).hexdigest()[:12]
+        name = f"DMS {family} {file_id}"
+        if name not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont(name, path))
         # One TTF, used for both weights: synthesising a bold face is not worth
         # a second font file, and the watermark is sized for impact anyway.
-        return family, family
+        return name, name
     except Exception:
         frappe.log_error(
             frappe.get_traceback(), "GMP Document: overlay font registration failed"
@@ -3458,7 +3521,9 @@ def _apply_watermark(pdf_path, watermark_text, footer_text=None):
     fall back to reportlab's built-in Helvetica and must stay WinAnsi-encodable.
     Either way the strings run through shape_rtl(), which applies the Arabic
     joining and bidi reordering reportlab does not do — without it Persian draws
-    as disconnected, mirrored letterforms.
+    as disconnected, mirrored letterforms. A configured font that lacks a glyph
+    the string needs (a Persian-only build has no Latin at all) is skipped for
+    that string in favour of Helvetica: the status words must stay legible.
 
     The stamp size adapts to the text and page: the font is scaled so the
     string spans ~60% of the page diagonal, capped at 60pt — a long text like
@@ -3475,6 +3540,13 @@ def _apply_watermark(pdf_path, watermark_text, footer_text=None):
     bold_font, regular_font = _register_overlay_font()
     watermark_text = shape_rtl(watermark_text) if watermark_text else watermark_text
     footer_text = shape_rtl(footer_text) if footer_text else footer_text
+    # reportlab draws a missing glyph as a blank box without complaint, so a
+    # font with no Latin glyphs would print an OBSOLETE copy with no readable
+    # OBSOLETE on it. Checked on the shaped text, which is what gets drawn.
+    if watermark_text and not font_covers(bold_font, watermark_text):
+        bold_font = "Helvetica-Bold"
+    if footer_text and not font_covers(regular_font, footer_text):
+        regular_font = "Helvetica"
 
     reader = PdfReader(pdf_path)
     writer = PdfWriter()

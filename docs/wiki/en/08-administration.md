@@ -39,11 +39,13 @@ The module **enforces** one font across everything it generates — it does not 
    ```bash
    fc-list : family | grep -i vazir
    ```
-2. **Set the family name exactly as the server reports it.** Recent Vazir releases are named **`Vazirmatn`**, not `Vazir`. A name fontconfig cannot resolve falls back to a substitute — silently, which is why the module verifies the match and writes to the Error Log when it fails.
+2. **Set the family name exactly as the server reports it.** Recent Vazir releases are named **`Vazirmatn`**, not `Vazir`. A name fontconfig cannot resolve would silently fall back to a substitute, so the module checks it at every approval: a family that is not installed is **not enforced** — the document keeps its template's own fonts and the Error Log (*DMS: document font*) says why. Saving DMS Settings with a missing family shows a warning.
 3. Leave **Preserve Symbol Fonts** ticked unless you have a reason not to: GMP forms often draw checkboxes as Wingdings glyphs, and replacing those with a text font turns every ☑ into a stray letter.
-4. Only if the font cannot be located automatically, attach a **`.ttf`** under *Font File for Watermarks*. TrueType only — reportlab cannot embed OpenType/CFF (`.otf`).
+4. Only if the font cannot be located automatically, attach a **`.ttf`** under *Font File for Watermarks*. TrueType only — reportlab cannot embed OpenType/CFF (`.otf`). A newly attached file takes effect on the next download, with no restart; a font installed on the server is picked up within five minutes.
 
-What enforcement covers: the body, `docDefaults`, headers, footers, footnotes, numbering and the theme of the `.docx`; every populated cell of an `.xlsx`; the FaceNames table of a `.vsdx` (best-effort — Visio support in LibreOffice is thin); and the PDF watermark and footer.
+What enforcement covers: the body, `docDefaults`, headers, footers, footnotes, numbering and the theme of the `.docx`; every populated cell of an `.xlsx`; the FaceNames table of a `.vsdx` (best-effort — Visio support in LibreOffice is thin); and the PDF watermark and footer. A watermark or footer the font cannot draw (a Persian-only font has no Latin glyphs) falls back to Helvetica so the status stays legible.
+
+**Each document keeps the font it was approved in.** The font is frozen on the document at QA approval (*Font Applied at Approval*), and retirement, cancellation, expiry and regeneration of a missing file all re-render with that font, never with the current setting — otherwise changing the setting would silently re-set approved documents and change their integrity hash. A new font therefore applies only to documents approved after the change.
 
 **Why this is needed for Persian.** OOXML gives every run three font slots — Latin, East Asian, and **complex script** (`w:cs`). Persian is complex-script, so `w:cs` is the slot that decides its font, and Word's ordinary font box only writes the Latin one. That mismatch is the usual reason a template "has the font set" yet still renders Persian in something else. The module writes all four slots and strips the theme attributes that would otherwise override them.
 

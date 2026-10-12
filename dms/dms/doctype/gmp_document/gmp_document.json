@@ -43,6 +43,8 @@
   "word_template",
   "attachment_file",
   "file_integrity_hash",
+  "render_font_family",
+  "render_preserve_symbol_fonts",
   "section_change_control",
   "revision_of",
   "reason_for_change",
@@ -267,6 +269,22 @@
    "no_copy": 1,
    "length": 64,
    "description": "SHA-256 digest of the controlled file. Recomputed after every render to match the distributed bytes."
+  },
+  {
+   "fieldname": "render_font_family",
+   "fieldtype": "Data",
+   "label": "Font Applied at Approval",
+   "read_only": 1,
+   "no_copy": 1,
+   "description": "The document font enforced when this version was QA-approved. Every later re-render of this version (retirement, cancellation, expiry, regeneration) reuses it, so the approved content never changes font when DMS Settings do. Empty: the template's own fonts."
+  },
+  {
+   "fieldname": "render_preserve_symbol_fonts",
+   "fieldtype": "Check",
+   "label": "Symbol Fonts Preserved at Approval",
+   "read_only": 1,
+   "no_copy": 1,
+   "depends_on": "render_font_family"
   },
   {
    "fieldname": "section_workflow",
@@ -800,7 +818,7 @@
  "is_submittable": 1,
  "is_tree": 1,
  "links": [],
- "modified": "2026-07-09 00:00:00.000000",
+ "modified": "2026-10-13 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "DMS",
  "name": "GMP Document",

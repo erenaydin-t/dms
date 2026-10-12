@@ -26,11 +26,39 @@ testable in isolation.
 import io
 import os
 import re
+import tempfile
 import zipfile
 from xml.sax.saxutils import escape as xml_escape
 
 # Matches {{ tag }} with flexible inner whitespace; tag is a bare identifier.
 _TOKEN = re.compile(r"{{\s*([A-Za-z0-9_]+)\s*}}")
+
+
+def rewrite_package(source_path, out_path, rewrite_part):
+    """Copy the zip package (.docx/.xlsx/.vsdx) at ``source_path`` to
+    ``out_path``, passing every part through ``rewrite_part(name, data)``, which
+    returns the bytes to store. Part order is preserved. Returns ``out_path``.
+
+    The package is written to a temporary file beside ``out_path`` and moved
+    into place only once complete. So ``out_path`` may equal ``source_path``,
+    and a failure part way — disk full, a part that does not decode — leaves
+    the original file intact rather than a truncated package, which the PDF
+    conversion and the integrity hash would otherwise pick up as if valid.
+    """
+    with zipfile.ZipFile(source_path) as zin:
+        items = [(info.filename, zin.read(info.filename)) for info in zin.infolist()]
+
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(out_path)), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh, zipfile.ZipFile(fh, "w", zipfile.ZIP_DEFLATED) as zout:
+            for name, data in items:
+                zout.writestr(name, rewrite_part(name, data))
+        os.replace(tmp, out_path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return out_path
 
 
 def _substitute(text, context):
@@ -168,19 +196,14 @@ def render_vsdx(source_path, out_path, context):
     field containing ``&``/``<``/``>`` cannot corrupt the package. Non-page parts
     are copied through byte-for-byte. Returns ``out_path``.
     """
-    def render_xml(raw):
+    def render_part(name, data):
+        if not _is_visio_page(name):
+            return data
         return _TOKEN.sub(
-            lambda m: xml_escape(str(context.get(m.group(1), "") or "")), raw
-        )
+            lambda m: xml_escape(str(context.get(m.group(1), "") or "")), data.decode("utf-8")
+        ).encode("utf-8")
 
-    with zipfile.ZipFile(source_path) as zin:
-        items = [(info.filename, zin.read(info.filename)) for info in zin.infolist()]
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zout:
-        for name, data in items:
-            if _is_visio_page(name):
-                data = render_xml(data.decode("utf-8")).encode("utf-8")
-            zout.writestr(name, data)
-    return out_path
+    return rewrite_package(source_path, out_path, render_part)
 
 
 # --------------------------------------------------------------------------- #

@@ -19,7 +19,7 @@ import os
 import shutil
 import tempfile
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -31,10 +31,14 @@ from dms.dms.doctype.gmp_document.gmp_document import (
     VALIDITY_YEARS_MAP,
     _apply_watermark,
     _compute_sha256,
+    _register_overlay_font,
     _resolve_watermark_text,
     get_template_field_catalog,
 )
 
+
+CONTROLLER = "dms.dms.doctype.gmp_document.gmp_document"
+SETTINGS = "dms.dms.doctype.dms_settings.dms_settings"
 
 TEST_DEPT = "GMP-Test-QA Department"
 TEST_DEPT_ABBR = "QA"
@@ -866,6 +870,171 @@ class TestGMPDocument(FrappeTestCase):
             self.assertGreater(len(output), 0)
         finally:
             os.unlink(base_path)
+
+    def test_watermark_falls_back_when_the_font_lacks_the_glyphs(self):
+        """A configured font without the glyphs a stamp needs would print it as
+        blanks — an obsolete copy with no readable OBSOLETE. Vera has no Arabic
+        script, so a Persian stamp stands in for an English stamp drawn in a
+        Persian-only font: the same coverage check decides both."""
+        from io import BytesIO
+
+        import reportlab
+        from pypdf import PdfReader
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.pdfgen import canvas
+
+        vera = os.path.join(os.path.dirname(reportlab.__file__), "fonts", "Vera.ttf")
+        pdfmetrics.registerFont(TTFont("DMSTestVera", vera))
+
+        def overlay_fonts(pdf_bytes):
+            page = PdfReader(BytesIO(pdf_bytes)).pages[0]
+            return {str(f.get_object()["/BaseFont"]) for f in page["/Resources"]["/Font"].values()}
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as fh:
+            c = canvas.Canvas(fh.name, pagesize=A4)
+            c.drawString(100, 750, "Base content")
+            c.save()
+            base_path = fh.name
+
+        try:
+            with patch(
+                f"{CONTROLLER}._register_overlay_font",
+                return_value=("DMSTestVera", "DMSTestVera"),
+            ):
+                covered = _apply_watermark(base_path, "OBSOLETE")
+                uncovered = _apply_watermark(base_path, "نسخه منسوخ")
+        finally:
+            os.unlink(base_path)
+
+        self.assertNotIn("/Helvetica-Bold", overlay_fonts(covered))
+        self.assertIn("/Helvetica-Bold", overlay_fonts(uncovered))
+
+    # ------------------------------------------------------------------ #
+    #  Document font pinned at approval (2.7.1)                          #
+    # ------------------------------------------------------------------ #
+
+    def _pin_font(self, doc, family="Vazir", installed=True):
+        policy = {"enforce": True, "family": family, "preserve_symbols": True}
+        with patch(f"{CONTROLLER}._document_font_policy", return_value=policy), patch(
+            f"{SETTINGS}.is_font_installed", return_value=installed
+        ):
+            doc._pin_render_font()
+        return frappe.get_doc("GMP Document", doc.name)
+
+    def test_rerender_uses_the_font_pinned_at_approval(self):
+        """Retirement, cancellation, expiry and regeneration re-render an
+        approved version; a font changed in DMS Settings since must not reach
+        it, or the archived record stops matching what QA approved."""
+        doc = self._build_doc(document_name_en="GMP-Test-FontPin")
+        doc.insert(ignore_permissions=True)
+        pinned = self._pin_font(doc, "Vazir")
+        self.assertEqual(pinned.render_font_family, "Vazir")
+
+        changed = {"enforce": True, "family": "Changed Later", "preserve_symbols": False}
+        with patch(f"{CONTROLLER}._document_font_policy", return_value=changed), patch(
+            f"{SETTINGS}.is_font_installed", return_value=True
+        ):
+            self.assertEqual(
+                pinned._render_font_policy(), {"family": "Vazir", "preserve_symbols": True}
+            )
+
+    def test_font_missing_on_the_host_is_not_pinned(self):
+        """Enforcing a family fontconfig cannot resolve makes LibreOffice draw a
+        silent substitute; the document keeps its template fonts instead."""
+        doc = self._build_doc(document_name_en="GMP-Test-FontMissing")
+        doc.insert(ignore_permissions=True)
+        pinned = self._pin_font(doc, "Vazir", installed=False)
+        self.assertFalse(pinned.render_font_family)
+        self.assertIsNone(pinned._render_font_policy())
+
+    def test_enforcement_off_pins_template_fonts(self):
+        doc = self._build_doc(document_name_en="GMP-Test-FontOff")
+        doc.insert(ignore_permissions=True)
+        with patch(f"{CONTROLLER}._document_font_policy", return_value=None):
+            doc._pin_render_font()
+        self.assertIsNone(frappe.get_doc("GMP Document", doc.name)._render_font_policy())
+
+    # ------------------------------------------------------------------ #
+    #  Watermark font file (DMS Settings)                                #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _reportlab_font(name="Vera.ttf"):
+        import reportlab
+
+        return os.path.join(os.path.dirname(reportlab.__file__), "fonts", name)
+
+    def test_font_file_needs_an_exact_family_match(self):
+        """fc-match returns a substitute rather than nothing; a substring test
+        accepted DejaVu Sans for "Sans" and a Vazirmatn file for "Vazir", which
+        LibreOffice would never pick for the body."""
+        from dms.dms.doctype.dms_settings.dms_settings import _resolve_font_file_uncached
+
+        vera = self._reportlab_font()
+        for family, matched, expected in (
+            ("Sans", ["DejaVu Sans"], None),
+            ("Vazir", ["Vazirmatn"], None),
+            ("Vazirmatn", ["Vazirmatn", "وزیرمتن"], vera),
+            ("vazir matn", ["Vazirmatn"], vera),  # fontconfig ignores case and blanks
+        ):
+            with patch(f"{SETTINGS}._fc_match", return_value=(matched, vera)):
+                self.assertEqual(_resolve_font_file_uncached(family, None), expected, family)
+
+    def test_failed_font_lookup_is_retried(self):
+        """A miss used to be cached for good, so a font installed after the
+        first watermark — or one fc-match timeout — meant Helvetica until
+        someone happened to re-save DMS Settings."""
+        from dms.dms.doctype.dms_settings import dms_settings
+
+        vera = self._reportlab_font()
+        later = dms_settings._FONT_MISS_RETRY_SECONDS + 1
+        dms_settings._font_file_cache.clear()
+        self.addCleanup(dms_settings._font_file_cache.clear)
+        with patch(
+            f"{SETTINGS}._resolve_font_file_uncached", side_effect=[None, vera]
+        ) as lookup, patch(f"{SETTINGS}.time") as clock:
+            clock.monotonic.side_effect = [0, 10, later, later]
+            self.assertIsNone(dms_settings.resolve_font_file("Vazir"))  # looked up: miss
+            self.assertIsNone(dms_settings.resolve_font_file("Vazir"))  # miss still fresh
+            self.assertEqual(dms_settings.resolve_font_file("Vazir"), vera)  # retried
+        self.assertEqual(lookup.call_count, 2)
+
+    def test_vanished_font_file_is_looked_up_again(self):
+        """The cache is per process because the path is container-local; a
+        path that is gone must not be handed to reportlab."""
+        from dms.dms.doctype.dms_settings import dms_settings
+
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        copy = shutil.copy(self._reportlab_font(), os.path.join(workdir, "Vera.ttf"))
+        dms_settings._font_file_cache.clear()
+        self.addCleanup(dms_settings._font_file_cache.clear)
+        with patch(
+            f"{SETTINGS}._resolve_font_file_uncached",
+            side_effect=[copy, self._reportlab_font()],
+        ):
+            self.assertEqual(dms_settings.resolve_font_file("Vazir"), copy)
+            os.unlink(copy)
+            self.assertEqual(dms_settings.resolve_font_file("Vazir"), self._reportlab_font())
+
+    def test_new_font_file_takes_effect_without_a_worker_restart(self):
+        """reportlab's registry outlives the request. Keyed on the family alone,
+        a corrected .ttf attached in DMS Settings never replaced the first file
+        a worker had registered."""
+        from reportlab.pdfbase import pdfmetrics
+
+        policy = {"enforce": True, "family": "Vazirmatn", "preserve_symbols": True}
+        with patch(f"{CONTROLLER}._document_font_policy", return_value=policy), patch(
+            f"{SETTINGS}.resolve_font_file",
+            side_effect=[self._reportlab_font("Vera.ttf"), self._reportlab_font("VeraBd.ttf")],
+        ):
+            first, _regular = _register_overlay_font()
+            second, _regular = _register_overlay_font()
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(pdfmetrics.getFont(second).face.name, b"BitstreamVeraSans-Bold")
 
     # ------------------------------------------------------------------ #
     #  End-to-end submit (skipped unless LibreOffice is on PATH)         #

@@ -87,7 +87,7 @@
   {
    "default": "Vazir",
    "depends_on": "enforce_document_font",
-   "description": "Must match the installed font family EXACTLY as the server reports it — check with <code>fc-list : family | grep -i vazir</code> in the container. Recent releases of Vazir are named <b>Vazirmatn</b>. A name the server cannot resolve silently falls back to a substitute font.",
+   "description": "Must match the installed font family EXACTLY as the server reports it — check with <code>fc-list : family | grep -i vazir</code> in the container. Recent releases of Vazir are named <b>Vazirmatn</b>. A family the server does not have is not enforced: documents approved meanwhile keep their template's own fonts and the Error Log says why. Each document keeps the font it was approved in — changing this later affects only documents approved afterwards.",
    "fieldname": "document_font",
    "fieldtype": "Data",
    "label": "Font Family",
@@ -115,7 +115,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-07-18 00:00:00.000000",
+ "modified": "2026-10-13 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "DMS",
  "name": "DMS Settings",
