@@ -4,36 +4,50 @@ Every `GMP Document` moves through the native Frappe workflow **GMP Document Wor
 
 ## States
 
-| State | docstatus | Meaning |
+| State | docstatus | Waiting on |
 |---|---|---|
-| **Draft** | 0 | Being authored by the preparer |
-| **Under Review** | 0 | Waiting for the assigned Reviewer |
-| **Pending QA Approval** | 0 | Waiting for the assigned QA Approver |
+| **Draft** | 0 | the preparer, authoring |
+| **Pending Supervisor Approval** | 0 | the preparer's supervisor (`Employee.reports_to`) |
+| **Under Review** | 0 | the Reviewer — the supervisor's own manager |
+| **Pending QA Supervisor** | 0 | the QA Supervisor (DMS Settings), who approves or delegates |
+| **QA Review In Progress** | 0 | the delegated QA reviewers, one after another (driven by the queue, not by actions) |
+| **Pending Regulatory Validation** | 0 | the Regulatory Manager (DMS Settings) |
+| **Pending Manager Approval** | 0 | the Reviewer again, now as Manager |
+| **Pending Final QA Approval** | 0 | the QA Approver (DMS Settings) |
 | **Approved** | 1 | QA-approved and submitted. If `is_active = 1`, it is the effective version; if `is_active = 0` with a future Effective Date, it is **pending** (scheduled) |
-| **Revision Requested** | 0 | Bounced back to the preparer with comments |
+| **Revision Requested** | 0 | the preparer, after a return |
 | **Revision Cancelled** | 0 | Terminal: an abandoned draft revision, retained for audit (cannot be deleted) |
 | **Obsolete** | 1 or 2 | Retired: superseded by an approved revision, expired, or manually cancelled |
 
+The supervisor and reviewer are resolved from the preparer's Employee reporting chain when the draft is submitted; the QA Supervisor, Regulatory Manager and QA Approver come from **DMS Settings** (global, or per department).
+
 ## Transitions and authorization
 
-Every transition requires the **QA Manager** role *plus* a per-actor condition — only the assigned person (or Administrator) can act:
+Each action needs the role in the *Role* column **plus** a per-actor condition — only the person the document is waiting on (or Administrator) can act. A **DMS Proxy Approver** can take any of them on that person's behalf (see *Roles*).
 
-| From | Action | To | Who |
+| From | Action | To | Role · who |
 |---|---|---|---|
-| Draft / Revision Requested | Submit for Review | Under Review | the **preparer** (`prepared_by`) |
-| Under Review | Approve as Reviewer | Pending QA Approval | the assigned **Reviewer** |
-| Under Review | Request Revision (Reviewer) | Revision Requested | the assigned Reviewer |
-| Pending QA Approval | Approve as QA | Approved *(auto-submits)* | the assigned **QA Approver** |
-| Pending QA Approval | Request Revision (QA) | Under Review | the assigned QA Approver |
-| Draft / Under Review / Pending QA / Revision Requested | Cancel Revision | Revision Cancelled | preparer or QA approver — only on drafts created via **Create Revision** |
+| Draft / Revision Requested | Submit for Approval | Pending Supervisor Approval | DMS Initiator · the **preparer** |
+| Pending Supervisor Approval | Approve (Supervisor) / Return to Preparer | Under Review / Revision Requested | DMS Approver · the **supervisor** |
+| Under Review | Approve as Reviewer / Return to Supervisor / Return to Preparer | Pending QA Supervisor / … | DMS Approver · the **reviewer** |
+| Pending QA Supervisor | Approve (QA Supervisor) / Return to Reviewer / Return to Preparer | Pending Regulatory Validation / … | DMS Approver · the **QA supervisor** |
+| QA Review In Progress | Recall Delegation | Pending QA Supervisor | DMS Approver · the QA supervisor |
+| Pending Regulatory Validation | Validate (Regulatory) / Return to QA Supervisor | Pending Manager Approval / … | DMS Approver · the **regulatory manager** |
+| Pending Manager Approval | Approve (Manager) / Return to Regulatory | Pending Final QA Approval / … | DMS Approver · the **reviewer** |
+| Pending Final QA Approval | Publish / Return to Manager | Approved *(auto-submits)* / … | QA Manager · the **QA approver** |
+| Draft / Revision Requested / Pending Supervisor Approval | Cancel Revision | Revision Cancelled | DMS Initiator · preparer or QA approver — only on drafts created via **Create Revision** |
 
-Approval (`Approve as QA`) triggers, in order:
+**Every Return asks for a reason.** The form prompts for it when a *Return …* action is chosen; it is recorded in the timeline with the person and time, and shown on the form (*Latest Revision Request*) until the document moves forward again.
 
-1. approver stamping (`approved_by` / `approved_on`),
+**Who can edit.** On a draft, only the person the document is waiting on can save changes (plus the unrestricted roles); anyone else named on it can read it. Fields the system writes — the approval stamps, signatures, *on behalf of* records, the CEO block, *Revision Of*, the integrity hash — cannot be changed by a save, from the form or the API.
+
+Publication (`Publish`) triggers, in order:
+
+1. approver stamping (`approved_by` / `approved_on`) and the CEO block,
 2. effective-date stamping (approval date, unless manually scheduled — see *Effective Dates*),
 3. template rendering: clean deliverable + signed base PDF (signatures + QA stamp),
 4. retirement of the superseded predecessor (revision flow, unless future-dated),
-5. repointing of dependents' references to this version.
+5. repointing of dependents' live references to this version (*Supersedes* and *Derived From* rows, and references held by retired documents, keep the version they name).
 
 ## Signatures (21 CFR Part 11)
 
@@ -44,5 +58,5 @@ Approval (`Approve as QA`) triggers, in order:
 ## Audit trail
 
 - Every transition writes a Workflow comment (who, when, what).
-- ToDos hand off automatically between preparer → reviewer → QA approver.
+- ToDos hand off automatically from each actor to the next.
 - Obsoleted and cancelled-revision records are retained permanently; deletion of a cancelled revision is blocked server-side.

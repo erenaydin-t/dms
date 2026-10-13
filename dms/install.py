@@ -539,7 +539,7 @@ def restore_workflow_defaults():
 def _ensure_gmp_workflow():
     """Seed the Frappe Workflow that mirrors the controller's state machine.
 
-    A SEED, not a synchronisation: if a workflow with this name already exists
+    A SEED, not a synchronisation: if any workflow for GMP Document exists
     this returns immediately, whatever state it is in. From the moment it is
     created the definition belongs to the site — states, transitions,
     conditions, roles and `allow_edit` can all be edited from the standard
@@ -557,7 +557,13 @@ def _ensure_gmp_workflow():
     so a site that renames a state must remap the controller's WF_* constants
     too. Adding states, actions and routing of your own is safe.
     """
-    if frappe.db.exists("Workflow", GMP_WORKFLOW_NAME):
+    # Any workflow for the doctype counts, not just one under the shipped
+    # name: a site may rename its workflow (Workflow allows renaming), and
+    # inserting the shipped one beside it would switch the site's off — an
+    # active Workflow deactivates every other workflow of its doctype.
+    if frappe.db.exists("Workflow", GMP_WORKFLOW_NAME) or frappe.db.exists(
+        "Workflow", {"document_type": "GMP Document"}
+    ):
         return
 
     # Workflow rows reference Workflow State + Workflow Action Master records

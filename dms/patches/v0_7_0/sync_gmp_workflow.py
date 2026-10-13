@@ -11,8 +11,11 @@ _sync_gmp_workflow — is no longer called by install or migrate. This patch has
 long since run everywhere it applies, and re-running it is harmless.)
 """
 
-from dms.install import restore_workflow_defaults
+from dms.install import _ensure_roles, restore_workflow_defaults
 
 
 def execute():
+    # Today's definition names roles (DMS Initiator, DMS Approver) that a site
+    # this old does not have yet — later patches and after_migrate create them.
+    _ensure_roles()
     restore_workflow_defaults()

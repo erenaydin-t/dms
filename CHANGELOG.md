@@ -4,6 +4,38 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.2] - 2026-10-13
+
+### Security
+- **A Word or Excel template could run code on the server.** The uploaded file *is* the Jinja template, and both render paths used an unsandboxed Jinja environment, so a tag hidden in it (white text, a hidden cell) such as `{{ cycler.__init__.__globals__.os.popen(…) }}` ran as the bench user at approval and at every re-render. Templates now render in Jinja's sandbox.
+- **Approval records could be forged on a draft through the API.** Frappe enforces *read only* in the form, not on the server, so a preparer could save a draft with a pre-filled CEO block or signature, an *on behalf of* record, or a *Revision Of* pointing at any effective document — which approval would then retire. Fields only the system writes are now restored from the database on every draft save, and start blank on every new document.
+
+### Fixed
+- **Users holding only DMS Initiator or DMS Approver could not work.** Frappe sets the next workflow state *before* it checks write permission, so the per-document write check asked about the next stage's actor and refused every supervisor, reviewer, QA supervisor and regulatory action; and it returned "no opinion" for a new document, which Frappe reads as a denial, so a DMS Initiator could not create one. Only users with an unrestricted role (QA Manager, DMS Manager, …) could use the chain. Write access is now judged on the stored state: the person the document is waiting on may edit, and any named participant may make a transition, which the Workflow engine then authorises.
+- **Scheduling an Effective Date blocked every later approver.** The privilege check ran on every save while *Edit Effective Date* was ticked, so the first approver after the manager who set the date got "Only a QA Manager or DMS Manager may edit the Effective Date". It now runs only when the date or the box changes.
+- **Unticking *Edit Effective Date* did not clear the date.** The manually saved date was restored as the "system value", so the document still went pending (or stayed backdated) at approval. Unticking now clears it, with the expiry and revision dates.
+- **A failed re-render kept an expired document in force.** The expiry sweep rolled the expiry back together with a failed re-stamp (LibreOffice down, source file missing), so the document stayed active and was served as a CONTROLLED COPY every day. The expiry is now committed first and the re-stamp is attempted separately. The activation sweep now also re-renders, so `{{ publish_date }}` is filled in the copy that goes into force.
+- **Values containing `&` or `<` broke the Word render.** "Research & Development" lost its `&` in the body and failed approval when it appeared in a header. Values are now escaped (Excel cells, which are not markup, are unchanged).
+- **Any PDF attached to a document could be served as its controlled copy.** The base PDF was found as "any attached `.pdf`, newest first", so a scanned copy attached after approval was downloaded watermarked CONTROLLED COPY. The base PDF is now found by its own name (and stored at a fixed path, so it can always be found that way).
+- **A file regenerated during a download was thrown away.** Downloads are GET requests, which Frappe rolls back, so the regenerated File rows and integrity hash were discarded while the files on disk had already been rewritten — the stored hash then no longer matched the deliverable. Regenerations are now committed.
+- **Return reasons were never recorded, or recorded under the wrong person.** The reason field was read-only for the actual approvers (its rules still named a state removed in 1.3), and the Return action reloads the document anyway. Choosing a *Return …* action now asks for the reason and stores it first; it is cleared once the document moves forward, so a later return can never be logged with an earlier actor's words.
+- **Approving a revision could make two documents impossible to revise.** Repointing references onto the new version can close a loop (an SOP and a form citing each other), and the loop check then refused *any* save that could reach the loop. It now refuses only a loop through the document being saved. Repointing also no longer rewrites *Supersedes* / *Derived From* rows or the references of retired documents, which name a specific version on purpose.
+- **Create Revision was offered to roles that could not finish it, and not to authors.** The clicker becomes the revision's preparer, but only DMS Initiator may submit a draft, so a QA Manager without it created a draft nobody could submit — which, as the one open revision, blocked any other revision. The button and the server now require a role that can submit a draft in the site's workflow.
+- **A transferred or rehired user kept seeing their old department's documents** through the record marked *Left*. Only Active Employee records count now.
+- **The tree showed a scheduled revision as OBSOLETE and hid the version in force.** It now shows the active version, and marks an approved, not-yet-effective one NOT YET EFFECTIVE.
+- **Renaming the site's workflow made the next migrate install the shipped one and switch the site's off.** The seed now checks for any GMP Document workflow, not just the shipped name.
+- **Codes that break document IDs were accepted.** A department abbreviation or document-type code with a dash added a fifth ID segment, and `_`/`%` acted as wildcards in the number lookup; they are now refused. A document type in use can no longer be renamed (renaming rewrote approved records).
+- An approved document is always active from the moment it is published (an unticked *Is Active* on the draft used to publish an invisible, rejected-stamp document); a cancelled document's PDF can be downloaded again, always stamped OBSOLETE; a timed-out LibreOffice conversion no longer leaves `soffice.bin` running; another user's pending counts are visible only to managers; the list view's *My Pending* filters cover every stage (the QA filter named a removed state); two very old patches no longer fail on sites that still need them.
+
+### Changed
+- CI now runs the approval-chain tests (`test_workflow_chain`, which had never run in CI and could not pass: its users had no roles) and installs the tested commit on a fresh site. 29 new tests; the restricted-role ones go through the same permission checks as a browser session.
+- The English wiki's workflow, roles and user-guide pages describe the current approval chain and roles.
+
+### Upgrade notes
+- `bench --site <site> migrate` → `bench restart`, and `bench build --app dms` for the form changes.
+- **Review who holds QA Manager.** It sees every document in every department. Authors need only **DMS Initiator**, chain approvers only **DMS Approver** — which now work on their own. A QA Manager who creates revisions also needs DMS Initiator.
+- A department abbreviation containing a space, dash, underscore or `%` now stops new documents in that department, with a message naming it; existing documents are untouched.
+
 ## [2.7.1] - 2026-10-13
 
 ### Fixed

@@ -99,6 +99,21 @@ jobs:
           docker compose exec -T backend bench --site test_site migrate
           docker compose exec -T backend bench --site test_site set-config allow_tests true
 
+      - name: Fresh install of the tested commit
+        working-directory: docker
+        run: |
+          # test_site was installed from the image's dms@main and then migrated
+          # to this commit, which covers the upgrade path. A second site installs
+          # this commit from scratch, so its own install hooks (roles, custom
+          # fields, the workflow seed) run too.
+          docker compose exec -T backend bench new-site install_check \
+            --no-mariadb-socket \
+            --admin-password admin \
+            --db-root-password admin \
+            --install-app erpnext \
+            --install-app hrms \
+            --install-app dms
+
       - name: Run DMS test suite
         working-directory: docker
         run: |
@@ -107,10 +122,11 @@ jobs:
           # unrelated doctypes, which submits a Stock Ledger Entry and fails on
           # the version-mismatched base image (frappe 17-dev + erpnext 16). The
           # per-module runs cover the whole DMS suite (controller, permission/
-          # visibility model, reference tree, and the LibreOffice DOCX->PDF
-          # end-to-end pipeline). --skip-before-tests skips ERPNext's
-          # setup-wizard bootstrap, which the DMS suite does not need.
-          for m in test_gmp_document test_font_enforcement test_permissions test_e2e_pdf; do
+          # visibility model, reference tree, approval chain and QA queue, font
+          # enforcement, and the LibreOffice DOCX->PDF end-to-end pipeline).
+          # --skip-before-tests skips ERPNext's setup-wizard bootstrap, which
+          # the DMS suite does not need. Every test_*.py module must be listed.
+          for m in test_gmp_document test_font_enforcement test_permissions test_workflow_chain test_e2e_pdf; do
             echo "::group::run-tests $m"
             docker compose exec -T backend bench --site test_site \
               run-tests --module "dms.dms.doctype.gmp_document.$m" --skip-before-tests

@@ -53,8 +53,8 @@ What enforcement covers: the body, `docDefaults`, headers, footers, footnotes, n
 
 ## Required setup checklist
 
-1. **Roles** — give authors/approvers **QA Manager**; module owners **DMS Manager**. (Administrator implicitly passes all role gates — always verify workflows with a *real* user.)
-2. **Departments** — set `custom_abbr` (e.g. QA, HR) on every department that will own documents; naming fails without it.
+1. **Roles** — authors **DMS Initiator**; supervisors, reviewers, QA supervisors and regulatory managers **DMS Approver**; the final QA approver **QA Manager**; module owners **DMS Manager** (see *Roles*). (Administrator implicitly passes all role gates — always verify workflows with a *real* user.)
+2. **Departments** — set `custom_abbr` (e.g. QA, HR) on every department that will own documents; naming fails without it. The abbreviation and every document-type code become segments of the document ID, so they may not contain spaces, dashes, underscores, `%` or path characters. A document type already used by documents cannot be renamed.
 3. **Signatures** — each preparer/reviewer/QA approver needs an Employee record with `user_id` linked and a PNG/JPG in *Signature (PNG)*.
 4. **Workflow** — `GMP Document Workflow` must be **Active** (a disabled workflow breaks every transition with "Workflow not found").
 5. **Word Templates** — at least one `GMP Word Template` record (tag mappings may be empty).

@@ -4,12 +4,12 @@
 
 1. **GMP Document → New.**
 2. Fill both titles (FA + EN), Document Type, Department (must have an abbreviation configured), GMP Impact, Validity Period.
-3. Pick the **Word Template** (tag-mapping profile) and assign the **Reviewer** and **QA Approver** — both must have a signature image on their Employee record (you are warned immediately if not).
+3. Pick the **Word Template** (tag-mapping profile).
 4. Attach the source **.docx** containing the template tags (see *Templates*).
 5. Save. The document gets its permanent ID (e.g. `QA-SOP-0001-1`); the file is renamed to that ID and its SHA-256 integrity hash is stored.
-6. **Actions → Submit for Review** (only you, the preparer, can do this).
-7. The Reviewer gets a ToDo → **Actions → Approve as Reviewer** (or *Request Revision* to bounce it back).
-8. The QA Approver → **Actions → Approve as QA**. The document is submitted, rendered, signed, stamped and becomes the **effective version** (green *Controlled* badge).
+6. **Actions → Submit for Approval** (only you, the preparer, can do this). The approvers are filled in now: your supervisor and their manager from the Employee reporting chain, the QA Supervisor, Regulatory Manager and QA Approver from DMS Settings. Reviewers and QA approvers need a signature image on their Employee record.
+7. Each approver in turn gets a ToDo and acts from **Actions** — supervisor, reviewer, QA supervisor (who may delegate to a queue of QA reviewers), regulatory manager, then the reviewer again as manager. Any of them can *Return* the document a step back or to you; the form asks them for the reason, which you see on the document.
+8. The QA Approver → **Actions → Publish**. The document is submitted, rendered, signed, stamped and becomes the **effective version** (green *Controlled* badge).
 
 ## 2. Download PDFs
 

@@ -11,6 +11,9 @@ frappe.listview_settings['GMP Document'] = {
         'reviewer',
         'qa_approver',
         'prepared_by',
+        'supervisor',
+        'qa_supervisor',
+        'regulatory_manager',
         'effective_date',
     ],
 
@@ -49,7 +52,6 @@ frappe.listview_settings['GMP Document'] = {
         // Draft docs use the workflow status for color
         const wf = doc.workflow_status;
         if (wf === 'Under Review') return [__('Under Review'), 'orange', 'workflow_status,=,Under Review'];
-        if (wf === 'Pending QA Approval') return [__('Pending QA'), 'blue', 'workflow_status,=,Pending QA Approval'];
         if (wf === 'Revision Requested') return [__('Revision Requested'), 'red', 'workflow_status,=,Revision Requested'];
         return [__('Draft'), 'gray', 'docstatus,=,0|workflow_status,=,Draft'];
     },
@@ -61,37 +63,29 @@ frappe.listview_settings['GMP Document'] = {
 
         const me = frappe.session.user;
 
-        listview.page.add_inner_button(
-            __('Awaiting My Review'),
-            () => {
-                listview.filter_area.clear();
-                listview.filter_area.add('GMP Document', 'workflow_status', '=', 'Under Review');
-                listview.filter_area.add('GMP Document', 'reviewer', '=', me);
-                listview.refresh();
-            },
-            __('My Pending')
-        );
-
-        listview.page.add_inner_button(
-            __('Awaiting My QA Approval'),
-            () => {
-                listview.filter_area.clear();
-                listview.filter_area.add('GMP Document', 'workflow_status', '=', 'Pending QA Approval');
-                listview.filter_area.add('GMP Document', 'qa_approver', '=', me);
-                listview.refresh();
-            },
-            __('My Pending')
-        );
-
-        listview.page.add_inner_button(
-            __('My Revisions to Address'),
-            () => {
-                listview.filter_area.clear();
-                listview.filter_area.add('GMP Document', 'workflow_status', '=', 'Revision Requested');
-                listview.filter_area.add('GMP Document', 'prepared_by', '=', me);
-                listview.refresh();
-            },
-            __('My Pending')
-        );
+        // One entry per stage that waits on a named person — the same stages
+        // get_my_pending_count() counts. (The delegated QA review queue lives
+        // in a child table, so it is reached from the document, not here.)
+        const stages = [
+            [__('Awaiting My Supervisor Approval'), 'Pending Supervisor Approval', 'supervisor'],
+            [__('Awaiting My Review'), 'Under Review', 'reviewer'],
+            [__('Awaiting Me as QA Supervisor'), 'Pending QA Supervisor', 'qa_supervisor'],
+            [__('Awaiting My Regulatory Validation'), 'Pending Regulatory Validation', 'regulatory_manager'],
+            [__('Awaiting My Manager Approval'), 'Pending Manager Approval', 'reviewer'],
+            [__('Awaiting My QA Approval'), 'Pending Final QA Approval', 'qa_approver'],
+            [__('My Revisions to Address'), 'Revision Requested', 'prepared_by'],
+        ];
+        for (const [label, state, actor_field] of stages) {
+            listview.page.add_inner_button(
+                label,
+                () => {
+                    listview.filter_area.clear();
+                    listview.filter_area.add('GMP Document', 'workflow_status', '=', state);
+                    listview.filter_area.add('GMP Document', actor_field, '=', me);
+                    listview.refresh();
+                },
+                __('My Pending')
+            );
+        }
     },
 };

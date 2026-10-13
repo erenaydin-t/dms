@@ -73,13 +73,14 @@ def _render_cell_text(text, context):
     always present under Frappe; if it is somehow unavailable we degrade to a
     bare-tag token substitution (expressions are then left as-is rather than
     crashing the render). ``autoescape=False`` because spreadsheet cells are not
-    HTML — values must land verbatim."""
+    HTML — values must land verbatim. Sandboxed because the workbook is written
+    by the preparer: a cell must not be able to reach Python internals."""
     if "{{" not in text and "{%" not in text:
         return text
     try:
-        from jinja2 import Environment
+        from jinja2.sandbox import SandboxedEnvironment
 
-        return Environment(autoescape=False).from_string(text).render(**context)
+        return SandboxedEnvironment(autoescape=False).from_string(text).render(**context)
     except ImportError:
         return _substitute(text, context)
 

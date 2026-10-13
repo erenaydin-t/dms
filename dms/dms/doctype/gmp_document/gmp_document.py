@@ -11,6 +11,7 @@ on download according to the document's current status.
 import hashlib
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 from io import BytesIO
@@ -18,12 +19,12 @@ from io import BytesIO
 import frappe
 from frappe import _
 from frappe.utils import add_months, add_years, cint, cstr, get_files_path, getdate, now_datetime, today
-from frappe.utils.file_manager import save_file
 from frappe.utils.nestedset import NestedSet
 from frappe.core.doctype.file.utils import get_content_hash
 
 from docx.shared import Mm
 from docxtpl import DocxTemplate, InlineImage
+from jinja2.sandbox import SandboxedEnvironment
 
 from .font_enforcement import enforce_docx_font, enforce_vsdx_font, font_covers, shape_rtl
 
@@ -257,6 +258,11 @@ _RETURN_EDGES = {
 }
 
 
+# Reference types that name one particular version on purpose; approving a
+# new version must not move them (see _repoint_references_to_self).
+_VERSION_PINNED_REFERENCE_TYPES = ("Supersedes", "Derived From")
+
+
 # Per-stage audit wiring — the single source of truth for the approval
 # timeline. For each stage of the chain:
 #   actor     — field naming the user the stage is assigned to
@@ -336,6 +342,53 @@ _STAGE_STAMPS = {
 }
 
 
+# What an approval cycle writes: the per-stage stamps, timeline, delegations
+# and signature snapshots, plus the CEO block, the publication date and the
+# return bookkeeping. Written only by the controller, never by a form save.
+_APPROVAL_RECORD_FIELDS = tuple(
+    dict.fromkeys(
+        [
+            fieldname
+            for spec in _STAGE_STAMPS.values()
+            for fieldname in (spec["by"], spec["on"], spec["date"], spec["on_behalf"], spec["signature"])
+            if fieldname
+        ]
+        + [
+            "reviewed_by",
+            "reviewed_on",
+            "approved_by",
+            "approved_on",
+            "qa_review_complete",
+            "last_revision_request",
+            "last_revision_by",
+            "last_revision_on",
+            "publish_date",
+            "ceo",
+            "ceo_name",
+            "ceo_date",
+            "ceo_signature",
+        ]
+    )
+)
+
+# Fields only the controller writes on a saved draft. Frappe enforces
+# read_only in the form, not on the server, so validate() puts back the stored
+# value of each whenever a save (form or REST) carries a different one:
+# - the approval record — a forged CEO block, signature or "on behalf of"
+#   would print on the approved PDF;
+# - revision_of — pointing a draft at another document would retire THAT
+#   document on approval; clearing it would leave two effective versions;
+# - the integrity hash and the pinned render font.
+# The controller writes all of them with db_set (or, for a new attachment,
+# in before_save, which runs after this check), so its own updates are kept.
+_SYSTEM_OWNED_FIELDS = _APPROVAL_RECORD_FIELDS + (
+    "revision_of",
+    "file_integrity_hash",
+    "render_font_family",
+    "render_preserve_symbol_fonts",
+)
+
+
 def _acts_on_behalf(user):
     """True when ``user`` may act for another role-holder.
 
@@ -374,6 +427,16 @@ class GMPDocument(NestedSet):
                 _("Department {0} must have 'custom_abbr' set before naming a GMP Document.").format(
                     self.department
                 )
+            )
+        # The abbreviation is free text on Department. A dash would add a fifth
+        # name segment, "_" and "%" are LIKE wildcards in the number lookup,
+        # and a slash or space breaks the file names derived from the ID.
+        if any(ch in dept_abbr for ch in r' -_%/\:*?"<>|'):
+            frappe.throw(
+                _(
+                    "The abbreviation {0} of department {1} cannot be used in a document ID: "
+                    "remove spaces, dashes, underscores, % and path characters."
+                ).format(frappe.bold(dept_abbr), self.department)
             )
 
         # Strict ID structure: [Dept Abbr]-[Form Type]-[Number(4)]-[Version]
@@ -461,6 +524,11 @@ class GMPDocument(NestedSet):
         if not self.workflow_status:
             self.workflow_status = WF_DRAFT
 
+        # A new record starts with no approval history, whatever the caller
+        # sent: the form never shows these fields as editable, but an API
+        # insert could pre-fill a CEO block, a signature or a delegation.
+        self._reset_approval_record()
+
         predecessor_name = self.revision_of or self.amended_from
         if not predecessor_name:
             # version_number is the human *revision* number rendered into the
@@ -537,43 +605,21 @@ class GMPDocument(NestedSet):
         # Routing actors are re-resolved when this successor is submitted for
         # approval — the org chart or DMS Settings may have changed since the
         # predecessor's cycle — and every stage stamp starts blank.
+        # The stage stamps were already blanked by _reset_approval_record().
         self.supervisor = None
         self.reviewer = None
         self.qa_supervisor = None
         self.regulatory_manager = None
         self.qa_approver = None
+
+    def _reset_approval_record(self):
+        """Blank everything an approval cycle records: the stage stamps and
+        timeline, the delegation record, the signature snapshots, the CEO
+        block, the QA queue and the return bookkeeping. A revision earns its
+        own; a brand-new document has none."""
         self.qa_reviews = []
-        self.qa_review_complete = 0
-        self.submitted_on = None
-        self.supervisor_approved_by = None
-        self.supervisor_approved_on = None
-        self.reviewed_by = None
-        self.reviewed_on = None
-        self.qa_supervisor_approved_by = None
-        self.qa_supervisor_approved_on = None
-        self.manager_approved_by = None
-        self.manager_approved_on = None
-        self.regulatory_validated_by = None
-        self.regulatory_validated_on = None
-        self.approved_by = None
-        self.approved_on = None
-        self.last_revision_request = None
-        self.last_revision_by = None
-        self.last_revision_on = None
-        # The approval timeline, the delegation record and the signature
-        # snapshots all belong to the predecessor's approval cycle; this
-        # revision earns its own.
-        for spec in _STAGE_STAMPS.values():
-            self.set(spec["date"], None)
-            if spec["on_behalf"]:
-                self.set(spec["on_behalf"], None)
-            if spec["signature"]:
-                self.set(spec["signature"], None)
-        self.publish_date = None
-        self.ceo = None
-        self.ceo_name = None
-        self.ceo_date = None
-        self.ceo_signature = None
+        for fieldname in _APPROVAL_RECORD_FIELDS:
+            self.set(fieldname, 0 if fieldname == "qa_review_complete" else None)
 
     def _guard_successor_creation(self, predecessor_name):
         """Integrity guards for creating a successor (revision or amendment).
@@ -643,6 +689,8 @@ class GMPDocument(NestedSet):
         if self.docstatus == 0 and self.workflow_status == WF_REVISION_CANCELLED and self.revision_of:
             self.flags.ignore_mandatory = True
 
+        self._restore_system_owned_fields()
+
         if (self.amended_from or self.revision_of) and not (
             self.reason_for_change and self.reason_for_change.strip()
         ):
@@ -652,6 +700,21 @@ class GMPDocument(NestedSet):
         self._resolve_workflow_actors_on_submit_for_approval()
         self._resolve_stage_actor_if_missing()
         self._validate_signatures()
+
+    def _restore_system_owned_fields(self):
+        """Put back the stored value of every field only the controller may
+        write (see _SYSTEM_OWNED_FIELDS). Silent, like the effective-date
+        normalisation: a form opened before an approver's stamp landed carries
+        the old, empty values, and saving it must neither fail nor wipe the
+        stamp."""
+        if self.is_new() or self.docstatus != 0:
+            return
+        before = self.get_doc_before_save()
+        if not before:
+            return
+        for fieldname in _SYSTEM_OWNED_FIELDS:
+            if self.get(fieldname) != before.get(fieldname):
+                self.set(fieldname, before.get(fieldname))
 
     def _resolve_stage_actor_if_missing(self):
         """Safety net for documents that entered the pipeline before v1.3 (or
@@ -783,12 +846,32 @@ class GMPDocument(NestedSet):
         if self.docstatus != 0:
             return  # post-submit edits are governed by Frappe's submitted-doc rules
 
+        previous = self.get_doc_before_save()
         if not cint(self.set_effective_date):
-            previous = self.get_doc_before_save()
-            system_value = previous.effective_date if previous else None
+            # A draft never holds a system date — the system stamps it only at
+            # submit — so the only value to keep is one saved while the box
+            # was already off. A date saved under a ticked box is a manual one
+            # and must go when the box is unticked, or it would survive to
+            # submit and schedule (or backdate) the document after all.
+            system_value = (
+                previous.effective_date
+                if previous and not cint(previous.set_effective_date)
+                else None
+            )
             if cstr(self.effective_date) != cstr(system_value):
                 self.effective_date = system_value
+                self.expiry_date = self.next_revision_date = None
                 self._calculate_lifecycle_dates()
+            return
+
+        # Only a change needs the privilege. Every workflow action saves the
+        # whole document, so checking the mere presence of a ticked box would
+        # block each approver after the manager who set the date.
+        if (
+            previous
+            and cint(previous.set_effective_date)
+            and cstr(previous.effective_date) == cstr(self.effective_date)
+        ):
             return
 
         allowed = {"QA Manager", "DMS Manager", "System Manager"}
@@ -821,28 +904,41 @@ class GMPDocument(NestedSet):
                 )
 
     def _check_circular_references(self):
-        """Prevent circular reference chains (A → B → A)."""
+        """Prevent this document's references from leading back to itself
+        (A → B → A).
+
+        Only a loop through THIS document is an error. Loops elsewhere in the
+        graph are not this save's doing and can arise legitimately: approving
+        a revision repoints its dependents' references onto it, so an SOP and
+        a form that cite each other end up in a loop. Throwing on those would
+        make both documents impossible to revise."""
         if not self.references:
             return
 
-        def _dfs(doc_name, visited):
-            if doc_name in visited:
-                frappe.throw(
-                    _("Circular reference detected: document {0} is already in the reference chain.").format(doc_name)
-                )
-            visited.add(doc_name)
-            children = frappe.get_all(
-                "GMP Document Reference",
-                filters={"parent": doc_name},
-                pluck="referenced_document",
-            )
-            for child in children:
-                _dfs(child, visited.copy())
-
+        seen = set()
+        stack = []
         for row in self.references:
             if row.referenced_document == self.name:
                 frappe.throw(_("A document cannot reference itself."))
-            _dfs(row.referenced_document, {self.name})
+            stack.append(row.referenced_document)
+
+        while stack:
+            doc_name = stack.pop()
+            if doc_name in seen:
+                continue
+            seen.add(doc_name)
+            for child in frappe.get_all(
+                "GMP Document Reference",
+                filters={"parenttype": "GMP Document", "parent": doc_name},
+                pluck="referenced_document",
+            ):
+                if child == self.name:
+                    frappe.throw(
+                        _("Circular reference detected: {0} already leads back to {1}.").format(
+                            frappe.bold(doc_name), frappe.bold(self.name)
+                        )
+                    )
+                stack.append(child)
 
     def before_save(self):
         self._calculate_lifecycle_dates()
@@ -917,6 +1013,13 @@ class GMPDocument(NestedSet):
         # that is when it became the version people are handed.
         if not _is_pending_effective_date(self.effective_date):
             self.db_set("publish_date", today(), update_modified=False)
+
+        # Approval makes this the live version (a future-dated one is switched
+        # off again below, after the render). Never keep an is_active a draft
+        # happened to carry: an unticked box would publish a document nobody
+        # can see, rendered with the rejected stamp.
+        if not cint(self.is_active):
+            self.db_set("is_active", 1, update_modified=False)
 
         # The only point where DMS Settings decides the font: every later
         # re-render of this version reuses what is frozen here.
@@ -1365,25 +1468,11 @@ class GMPDocument(NestedSet):
             update_modified=False,
         )
 
-        base_pdf_filename = f"{self.name}.pdf"
-        for old in frappe.get_all(
-            "File",
-            filters={
-                "attached_to_doctype": self.doctype,
-                "attached_to_name": self.name,
-                "file_name": base_pdf_filename,
-            },
-            pluck="name",
-        ):
-            frappe.delete_doc("File", old, ignore_permissions=True, force=True)
-
-        save_file(
-            fname=base_pdf_filename,
-            content=pdf_bytes,
-            dt=self.doctype,
-            dn=self.name,
-            is_private=1,
-        )
+        # Same deterministic path as the deliverable. save_file() would rename
+        # the file with a hash suffix whenever the plain name is taken on disk,
+        # and then neither the next re-render nor the download lookup — both
+        # keyed by the exact name — would find it.
+        self._own_private_file(pdf_bytes, f"{self.name}.pdf")
 
     def _soffice_binary(self):
         soffice = shutil.which("soffice") or shutil.which("libreoffice")
@@ -1399,28 +1488,37 @@ class GMPDocument(NestedSet):
         processes sharing the default profile exit 0 without producing output."""
         profile_dir = os.path.join(tmpdir, ".lo-profile")
         os.makedirs(profile_dir, exist_ok=True)
+        # Its own process group: the soffice launcher forks soffice.bin, and a
+        # timeout that killed only the launcher would leave a hung soffice.bin
+        # behind on every stuck conversion.
+        proc = subprocess.Popen(
+            [
+                soffice,
+                "--headless",
+                f"-env:UserInstallation=file://{profile_dir}",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                tmpdir,
+                src_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
         try:
-            proc = subprocess.run(
-                [
-                    soffice,
-                    "--headless",
-                    f"-env:UserInstallation=file://{profile_dir}",
-                    "--convert-to",
-                    "pdf",
-                    "--outdir",
-                    tmpdir,
-                    src_path,
-                ],
-                capture_output=True,
-                timeout=180,
-                check=True,
-            )
+            stdout, stderr = proc.communicate(timeout=180)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
             frappe.throw(_("PDF conversion timed out."))
-        except subprocess.CalledProcessError as exc:
+        if proc.returncode != 0:
             frappe.log_error(
                 title="GMP Document: PDF conversion failed",
-                message=(exc.stderr or b"").decode("utf-8", errors="ignore"),
+                message=(stderr or b"").decode("utf-8", errors="ignore"),
             )
             frappe.throw(_("PDF conversion failed. Check Error Log for details."))
 
@@ -1437,8 +1535,8 @@ class GMPDocument(NestedSet):
                     for part in (
                         f"binary: {soffice}",
                         f"source: {os.path.basename(src_path)}",
-                        (proc.stdout or b"").decode("utf-8", errors="ignore"),
-                        (proc.stderr or b"").decode("utf-8", errors="ignore"),
+                        (stdout or b"").decode("utf-8", errors="ignore"),
+                        (stderr or b"").decode("utf-8", errors="ignore"),
                     )
                     if part
                 ),
@@ -1533,7 +1631,9 @@ class GMPDocument(NestedSet):
         clean_path = os.path.join(tmpdir, f"{self.name}.docx")
         try:
             clean_template = DocxTemplate(source_path)
-            clean_template.render(self._build_template_context(field_mappings=field_mappings))
+            _render_docx_template(
+                clean_template, self._build_template_context(field_mappings=field_mappings)
+            )
             clean_template.save(clean_path)
         except Exception:
             frappe.log_error(
@@ -1548,7 +1648,7 @@ class GMPDocument(NestedSet):
             sig_context = self._build_template_context(
                 template_for_images=sig_template, field_mappings=field_mappings
             )
-            sig_template.render(sig_context)
+            _render_docx_template(sig_template, sig_context)
             sig_template.save(sig_path)
         except Exception:
             frappe.log_error(
@@ -1830,6 +1930,12 @@ class GMPDocument(NestedSet):
 
         actor = frappe.session.user
 
+        # A return's reason stays on the form for whoever has to address it,
+        # and goes once the document moves on — so a later return recorded
+        # without one can never be logged under the earlier actor's words.
+        if (prev, curr) not in _RETURN_EDGES and self.last_revision_request:
+            self.db_set("last_revision_request", None, update_modified=False)
+
         # ---------------- forward path ---------------- #
         if curr == WF_PENDING_SUPERVISOR and prev in (WF_DRAFT, WF_REVISION):
             # Preparer submitted for approval; actors were resolved in
@@ -2036,9 +2142,9 @@ class GMPDocument(NestedSet):
         self._snapshot_signature("ceo_signature", ceo)
 
     def _stamp_revision_request(self, actor):
-        """Record who/when on a revision request. The reason text is captured
-        in the writable `last_revision_request` field on the form before the
-        actor selects the native Request Revision action."""
+        """Record who/when on a revision request. The reason is stored by
+        set_return_reason() — the form prompts for it when a Return action is
+        chosen — before apply_workflow reloads the document from the database."""
         self.db_set("last_revision_by", actor, update_modified=False)
         self.db_set("last_revision_on", now_datetime(), update_modified=False)
         reason = (self.last_revision_request or "").strip()
@@ -2154,20 +2260,44 @@ class GMPDocument(NestedSet):
     def _repoint_references_to_self(self):
         """Swing dependents' reference rows from the superseded version to this
         newly-approved one, so cross-references always resolve to the current
-        controlled version (Issue #4)."""
+        controlled version (Issue #4).
+
+        Only live references move. A "Supersedes" or "Derived From" row names
+        one particular version on purpose, and a retired document (obsolete,
+        cancelled, an abandoned revision) is a record of what it cited when it
+        was in force — rewriting either would falsify history."""
         predecessor_name = self.revision_of or self.amended_from
         if not predecessor_name:
             return
 
-        rows = frappe.get_all(
-            "GMP Document Reference",
-            filters={"referenced_document": predecessor_name},
-            fields=["name", "parent", "parenttype"],
+        rows = [
+            r
+            for r in frappe.get_all(
+                "GMP Document Reference",
+                filters={"referenced_document": predecessor_name},
+                fields=["name", "parent", "parenttype", "reference_type"],
+            )
+            if r.reference_type not in _VERSION_PINNED_REFERENCE_TYPES
+        ]
+        retired = set(
+            frappe.get_all(
+                "GMP Document",
+                filters={
+                    "name": ["in", list({r.parent for r in rows if r.parenttype == "GMP Document"}) or [""]],
+                },
+                or_filters={
+                    "docstatus": 2,
+                    "workflow_status": ["in", (WF_OBSOLETE, WF_REVISION_CANCELLED)],
+                },
+                pluck="name",
+            )
         )
         repointed_parents = set()
         for row in rows:
             if row.parent == self.name:
                 continue  # never repoint this revision's own reference rows
+            if row.parent in retired:
+                continue
             frappe.db.set_value(
                 "GMP Document Reference",
                 row.name,
@@ -2203,6 +2333,19 @@ class GMPDocument(NestedSet):
 # ---------------------------------------------------------------------- #
 #  Module-level helpers                                                  #
 # ---------------------------------------------------------------------- #
+
+
+def _render_docx_template(template, context):
+    """Render an uploaded .docx template.
+
+    The file IS the Jinja template, and its author is the preparer. Sandboxed,
+    so a tag hidden in it (white text, a field code) cannot reach Python
+    internals — ``{{ cycler.__init__.__globals__.os... }}`` would otherwise run
+    on the server at every approval and re-render. Autoescaped, so a value
+    such as "Research & Development" or "pH < 7" lands as text instead of
+    breaking the XML (silently dropped in the body, a failed approval in a
+    header). docxtpl's InlineImage/RichText mark themselves safe."""
+    template.render(context, jinja_env=SandboxedEnvironment(), autoescape=True)
 
 
 def _compute_sha256(path):
@@ -2427,6 +2570,11 @@ def activate_effective_documents():
                 frappe.get_traceback(),
                 f"GMP Document: effective-date activation failed for {name}",
             )
+            continue
+        # The approval render ran before publish_date existed; re-render so a
+        # template's {{ publish_date }} is filled in the copy that is now in
+        # force. After the commit, so a render failure cannot undo activation.
+        _rerender_after_status_change(doc, "effective-date activation re-render")
 
 
 def expire_gmp_documents():
@@ -2455,8 +2603,6 @@ def expire_gmp_documents():
             doc = frappe.get_doc("GMP Document", name)
             doc.db_set("is_active", 0, update_modified=False)
             doc.db_set("workflow_status", WF_OBSOLETE, update_modified=False)
-            if doc.attachment_file:
-                doc._render_and_generate_pdf()
             frappe.db.commit()
         except Exception:
             frappe.db.rollback()
@@ -2464,6 +2610,25 @@ def expire_gmp_documents():
                 frappe.get_traceback(),
                 f"GMP Document: auto-expire failed for {name}",
             )
+            continue
+        # Separately from the expiry itself: a render failure (LibreOffice
+        # down, source file gone) must not roll the document back to active
+        # and keep it in circulation. Downloads are OBSOLETE-watermarked from
+        # the status regardless; only the base PDF's stamp waits for a re-run.
+        _rerender_after_status_change(doc, "auto-expire re-stamp")
+
+
+def _rerender_after_status_change(doc, what):
+    """Re-render after a committed status change; failures are logged, and
+    their partial writes discarded, without touching the status change."""
+    if not doc.attachment_file:
+        return
+    try:
+        doc._render_and_generate_pdf()
+        frappe.db.commit()
+    except Exception:
+        frappe.db.rollback()
+        frappe.log_error(frappe.get_traceback(), f"GMP Document: {what} failed for {doc.name}")
 
 
 # ---------------------------------------------------------------------- #
@@ -2494,6 +2659,20 @@ def create_revision(docname, reason_for_change):
     if not reason:
         frappe.throw(_("Reason for Change is required to start a revision."))
 
+    # The caller becomes the draft's preparer, so they must be able to take
+    # it forward: a revision started by someone the workflow does not let
+    # submit a draft would sit unsubmittable — and, as the one open revision,
+    # block every other revision of the document.
+    if not _can_author(frappe.session.user):
+        frappe.throw(
+            _(
+                "You would be the preparer of this revision, but your roles cannot "
+                "submit a draft in the GMP Document workflow (usually the DMS "
+                "Initiator role). Ask a document author to start the revision."
+            ),
+            frappe.PermissionError,
+        )
+
     revision = frappe.copy_doc(source)  # no_copy fields (revision_of, amended_from) reset by copy
     revision.docstatus = 0  # copy_doc may carry the source's submitted docstatus
     revision.revision_of = source.name
@@ -2521,6 +2700,57 @@ def create_revision(docname, reason_for_change):
         ),
     )
     return revision.name
+
+
+@frappe.whitelist(methods=["POST"])
+def set_return_reason(docname, reason):
+    """Store the reason for a Return action the caller is about to apply.
+
+    The form calls this from before_workflow_action. It has to be its own
+    request: apply_workflow reloads the document from the database, so a
+    reason typed into the form beforehand would never reach the save."""
+    doc = frappe.get_doc("GMP Document", docname)
+    doc.check_permission("read")
+
+    reason = cstr(reason).strip()
+    if not reason:
+        frappe.throw(_("Enter the reason for returning the document."))
+    if doc.docstatus != 0:
+        frappe.throw(_("{0} is no longer in review.").format(docname))
+
+    user = frappe.session.user
+    actor_field = _STATE_WRITE_ACTOR.get(doc.workflow_status)
+    if not (_is_unrestricted(user) or (actor_field and doc.get(actor_field) == user)):
+        frappe.throw(
+            _("Only the approver {0} is waiting on can return it.").format(docname),
+            frappe.PermissionError,
+        )
+
+    doc.db_set("last_revision_request", reason, update_modified=False)
+
+
+def _can_author(user):
+    """True when the workflow lets ``user`` act on a draft (a transition out
+    of Draft is given to one of their roles). Read from the site's workflow —
+    which the site owns — rather than from a fixed role name."""
+    if user == "Administrator":
+        return True
+    from frappe.model.workflow import get_workflow_name
+
+    workflow = get_workflow_name("GMP Document")
+    if not workflow:
+        return True  # no workflow: role permissions alone decide
+    return bool(
+        frappe.get_all(
+            "Workflow Transition",
+            filters={
+                "parent": workflow,
+                "state": WF_DRAFT,
+                "allowed": ["in", frappe.get_roles(user)],
+            },
+            limit=1,
+        )
+    )
 
 
 PDF_VARIANTS = ("controlled", "uncontrolled", "plain")
@@ -2558,7 +2788,9 @@ def download_watermarked_pdf(docname, variant=None):
             )
         )
 
-    if doc.docstatus != 1:
+    # A cancelled document (docstatus 2) stays downloadable — always stamped
+    # OBSOLETE below — so its retired copy can still be produced for audit.
+    if doc.docstatus == 0:
         frappe.throw(
             _("A PDF is only available after {0} has been QA-approved (submitted).").format(
                 docname
@@ -2579,7 +2811,7 @@ def download_watermarked_pdf(docname, variant=None):
     # not obsolete, but it must not circulate looking like a normal copy.
     if _is_pending_effective(doc):
         watermark_text = "NOT YET EFFECTIVE"
-    elif not doc.is_active:
+    elif not doc.is_active or doc.docstatus == 2:
         watermark_text = "OBSOLETE"
 
     # 21 CFR Part 11: a reference print outside change control is only
@@ -2616,18 +2848,24 @@ def _resolve_base_pdf_path(doc):
     requires the source ``.docx`` to still be present."""
 
     def _find_pdf_on_disk():
-        for f in frappe.get_all(
-            "File",
-            filters={
-                "attached_to_doctype": doc.doctype,
-                "attached_to_name": doc.name,
-                "file_name": ["like", "%.pdf"],
-            },
-            fields=["name"],
-        ):
-            path = frappe.get_doc("File", f.name).get_full_path()
-            if os.path.exists(path):
-                return path
+        # The base PDF by its own name first: any other PDF attached to the
+        # document (a scanned copy, a training record) must never be served as
+        # the controlled copy. The prefix match only covers base PDFs stored by
+        # releases before 2.7.2, which could carry a hash suffix.
+        for file_name in (f"{doc.name}.pdf", ["like", f"{doc.name}%.pdf"]):
+            for f in frappe.get_all(
+                "File",
+                filters={
+                    "attached_to_doctype": doc.doctype,
+                    "attached_to_name": doc.name,
+                    "file_name": file_name,
+                },
+                fields=["name"],
+                order_by="creation desc",
+            ):
+                path = frappe.get_doc("File", f.name).get_full_path()
+                if os.path.exists(path):
+                    return path
         return None
 
     path = _find_pdf_on_disk()
@@ -2653,11 +2891,20 @@ def _resolve_base_pdf_path(doc):
             ).format(doc.name)
         )
     doc._render_and_generate_pdf()
+    _keep_regeneration()
 
     path = _find_pdf_on_disk()
     if not path:
         frappe.throw(_("Base PDF for {0} could not be generated.").format(doc.name))
     return path
+
+
+def _keep_regeneration():
+    """Downloads arrive as GET, and Frappe rolls back every GET request. A
+    regeneration's File rows and integrity hash would be discarded while the
+    files it wrote stayed on disk — the stored hash would then no longer match
+    the deliverable, and the next download would regenerate all over again."""
+    frappe.local.flags.commit = True
 
 
 def _resolve_deliverable_path(doc):
@@ -2703,6 +2950,7 @@ def _resolve_deliverable_path(doc):
             ).format(doc.name)
         )
     doc._render_and_generate_pdf()
+    _keep_regeneration()
 
     path = _find_on_disk()
     if not path:
@@ -2741,7 +2989,11 @@ def _resolve_deliverable_path(doc):
 def get_my_pending_count(user=None):
     """Used by the workspace pending-count badge: how many documents are
     waiting on this user at each stage of the chain, including the QA queue
-    (counted only when the user is the row currently awaiting review)."""
+    (counted only when the user is the row currently awaiting review).
+
+    Someone else's workload is visible only to the unrestricted roles."""
+    if user and user != frappe.session.user and not _is_unrestricted(frappe.session.user):
+        frappe.throw(_("You can only see your own pending documents."), frappe.PermissionError)
     user = user or frappe.session.user
     stage_actor = (
         ("supervisor_approval", WF_PENDING_SUPERVISOR, "supervisor"),
@@ -3017,7 +3269,10 @@ def skip_qa_reviewer(docname, reason):
 
 def _user_departments(user):
     """Departments the user belongs to, resolved via their Employee record(s)
-    (Employee.user_id == user). A user with no Employee link has none.
+    (Employee.user_id == user). A user with no Employee link has none. Only
+    Active records count: after a transfer or rehire the old record (Left) may
+    still carry the user id, and must not keep the old department's documents
+    visible.
 
     Memoised per request (frappe.flags is request-local) because has_permission
     can fire several times per document per request — without this each call
@@ -3029,7 +3284,7 @@ def _user_departments(user):
         memo[user] = [
             d
             for d in frappe.get_all(
-                "Employee", filters={"user_id": user}, pluck="department"
+                "Employee", filters={"user_id": user, "status": "Active"}, pluck="department"
             )
             if d
         ]
@@ -3118,6 +3373,31 @@ def get_permission_query_conditions(user=None):
     return "(" + " or ".join(conditions) + ")"
 
 
+def _may_write(doc, user):
+    """Write gate for a named participant of a saved draft.
+
+    Judged on the STORED row, never the in-memory document: apply_workflow
+    sets the next state before it saves, and Frappe checks write permission
+    inside that save — so the in-memory state names the NEXT stage's actor,
+    and a plain REST save carries whatever actor fields the client sent.
+
+    A save that changes the state is a workflow transition; whether this user
+    may make it is decided by the Workflow engine (validate_workflow checks
+    the transition's role and condition), so it is allowed here. That keeps
+    actions offered to someone other than the waiting actor — the preparer's
+    Cancel Revision, or a transition a site adds to its own workflow —
+    working. Any other save is an edit, and only the waiting actor may edit."""
+    stored = frappe.db.get_value(
+        doc.doctype, doc.name, ["workflow_status", *_PARTICIPANT_FIELDS], as_dict=True
+    )
+    if not stored:
+        return False
+    if doc.get("workflow_status") != stored.workflow_status:
+        return user in tuple(stored.get(f) for f in _PARTICIPANT_FIELDS)
+    actor_field = _STATE_WRITE_ACTOR.get(stored.workflow_status)
+    return bool(actor_field and stored.get(actor_field) == user)
+
+
 def _in_qa_queue(doc, user):
     if doc.get("qa_reviews") is not None:
         return any(r.reviewer == user for r in doc.qa_reviews)
@@ -3135,9 +3415,10 @@ def has_permission(doc, ptype="read", user=None):
 
     Returning False denies; True/None defers to the role permission.
     Unrestricted roles always pass. A workflow participant may always read
-    (and print) the document; write is granted only to the participant the
-    current state is waiting on (that's what apply_workflow saves as). A
-    plain member may read an approved, active document of their department.
+    (and print) the document; on a draft, write is granted to the participant
+    the stored state is waiting on, and to a participant making a workflow
+    transition (see _may_write). A plain member may read an approved, active
+    document of their department.
     Everything else is denied here (role perms already withhold
     create/delete/etc. — this is defence in depth)."""
     if doc is None:
@@ -3148,20 +3429,19 @@ def has_permission(doc, ptype="read", user=None):
         return True
 
     if getattr(doc, "is_new", None) and doc.is_new():
-        return None  # creation is governed by role perms (DMS Initiator)
+        # Creation is governed by role perms (DMS Initiator). True, not None:
+        # Frappe reads any falsy hook result as a denial, and a hook can only
+        # deny — it never grants a permission the role does not have.
+        return True
 
     read_like = ptype in ("read", "print")
     named = user in tuple(doc.get(f) for f in _PARTICIPANT_FIELDS)
     if named:
         if read_like:
             return True
-        write_actor_field = _STATE_WRITE_ACTOR.get(doc.get("workflow_status"))
-        return bool(
-            ptype == "write"
-            and cint(doc.get("docstatus")) == 0
-            and write_actor_field
-            and doc.get(write_actor_field) == user
-        )
+        if ptype != "write" or cint(doc.get("docstatus")) != 0:
+            return False
+        return _may_write(doc, user)
 
     if _in_qa_queue(doc, user):
         return read_like
@@ -3263,16 +3543,21 @@ def get_dms_tree_children(parent=None):
         docs = frappe.get_all(
             "GMP Document",
             filters=base_filters({"department": dept, "document_type": dtype}),
-            fields=["name", "version_number", "document_name_en", "is_active"],
+            fields=["name", "version_number", "document_name_en", "is_active", "docstatus", "workflow_status"],
         )
+
+        def rank(d):
+            # The version in force wins; failing that, the newest. Picking the
+            # highest version alone would show an approved revision that waits
+            # for its effective date — and hide the version actually in force.
+            return (cint(d.is_active), int(d.version_number or 0))
 
         latest = {}
         for d in docs:
             # Logical base = the ID without the trailing version segment
             # ([Dept]-[Type]-[Number]), so every version collapses to one node.
             base = d.name.rsplit("-", 1)[0]
-            v = int(d.version_number or 0)
-            if base not in latest or v > int(latest[base].version_number or 0):
+            if base not in latest or rank(d) > rank(latest[base]):
                 latest[base] = d
 
         nodes = []
@@ -3280,12 +3565,18 @@ def get_dms_tree_children(parent=None):
             title = d.name
             if d.document_name_en:
                 title += f"  —  {d.document_name_en}"
+            if d.is_active:
+                indicator, color = "ACTIVE", "green"
+            elif _is_pending_effective(d):
+                indicator, color = "NOT YET EFFECTIVE", "orange"
+            else:
+                indicator, color = "OBSOLETE", "red"
             nodes.append({
                 "value": d.name,
                 "title": title,
                 "expandable": 0,
-                "indicator": "ACTIVE" if d.is_active else "OBSOLETE",
-                "indicator_color": "green" if d.is_active else "red",
+                "indicator": indicator,
+                "indicator_color": color,
             })
         return nodes
 

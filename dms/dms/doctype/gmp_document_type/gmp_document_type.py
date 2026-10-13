@@ -31,9 +31,32 @@ class GMPDocumentType(Document):
         # so it must stay terse and filesystem/name safe.
         self._normalize_code()
 
+    def before_rename(self, old, new, merge=False):
+        # Renaming rewrites the Link on every GMP Document — approved, signed
+        # records included — and the code is part of their IDs. Allowed only
+        # while nothing uses the type (e.g. to fix a typo in a new code).
+        if frappe.db.exists("GMP Document", {"document_type": old}):
+            frappe.throw(
+                _(
+                    "Document type {0} is used by GMP Documents and cannot be renamed: "
+                    "its code is part of their IDs, and renaming would rewrite approved records."
+                ).format(frappe.bold(old))
+            )
+        return _checked_code(new)
+
     def _normalize_code(self):
-        self.code = (self.code or "").strip().upper()
-        if not self.code:
-            frappe.throw(_("Code is mandatory."))
-        if any(ch in self.code for ch in r' /\:*?"<>|'):
-            frappe.throw(_("Code may not contain spaces, slashes or path characters."))
+        self.code = _checked_code(self.code)
+
+
+def _checked_code(code):
+    """The code, upper-cased, or a throw when it cannot be a name segment.
+
+    The GMP Document ID is exactly four dash-separated segments, so a dash
+    would add one; "_" and "%" are LIKE wildcards in the chain-number lookup;
+    the rest are illegal in names or file names."""
+    code = (code or "").strip().upper()
+    if not code:
+        frappe.throw(_("Code is mandatory."))
+    if any(ch in code for ch in r' -_%/\:*?"<>|'):
+        frappe.throw(_("Code may not contain spaces, dashes, underscores, % or path characters."))
+    return code

@@ -403,7 +403,7 @@
    "fieldtype": "Section Break",
    "label": "Latest Revision Request",
    "collapsible": 1,
-   "depends_on": "eval:doc.last_revision_request || ['Under Review','Pending QA Approval'].includes(doc.workflow_status)"
+   "depends_on": "eval:doc.last_revision_request"
   },
   {
    "fieldname": "last_revision_by",
@@ -423,8 +423,8 @@
    "fieldname": "last_revision_request",
    "fieldtype": "Small Text",
    "label": "Reason",
-   "read_only_depends_on": "eval:!['Under Review','Pending QA Approval'].includes(doc.workflow_status)",
-   "description": "Reviewer/QA: enter the reason here before choosing 'Request Revision' from the Actions menu. Recorded with the requester and timestamp."
+   "read_only": 1,
+   "description": "Asked for when an approver chooses a Return action. Shown until the document moves forward again; every return is also kept in the timeline."
   },
   {
    "fieldname": "section_tree",
@@ -818,7 +818,7 @@
  "is_submittable": 1,
  "is_tree": 1,
  "links": [],
- "modified": "2026-10-13 00:00:00.000000",
+ "modified": "2026-10-13 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "DMS",
  "name": "GMP Document",

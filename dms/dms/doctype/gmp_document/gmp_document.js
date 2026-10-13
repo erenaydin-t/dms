@@ -26,6 +26,10 @@ frappe.ui.form.on("GMP Document", {
         }
     },
 
+    before_workflow_action(frm) {
+        return ask_return_reason(frm);
+    },
+
     version_number(frm) {
         toggle_reason_for_change(frm);
     },
@@ -46,6 +50,60 @@ frappe.ui.form.on("GMP Document", {
         warn_if_no_signature(frm, "qa_approver", __("QA Approver"));
     },
 });
+
+
+/**
+ * Every Return action asks why, and stores the answer before the action runs:
+ * apply_workflow reloads the document from the database, so the reason has to
+ * be saved by its own call first (set_return_reason). Cancelling the prompt
+ * cancels the action.
+ */
+function ask_return_reason(frm) {
+    const action = frm.selected_workflow_action || "";
+    const workflow = frappe.workflow.workflows[frm.doctype];
+    const transition = ((workflow && workflow.transitions) || []).find(
+        (t) => t.state === frm.doc.workflow_status && t.action === action
+    );
+    const is_return =
+        action.startsWith("Return") ||
+        (transition && transition.next_state === "Revision Requested");
+    if (!is_return) return;
+
+    // Frappe freezes the screen before this event; the dialog must sit on top.
+    frappe.dom.unfreeze();
+    return new Promise((resolve, reject) => {
+        let answered = false;
+        const dialog = frappe.prompt(
+            [
+                {
+                    fieldname: "reason",
+                    fieldtype: "Small Text",
+                    label: __("Reason for returning"),
+                    reqd: 1,
+                },
+            ],
+            (values) => {
+                answered = true;
+                frappe.dom.freeze();
+                frappe
+                    .xcall("dms.dms.doctype.gmp_document.gmp_document.set_return_reason", {
+                        docname: frm.doc.name,
+                        reason: values.reason,
+                    })
+                    .then(resolve)
+                    .catch((err) => {
+                        frappe.dom.unfreeze();
+                        reject(err);
+                    });
+            },
+            __(action),
+            __("Return")
+        );
+        dialog.onhide = () => {
+            if (!answered) reject();
+        };
+    });
+}
 
 
 /**
@@ -99,10 +157,14 @@ function add_create_revision_button(frm) {
     if (frm.doc.docstatus !== 1) return;
     if (frm.doc.workflow_status !== "Approved" || !cint(frm.doc.is_active)) return;
 
-    const can_author =
-        frappe.user.has_role("QA Manager") ||
-        frappe.user.has_role("DMS Manager") ||
-        frappe.user.has_role("System Manager");
+    // The clicker becomes the draft's preparer, so offer the button only to
+    // someone the workflow lets submit a draft (the server checks the same).
+    const workflow = frappe.workflow.workflows[frm.doctype];
+    const can_author = workflow
+        ? (workflow.transitions || []).some(
+              (t) => t.state === "Draft" && frappe.user.has_role(t.allowed)
+          )
+        : frappe.user.has_role("DMS Initiator");
     if (!can_author) return;
 
     frm.add_custom_button(__("Create Revision"), () => {
@@ -274,7 +336,8 @@ function show_revision_banner(frm) {
  */
 function add_download_pdf_button(frm) {
     if (frm.is_new()) return;
-    if (frm.doc.docstatus !== 1) return;
+    // Approved, or cancelled (the server stamps a cancelled copy OBSOLETE).
+    if (frm.doc.docstatus === 0) return;
 
     frm.add_custom_button(
         __("Download PDF (Uncontrolled Copy)"),

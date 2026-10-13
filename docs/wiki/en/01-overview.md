@@ -23,7 +23,7 @@ The DMS app manages **controlled documents** (SOPs, Work Instructions, Forms, Pr
 | Workflow | `GMP Document Workflow` | Native Frappe workflow driving all state transitions (must stay **Active**) |
 | Scheduler | `activate_effective_documents` (daily) | Promotes future-dated approved documents on their effective date |
 | Scheduler | `expire_gmp_documents` (daily) | Obsoletes documents past their expiry date |
-| Roles | `QA Manager`, `DMS Manager` | Authoring/workflow role and module-owner role |
+| Roles | `DMS Initiator`, `DMS Approver`, `QA Manager`, `DMS Manager`, `DMS Proxy Approver` | Authors, chain approvers, final QA, module owner, delegated approval (see *Roles*) |
 
 ### Document identity
 

@@ -13,6 +13,7 @@ Administrator, which every transition condition accepts as escape hatch.
 import unittest
 
 import frappe
+from frappe.model.workflow import apply_workflow
 from frappe.tests.utils import FrappeTestCase
 
 from dms.dms.doctype.gmp_document.gmp_document import (
@@ -29,9 +30,15 @@ from dms.dms.doctype.gmp_document.gmp_document import (
     WF_PENDING_REGULATORY,
     WF_PENDING_SUPERVISOR,
     WF_QA_IN_PROGRESS,
+    WF_REVISION,
     WF_UNDER_REVIEW,
+    _user_departments,
     complete_qa_review,
+    create_revision,
     delegate_qa_review,
+    get_my_pending_count,
+    has_permission,
+    set_return_reason,
     skip_qa_reviewer,
 )
 from dms.install import _ensure_gmp_workflow, _ensure_role, restore_workflow_defaults
@@ -223,6 +230,13 @@ class TestWorkflowChain(FrappeTestCase):
         _ensure_signature(PROXY)
         _ensure_signature(QA_R1)
         _grant_role(PROXY, PROXY_ROLE)
+        # The roles the shipped workflow gates on (install.py). Without them a
+        # user cannot even read the document — get_transitions checks read
+        # permission — let alone take a transition.
+        _grant_role(PREPARER, "DMS Initiator")
+        for email in (SUPERVISOR, MANAGER, QA_SUP, REG_MGR, QA_R1, QA_R2, QA_R3):
+            _grant_role(email, "DMS Approver")
+        _grant_role(QA_APPR, "QA Manager")
         _configure_settings()
         _ensure_gmp_workflow()
         restore_workflow_defaults()
@@ -551,6 +565,7 @@ class TestWorkflowChain(FrappeTestCase):
         doc.reload()
 
         successor = frappe.copy_doc(doc)
+        successor.docstatus = 0  # copy_doc carries the source's submitted docstatus
         successor.revision_of = doc.name
         successor.reason_for_change = "timeline reset check"
         successor.document_name_en = "GMP-Chain-TimelineReset-r2"
@@ -781,6 +796,7 @@ class TestWorkflowChain(FrappeTestCase):
             and t.allowed == "DMS Approver"
         )
         before_rows = len(wf.transitions)
+        original = {"allowed": row.allowed, "condition": row.condition}
         edited_condition = "doc.supervisor == frappe.session.user"
 
         try:
@@ -804,7 +820,11 @@ class TestWorkflowChain(FrappeTestCase):
                 before_rows,
             )
         finally:
-            restore_workflow_defaults()
+            # Put the row back by hand: restore_workflow_defaults() treats a row
+            # whose role AND condition both differ as one the site added, so it
+            # would leave this one behind and append a fresh copy beside it.
+            frappe.db.set_value("Workflow Transition", row.name, original)
+            frappe.db.commit()
 
     def test_restore_defaults_is_idempotent_with_twin_rows(self):
         """The twins make (state, action) non-unique; a restore that keyed on
@@ -843,6 +863,272 @@ class TestWorkflowChain(FrappeTestCase):
         self.assertEqual(
             sorted(t.allowed for t in repaired), ["DMS Approver", PROXY_ROLE]
         )
+
+    # ------------------------------------------------------------------ #
+    #  Real permissions: actors holding only their workflow role         #
+    # ------------------------------------------------------------------ #
+    # Everything above saves with ignore_permissions. These go through the
+    # same checks a browser session does: insert() and apply_workflow() as a
+    # user who holds DMS Initiator or DMS Approver and nothing broader.
+
+    def _act(self, doc, action, as_user):
+        frappe.set_user(as_user)
+        try:
+            apply_workflow(frappe.get_doc("GMP Document", doc.name), action)
+        finally:
+            frappe.set_user("Administrator")
+        doc.reload()
+        return doc
+
+    def _as(self, user, fn, *args, **kwargs):
+        frappe.set_user(user)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            frappe.set_user("Administrator")
+
+    def _force_effective(self, doc):
+        doc.db_set(
+            {"docstatus": 1, "workflow_status": "Approved", "is_active": 1}, update_modified=False
+        )
+        doc.reload()
+        return doc
+
+    def test_initiator_creates_a_draft_with_their_own_permissions(self):
+        attachment = self._dummy_attachment("GMP-Chain-Perm-Create").file_url
+
+        def create():
+            doc = frappe.new_doc("GMP Document")
+            doc.update(
+                {
+                    "document_name_fa": "تست",
+                    "document_name_en": "GMP-Chain-Perm-Create",
+                    "document_type": "SOP",
+                    "department": DEPT,
+                    "gmp_impact": "Major",
+                    "validity_period": "3 Years",
+                    "word_template": WORD_TEMPLATE,
+                    "attachment_file": attachment,
+                }
+            )
+            return doc.insert()
+
+        doc = self._as(PREPARER, create)
+        self.assertEqual(doc.prepared_by, PREPARER)
+
+    def test_restricted_actors_walk_the_chain_with_apply_workflow(self):
+        """Frappe sets the next state BEFORE it checks write permission, so a
+        write gate keyed on the in-memory state asked about the next stage's
+        actor and refused every one of these clicks."""
+        doc = self._make_draft("GMP-Chain-Perm-Walk")
+        for action, user, state in (
+            ("Submit for Approval", PREPARER, WF_PENDING_SUPERVISOR),
+            ("Approve (Supervisor)", SUPERVISOR, WF_UNDER_REVIEW),
+            ("Approve as Reviewer", MANAGER, WF_PENDING_QA_SUPERVISOR),
+            ("Approve (QA Supervisor)", QA_SUP, WF_PENDING_REGULATORY),
+            ("Validate (Regulatory)", REG_MGR, WF_PENDING_MANAGER),
+            ("Approve (Manager)", MANAGER, WF_PENDING_FINAL_QA),
+        ):
+            doc = self._act(doc, action, user)
+            self.assertEqual(doc.workflow_status, state, action)
+
+    def test_only_the_waiting_actor_may_edit(self):
+        doc = self._act(self._make_draft("GMP-Chain-Perm-Edit"), "Submit for Approval", PREPARER)
+        self.assertTrue(has_permission(doc, "write", SUPERVISOR))
+        self.assertFalse(has_permission(doc, "write", PREPARER))
+        self.assertFalse(has_permission(doc, "write", MANAGER))
+
+        def edit():
+            d = frappe.get_doc("GMP Document", doc.name)
+            d.document_name_fa = "ویرایش"
+            d.save()
+
+        with self.assertRaises(frappe.PermissionError):
+            self._as(PREPARER, edit)
+
+    def test_actor_fields_sent_by_the_client_do_not_grant_write(self):
+        doc = self._act(self._make_draft("GMP-Chain-Perm-Forge"), "Submit for Approval", PREPARER)
+        doc.supervisor = MANAGER  # what a forged REST payload would carry
+        self.assertFalse(has_permission(doc, "write", MANAGER))
+
+    def test_preparer_cancels_a_revision_waiting_on_the_supervisor(self):
+        source = self._force_effective(self._make_draft("GMP-Chain-Perm-Cancel"))
+        rev = frappe.get_doc(
+            "GMP Document", self._as(PREPARER, create_revision, source.name, "Update")
+        )
+        self.assertEqual(rev.prepared_by, PREPARER)
+
+        def attach():
+            d = frappe.get_doc("GMP Document", rev.name)
+            d.attachment_file = self._dummy_attachment("GMP-Chain-Perm-Cancel-2").file_url
+            d.save()
+
+        self._as(PREPARER, attach)
+        rev = self._act(rev, "Submit for Approval", PREPARER)
+        rev = self._act(rev, "Cancel Revision", PREPARER)
+        self.assertEqual(rev.workflow_status, "Revision Cancelled")
+
+    def test_revision_needs_someone_who_can_submit_the_draft(self):
+        source = self._force_effective(self._make_draft("GMP-Chain-Perm-Author"))
+        with self.assertRaises(frappe.PermissionError):
+            self._as(SUPERVISOR, create_revision, source.name, "Update")
+
+    # ------------------------------------------------------------------ #
+    #  Effective date                                                    #
+    # ------------------------------------------------------------------ #
+
+    def test_a_scheduled_date_does_not_block_later_approvers(self):
+        """The privilege check used to fire on every save while the box was
+        ticked, so the first approver after the manager who set the date was
+        refused — and every one after them."""
+        doc = self._make_draft("GMP-Chain-Eff-Scheduled")
+        future = frappe.utils.add_days(frappe.utils.today(), 30)
+        doc.set_effective_date = 1
+        doc.effective_date = future
+        doc.save(ignore_permissions=True)  # as Administrator, a privileged user
+
+        doc = self._act(doc, "Submit for Approval", PREPARER)
+        doc = self._act(doc, "Approve (Supervisor)", SUPERVISOR)
+        self.assertEqual(doc.workflow_status, WF_UNDER_REVIEW)
+        self.assertEqual(str(doc.effective_date), future)
+
+    def test_setting_the_date_still_needs_the_privilege(self):
+        doc = self._make_draft("GMP-Chain-Eff-Denied")
+
+        def schedule():
+            d = frappe.get_doc("GMP Document", doc.name)
+            d.set_effective_date = 1
+            d.effective_date = frappe.utils.add_days(frappe.utils.today(), 30)
+            d.save()
+
+        with self.assertRaises(frappe.PermissionError):
+            self._as(PREPARER, schedule)
+
+    def test_unticking_clears_a_manual_date(self):
+        doc = self._make_draft("GMP-Chain-Eff-Untick")
+        doc.set_effective_date = 1
+        doc.effective_date = frappe.utils.add_days(frappe.utils.today(), 30)
+        doc.save(ignore_permissions=True)
+        self.assertTrue(doc.expiry_date)
+
+        doc.set_effective_date = 0
+        doc.save(ignore_permissions=True)
+        doc.reload()
+        self.assertFalse(doc.effective_date)
+        self.assertFalse(doc.expiry_date)
+        self.assertFalse(doc.next_revision_date)
+
+    # ------------------------------------------------------------------ #
+    #  Return reasons                                                    #
+    # ------------------------------------------------------------------ #
+
+    def _return_comments(self, doc):
+        return frappe.get_all(
+            "Comment",
+            filters={
+                "reference_doctype": "GMP Document",
+                "reference_name": doc.name,
+                "content": ["like", "Revision requested by%"],
+            },
+            pluck="content",
+            order_by="creation asc",
+        )
+
+    def test_return_reason_is_recorded_then_cleared(self):
+        doc = self._act(self._make_draft("GMP-Chain-Return"), "Submit for Approval", PREPARER)
+        self._as(SUPERVISOR, set_return_reason, doc.name, "Fix section 3")
+        doc = self._act(doc, "Return to Preparer", SUPERVISOR)
+
+        self.assertEqual(doc.workflow_status, WF_REVISION)
+        self.assertEqual(doc.last_revision_request, "Fix section 3")
+        self.assertEqual(doc.last_revision_by, SUPERVISOR)
+        self.assertIn("Fix section 3", self._return_comments(doc)[-1])
+
+        # Moving forward again clears it, so a later return recorded without
+        # a reason is never logged under the supervisor's words.
+        doc = self._act(doc, "Submit for Approval", PREPARER)
+        self.assertFalse(doc.last_revision_request)
+        doc = self._act(doc, "Return to Preparer", SUPERVISOR)
+        self.assertNotIn("Fix section 3", self._return_comments(doc)[-1])
+
+    def test_only_the_waiting_actor_may_give_a_return_reason(self):
+        doc = self._act(self._make_draft("GMP-Chain-Return-Denied"), "Submit for Approval", PREPARER)
+        with self.assertRaises(frappe.PermissionError):
+            self._as(MANAGER, set_return_reason, doc.name, "Not mine to return")
+
+    # ------------------------------------------------------------------ #
+    #  Fields only the controller writes                                 #
+    # ------------------------------------------------------------------ #
+
+    def test_a_draft_save_cannot_forge_the_approval_record(self):
+        other = self._force_effective(self._make_draft("GMP-Chain-Forge-Target"))
+        doc = self._make_draft("GMP-Chain-Forge")
+
+        def forge():
+            d = frappe.get_doc("GMP Document", doc.name)
+            d.revision_of = other.name  # approval would retire `other`
+            d.ceo = QA_R1
+            d.ceo_name = "Forged"
+            d.qa_approver_on_behalf_of = QA_R2
+            d.save()
+
+        self._as(PREPARER, forge)
+        doc.reload()
+        self.assertFalse(doc.revision_of)
+        self.assertFalse(doc.ceo)
+        self.assertFalse(doc.ceo_name)
+        self.assertFalse(doc.qa_approver_on_behalf_of)
+
+    def test_a_new_document_starts_without_an_approval_record(self):
+        doc = frappe.new_doc("GMP Document")
+        doc.update(
+            {
+                "document_name_fa": "تست",
+                "document_name_en": "GMP-Chain-Forge-New",
+                "document_type": "SOP",
+                "department": DEPT,
+                "gmp_impact": "Major",
+                "validity_period": "3 Years",
+                "prepared_by": PREPARER,
+                "word_template": WORD_TEMPLATE,
+                "attachment_file": self._dummy_attachment("GMP-Chain-Forge-New").file_url,
+                "ceo": QA_R1,
+                "approved_by": QA_R2,
+                "supervisor_on_behalf_of": QA_R3,
+            }
+        )
+        doc.insert(ignore_permissions=True)
+        doc.reload()
+        self.assertFalse(doc.ceo)
+        self.assertFalse(doc.approved_by)
+        self.assertFalse(doc.supervisor_on_behalf_of)
+
+    # ------------------------------------------------------------------ #
+    #  Visibility                                                        #
+    # ------------------------------------------------------------------ #
+
+    def test_a_left_employee_record_grants_no_department(self):
+        old = frappe.new_doc("Employee")
+        old.name = f"GMP-CHN-EMP-{frappe.generate_hash(length=8)}"
+        old.first_name = "left"
+        old.employee_name = "left"
+        old.user_id = QA_R3
+        old.department = "GMP-Chain Former Department"
+        old.status = "Left"
+        old.flags.ignore_mandatory = True
+        old.db_insert()
+        try:
+            frappe.flags.pop("dms_user_departments", None)
+            self.assertNotIn("GMP-Chain Former Department", _user_departments(QA_R3))
+            self.assertIn(DEPT, _user_departments(QA_R3))
+        finally:
+            frappe.db.delete("Employee", {"name": old.name})
+            frappe.flags.pop("dms_user_departments", None)
+
+    def test_pending_counts_of_another_user_are_private(self):
+        with self.assertRaises(frappe.PermissionError):
+            self._as(PREPARER, get_my_pending_count, SUPERVISOR)
+        self.assertIn("total", self._as(PREPARER, get_my_pending_count))
 
 
 if __name__ == "__main__":

@@ -12,8 +12,10 @@ def execute():
     if not frappe.db.exists("Workflow", "GMP Document Workflow"):
         return
 
+    # The per-workflow state rows live in the child table "Workflow Document
+    # State"; "Workflow State" is the global master, which has no doc_status.
     frappe.db.sql("""
-        UPDATE `tabWorkflow State`
+        UPDATE `tabWorkflow Document State`
         SET `doc_status` = CAST(`doc_status` AS SIGNED)
         WHERE `parent` = 'GMP Document Workflow'
     """)

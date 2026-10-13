@@ -19,6 +19,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 import frappe
@@ -1252,3 +1253,317 @@ class TestGMPDocument(FrappeTestCase):
         download_watermarked_pdf(doc.name)
         self.assertEqual(frappe.local.response.type, "download")
         self.assertTrue(frappe.local.response.filecontent.startswith(b"%PDF"))
+
+    # ------------------------------------------------------------------ #
+    #  Reference loops                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _add_reference_row(self, parent, target, reference_type="References"):
+        """Write a reference row straight to the table, as repointing does."""
+        row = frappe.get_doc(
+            {
+                "doctype": "GMP Document Reference",
+                "parent": parent,
+                "parenttype": "GMP Document",
+                "parentfield": "references",
+                "referenced_document": target,
+                "reference_type": reference_type,
+            }
+        )
+        row.db_insert()
+
+    def test_a_loop_elsewhere_does_not_block_a_save(self):
+        """Approving a revision repoints its dependents onto it, so an SOP and
+        a form that cite each other end up in a loop. A document that merely
+        references one of them is not part of that loop."""
+        a = self._build_doc(document_name_en="GMP-Test-Loop-A")
+        a.insert(ignore_permissions=True)
+        b = self._build_doc(document_name_en="GMP-Test-Loop-B")
+        b.insert(ignore_permissions=True)
+        self._add_reference_row(a.name, b.name)
+        self._add_reference_row(b.name, a.name)
+
+        c = self._build_doc(document_name_en="GMP-Test-Loop-C")
+        c.append("references", {"referenced_document": a.name, "reference_type": "References"})
+        c.insert(ignore_permissions=True)  # must not raise
+
+    def test_a_reference_back_to_itself_is_refused(self):
+        a = self._build_doc(document_name_en="GMP-Test-Loop-Self-A")
+        a.insert(ignore_permissions=True)
+        b = self._build_doc(document_name_en="GMP-Test-Loop-Self-B")
+        b.append("references", {"referenced_document": a.name, "reference_type": "References"})
+        b.insert(ignore_permissions=True)
+
+        a.reload()
+        a.append("references", {"referenced_document": b.name, "reference_type": "References"})
+        with self.assertRaises(frappe.ValidationError):
+            a.save(ignore_permissions=True)
+
+    def test_repointing_moves_only_live_references(self):
+        from dms.dms.doctype.gmp_document.gmp_document import create_revision
+
+        pred = self._build_doc(document_name_en="GMP-Test-Repoint-Pred")
+        pred.insert(ignore_permissions=True)
+        pred = self._force_approved(pred)
+        rev = frappe.get_doc("GMP Document", create_revision(pred.name, "Update"))
+
+        def citing(en, reference_type="References", **state):
+            d = self._build_doc(document_name_en=en)
+            d.append("references", {"referenced_document": pred.name, "reference_type": reference_type})
+            d.insert(ignore_permissions=True)
+            frappe.db.set_value(
+                "GMP Document",
+                d.name,
+                {"docstatus": 1, "workflow_status": "Approved", "is_active": 1, **state},
+                update_modified=False,
+            )
+            return d.name
+
+        live = citing("GMP-Test-Repoint-Live")
+        retired = citing("GMP-Test-Repoint-Retired", workflow_status="Obsolete", is_active=0)
+        pinned = citing("GMP-Test-Repoint-Pinned", reference_type="Supersedes")
+
+        rev._repoint_references_to_self()
+
+        def target(name):
+            return frappe.get_all(
+                "GMP Document Reference", filters={"parent": name}, pluck="referenced_document"
+            )
+
+        self.assertEqual(target(live), [rev.name])
+        self.assertEqual(target(retired), [pred.name])
+        self.assertEqual(target(pinned), [pred.name])
+
+    # ------------------------------------------------------------------ #
+    #  Daily sweeps                                                      #
+    # ------------------------------------------------------------------ #
+
+    def test_expiry_holds_even_when_the_rerender_fails(self):
+        """A render failure used to roll the expiry back with it, keeping an
+        expired document in circulation as a controlled copy."""
+        from dms.dms.doctype.gmp_document.gmp_document import expire_gmp_documents
+
+        doc = self._build_doc(document_name_en="GMP-Test-Expire-RenderFail")
+        doc.insert(ignore_permissions=True)
+        doc = self._force_approved(doc)
+        doc.db_set("expiry_date", frappe.utils.add_days(frappe.utils.today(), -1), update_modified=False)
+
+        with patch(
+            f"{CONTROLLER}.GMPDocument._render_and_generate_pdf",
+            side_effect=RuntimeError("soffice down"),
+        ):
+            expire_gmp_documents()
+
+        doc.reload()
+        self.assertEqual(cint(doc.is_active), 0)
+        self.assertEqual(doc.workflow_status, "Obsolete")
+
+    def test_activation_rerenders_with_the_publish_date(self):
+        from dms.dms.doctype.gmp_document.gmp_document import activate_effective_documents
+
+        doc = self._build_doc(document_name_en="GMP-Test-Activate-Rerender")
+        doc.insert(ignore_permissions=True)
+        frappe.db.set_value(
+            "GMP Document",
+            doc.name,
+            {
+                "docstatus": 1,
+                "workflow_status": "Approved",
+                "is_active": 0,
+                "effective_date": frappe.utils.today(),
+            },
+            update_modified=False,
+        )
+
+        rendered = {}
+
+        def render(self_doc):
+            rendered[self_doc.name] = self_doc.publish_date
+
+        with patch(
+            f"{CONTROLLER}.GMPDocument._render_and_generate_pdf", autospec=True, side_effect=render
+        ):
+            activate_effective_documents()
+
+        doc.reload()
+        self.assertEqual(cint(doc.is_active), 1)
+        self.assertEqual(str(rendered.get(doc.name)), frappe.utils.today())
+
+    # ------------------------------------------------------------------ #
+    #  Template rendering                                                #
+    # ------------------------------------------------------------------ #
+
+    def _docx_with(self, lines):
+        from docx import Document as DocxDocument
+
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        path = os.path.join(tmpdir, "template.docx")
+        d = DocxDocument()
+        for line in lines:
+            d.add_paragraph(line)
+        d.save(path)
+        return path
+
+    def test_template_tags_cannot_reach_python(self):
+        """The uploaded file is the Jinja template, and its author is the
+        preparer: a hidden tag must not run code on the server."""
+        from docxtpl import DocxTemplate
+        from jinja2.exceptions import TemplateError
+
+        from dms.dms.doctype.gmp_document.format_renderers import _render_cell_text
+        from dms.dms.doctype.gmp_document.gmp_document import _render_docx_template
+
+        payload = "{{ cycler.__init__.__globals__.os.getpid() }}"
+        with self.assertRaises(TemplateError):
+            _render_docx_template(DocxTemplate(self._docx_with([payload])), {})
+        with self.assertRaises(TemplateError):
+            _render_cell_text(payload, {})
+
+    def test_values_with_markup_characters_render_as_text(self):
+        """Unescaped, "&" was dropped from the body and broke a header."""
+        from docx import Document as DocxDocument
+        from docxtpl import DocxTemplate
+
+        from dms.dms.doctype.gmp_document.format_renderers import _render_cell_text
+        from dms.dms.doctype.gmp_document.gmp_document import _render_docx_template
+
+        path = self._docx_with(["{{ department_name }}", "{{ limit }}"])
+        template = DocxTemplate(path)
+        _render_docx_template(template, {"department_name": "Research & Development", "limit": "pH < 7"})
+        out = path + ".rendered.docx"
+        template.save(out)
+
+        texts = [p.text for p in DocxDocument(out).paragraphs]
+        self.assertIn("Research & Development", texts)
+        self.assertIn("pH < 7", texts)
+        # Spreadsheet cells are not markup: values land verbatim.
+        self.assertEqual(_render_cell_text("{{ d }}", {"d": "R&D"}), "R&D")
+
+    # ------------------------------------------------------------------ #
+    #  Downloads                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _attach_pdf(self, doc, file_name, label):
+        from reportlab.pdfgen import canvas
+
+        buf = BytesIO()
+        c = canvas.Canvas(buf)
+        c.drawString(100, 750, f"{label} {frappe.generate_hash(length=8)}")
+        c.save()
+        return frappe.get_doc(
+            {
+                "doctype": "File",
+                "file_name": file_name,
+                "is_private": 1,
+                "content": buf.getvalue(),
+                "attached_to_doctype": "GMP Document",
+                "attached_to_name": doc.name,
+            }
+        ).insert(ignore_permissions=True)
+
+    def test_an_attached_pdf_is_never_served_as_the_controlled_copy(self):
+        from dms.dms.doctype.gmp_document.gmp_document import _resolve_base_pdf_path
+
+        doc = self._build_doc(document_name_en="GMP-Test-BasePdf-Lookup")
+        doc.insert(ignore_permissions=True)
+        doc = self._force_approved(doc)
+        base = self._attach_pdf(doc, f"{doc.name}.pdf", "base")
+        self._attach_pdf(doc, "scanned-copy.pdf", "scan")  # newer
+
+        self.assertEqual(_resolve_base_pdf_path(doc), base.get_full_path())
+
+    def test_a_regeneration_inside_a_download_is_committed(self):
+        """Downloads are GET requests, which Frappe rolls back."""
+        from dms.dms.doctype.gmp_document.gmp_document import _resolve_base_pdf_path
+
+        doc = self._build_doc(document_name_en="GMP-Test-BasePdf-Regen")
+        doc.insert(ignore_permissions=True)
+        doc = self._force_approved(doc)
+
+        def render(self_doc):
+            self_doc._own_private_file(b"%PDF-1.4 regenerated", f"{self_doc.name}.pdf")
+
+        frappe.local.flags.commit = False
+        try:
+            with patch(
+                f"{CONTROLLER}.GMPDocument._render_and_generate_pdf", autospec=True, side_effect=render
+            ):
+                path = _resolve_base_pdf_path(doc)
+            self.assertTrue(path.endswith(f"{doc.name}.pdf"))
+            self.assertTrue(frappe.local.flags.commit)
+        finally:
+            frappe.local.flags.commit = False
+
+    def test_a_cancelled_document_downloads_as_obsolete(self):
+        from dms.dms.doctype.gmp_document.gmp_document import download_watermarked_pdf
+
+        doc = self._build_doc(document_name_en="GMP-Test-Cancelled-Download")
+        doc.insert(ignore_permissions=True)
+        frappe.db.set_value(
+            "GMP Document",
+            doc.name,
+            {"docstatus": 2, "workflow_status": "Obsolete", "is_active": 0},
+            update_modified=False,
+        )
+        self._attach_pdf(doc, f"{doc.name}.pdf", "base")
+
+        download_watermarked_pdf(doc.name, "plain")
+        self.assertIn("OBSOLETE", frappe.local.response.filename)
+
+    # ------------------------------------------------------------------ #
+    #  Tree                                                              #
+    # ------------------------------------------------------------------ #
+
+    def test_tree_shows_the_version_in_force(self):
+        """A revision approved for a future date must not hide the version
+        that is actually in force, nor read as OBSOLETE."""
+        from dms.dms.doctype.gmp_document.gmp_document import create_revision, get_dms_tree_children
+
+        original = self._build_doc(document_name_en="GMP-Test-Tree-Origin")
+        original.insert(ignore_permissions=True)
+        original = self._force_approved(original)
+        rev_name = create_revision(original.name, "Scheduled update")
+        frappe.db.set_value(
+            "GMP Document",
+            rev_name,
+            {
+                "docstatus": 1,
+                "workflow_status": "Approved",
+                "is_active": 0,
+                "effective_date": frappe.utils.add_days(frappe.utils.today(), 30),
+            },
+            update_modified=False,
+        )
+
+        nodes = get_dms_tree_children(f"Type::{TEST_DEPT}::SOP")
+        family = [n for n in nodes if n["value"] in (original.name, rev_name)]
+        self.assertEqual([n["value"] for n in family], [original.name])
+        self.assertEqual(family[0]["indicator"], "ACTIVE")
+
+    # ------------------------------------------------------------------ #
+    #  Name segments                                                     #
+    # ------------------------------------------------------------------ #
+
+    def test_a_type_code_cannot_hold_a_name_separator(self):
+        for code in ("SOP-A", "SOP_A", "SOP%"):
+            with self.assertRaises(frappe.ValidationError, msg=code):
+                frappe.get_doc(
+                    {"doctype": "GMP Document Type", "code": code, "type_name": code}
+                ).insert(ignore_permissions=True)
+
+    def test_a_used_type_cannot_be_renamed(self):
+        self._build_doc(document_name_en="GMP-Test-TypeRename", document_type="WI").insert(
+            ignore_permissions=True
+        )
+        with self.assertRaises(frappe.ValidationError):
+            frappe.rename_doc("GMP Document Type", "WI", "WIX", force=True)
+        self.assertTrue(frappe.db.exists("GMP Document Type", "WI"))
+
+    def test_a_department_abbreviation_with_a_dash_is_refused(self):
+        frappe.db.set_value("Department", TEST_DEPT, "custom_abbr", "Q-A")
+        try:
+            with self.assertRaises(frappe.ValidationError):
+                self._build_doc(document_name_en="GMP-Test-BadAbbr").insert(ignore_permissions=True)
+        finally:
+            frappe.db.set_value("Department", TEST_DEPT, "custom_abbr", TEST_DEPT_ABBR)
