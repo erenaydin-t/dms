@@ -17,7 +17,11 @@
   "document_font",
   "column_break_font_1",
   "preserve_symbol_fonts",
-  "document_font_file"
+  "document_font_file",
+  "section_file_storage",
+  "store_files_on_s3",
+  "column_break_storage_1",
+  "storage_summary"
  ],
  "fields": [
   {
@@ -111,11 +115,32 @@
    "fieldname": "document_font_file",
    "fieldtype": "Attach",
    "label": "Font File (.ttf) for Watermarks"
+  },
+  {
+   "fieldname": "section_file_storage",
+   "fieldtype": "Section Break",
+   "label": "File Storage"
+  },
+  {
+   "default": "0",
+   "description": "Store the files of GMP Documents — source templates, rendered Word/Excel/Visio files, signed PDFs and signature snapshots — in the bucket configured in <b>S3 File Attachment</b> instead of on this server. Documents are still rendered on this server; only the results are kept in the bucket. Files already stored stay where they are until you click <b>Move Stored Files</b>. Needs the frappe_s3_attachment app, version 16.3.0 or later.",
+   "fieldname": "store_files_on_s3",
+   "fieldtype": "Check",
+   "label": "Store DMS Files on S3"
+  },
+  {
+   "fieldname": "column_break_storage_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "storage_summary",
+   "fieldtype": "HTML",
+   "label": "Stored Files"
   }
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-13 00:00:00.000000",
+ "modified": "2026-10-14 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "DMS",
  "name": "DMS Settings",

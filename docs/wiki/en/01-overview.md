@@ -36,12 +36,6 @@ The DMS app manages **controlled documents** (SOPs, Work Instructions, Forms, Pr
 
 ### File handling
 
-- The uploaded source file is copied to a **controlled private file** named after the document (`QA-SOP-0001-1.docx`); a SHA-256 integrity hash is stored on the document.
+- The uploaded source file is copied into the document's own storage as its **controlled source** (`QA-SOP-0001-1.docx`), and its SHA-256 integrity hash is stored on the document. The upload itself is removed.
 - On QA approval the source is rendered twice: a clean deliverable (no stamp) and a **base PDF** carrying signatures + QA stamp. Watermarks are applied dynamically at download time, so status changes never require re-rendering.
-- ⚠️ **S3 offloading must be disabled for DMS files.** If `frappe_s3_attachment` (or similar) is installed, add the DMS doctypes to the exemption list in `site_config.json` — LibreOffice rendering, hashing and re-stamping read these files from local disk across requests:
-
-```json
-"ignore_s3_upload_for_doctype": ["Data Import", "GMP Document", "GMP Word Template", "Employee"]
-```
-
-(`Employee` is included so signature images stay local for PDF embedding.)
+- **The DMS keeps these files itself, not as attachments** (since 2.8.0): the source, the deliverable, the base PDF and the signature snapshots of every stage. They live on the server's disk or — with *Store DMS Files on S3* in DMS Settings — in the S3 bucket of `frappe_s3_attachment`, and are listed in **DMS Stored File** with their SHA-256, which is checked every time a file is read. They leave only through the DMS download actions, under the DMS rules (see *Roles*): an attachment would be downloadable by everyone who can read the document. Documents are always rendered on the server; with S3 only the results are kept in the bucket. See *Administration › File storage*.

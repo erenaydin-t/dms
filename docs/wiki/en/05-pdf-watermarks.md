@@ -30,5 +30,7 @@ The base PDF embeds a stamp image next to the `{{ qa_stamp }}` tag: **approved**
 
 ## Integrity
 
-- The controlled source file is renamed to the document ID and its **SHA-256 hash** is stored on the record (`file_integrity_hash`).
-- Base-PDF regeneration (if the file disappears from disk) is manager-only and automatic on the next controlled download by a manager.
+- The controlled source file is stored under the document ID and its **SHA-256 hash** is stored on the record (`file_integrity_hash`).
+- Every stored file — source, deliverable, base PDF, signature snapshots — is checked against its own SHA-256 (*DMS Stored File*) whenever it is read. A file changed outside the DMS is refused, never watermarked and served.
+- The base PDF is never downloadable as it is: it leaves only through these watermarked downloads.
+- Base-PDF regeneration (if the file is missing) is manager-only and automatic on the next controlled download by a manager.

@@ -16,6 +16,7 @@ import frappe
 from frappe.model.workflow import apply_workflow
 from frappe.tests.utils import FrappeTestCase
 
+from dms.dms import storage
 from dms.dms.doctype.gmp_document.gmp_document import (
     PROXY_ROLE,
     QA_APPROVED,
@@ -326,6 +327,9 @@ class TestWorkflowChain(FrappeTestCase):
         )
 
     def _file_bytes(self, file_url):
+        stored = storage.parse_file_url(file_url)
+        if stored:
+            return storage.read(*stored)
         path = frappe.get_doc("File", {"file_url": file_url}).get_full_path()
         with open(path, "rb") as fh:
             return fh.read()
@@ -650,16 +654,12 @@ class TestWorkflowChain(FrappeTestCase):
         )
         doc = self._advance(doc, WF_UNDER_REVIEW, SUPERVISOR)
 
-        # The snapshot is a distinct file belonging to this document...
+        # The snapshot is a distinct file stored for this document...
         self.assertNotEqual(doc.supervisor_signature, sig_url)
-        snapshot = frappe.db.get_value(
-            "File",
-            {"file_url": doc.supervisor_signature},
-            ["attached_to_doctype", "attached_to_name"],
-            as_dict=True,
-        )
-        self.assertEqual(snapshot.attached_to_doctype, "GMP Document")
-        self.assertEqual(snapshot.attached_to_name, doc.name)
+        snapshot = storage.parse_file_url(doc.supervisor_signature)
+        self.assertEqual(snapshot[0], doc.name)
+        self.assertTrue(storage.exists(*snapshot))
+        self.assertFalse(frappe.db.exists("File", {"file_url": doc.supervisor_signature}))
 
         # ...and the employee's own File was not re-parented.
         after = frappe.db.get_value(
@@ -668,12 +668,14 @@ class TestWorkflowChain(FrappeTestCase):
         self.assertEqual(after.attached_to_doctype, before.attached_to_doctype)
         self.assertEqual(after.attached_to_name, before.attached_to_name)
 
-        # Deleting the document must not take the employee's signature with it.
+        # Deleting the document must not take the employee's signature with it
+        # — only its own copy.
         frappe.delete_doc("GMP Document", doc.name, force=True, ignore_permissions=True)
         self.assertTrue(
             frappe.db.exists("File", {"file_url": sig_url}),
             "deleting the document destroyed the employee's signature file",
         )
+        self.assertFalse(storage.exists(*snapshot))
 
     def test_proxy_reviewer_signature_beats_the_actual_actor(self):
         doc = self._advance(

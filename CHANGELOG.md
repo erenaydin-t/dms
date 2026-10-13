@@ -4,6 +4,27 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] - 2026-10-14
+
+### Added
+- **GMP Document files can be kept in S3.** With *Store DMS Files on S3* (DMS Settings › File Storage) a document's source template, rendered deliverable, signed base PDF and signature snapshots go to the bucket of `frappe_s3_attachment` (16.3.0 or later) instead of the server's disk. Documents are still rendered on the server — it fetches what it renders into a temporary, verified cache and stores the results in the bucket. **Move Stored Files** moves existing files either way in the background, each copied, read back and checked against its SHA-256 before the old copy goes; the table in DMS Settings shows how many files are where.
+- **DMS Stored File** lists every stored file with its location and SHA-256. Every read is checked against it: a file changed outside the DMS — on the disk or in the bucket — is refused and logged, never rendered, served or regenerated over.
+- Signature images and the watermark font file are read from the bucket when `frappe_s3_attachment` moved them there, so *Employee* no longer has to be kept out of S3.
+
+### Security
+- **Department readers could download the unwatermarked PDF and the clean Word file.** A document's files were attachments, and Frappe lets everyone who can read a document download all its attachments — around the watermark and the managers-only Word download. The DMS now stores them itself and serves each under its own rule: watermarked PDFs and signature images to every reader; the source to the people named on the document and the unrestricted roles; the clean deliverable to the unrestricted roles; the signed base PDF to nobody (it leaves only watermarked).
+- A file stored for one document can no longer be attached to another by putting its link in the attachment field.
+
+### Changed
+- Writing a stored file follows the database transaction: a new version is written next to the old one, which is removed only after the commit; a rolled-back approval or re-render leaves the previous version in place.
+- Deleting a draft also deletes its stored files.
+- The *Attachment* field shows the stored source's file name; its link is the DMS download, under the rule above.
+- CI runs the S3 tests against a real S3-compatible server (SeaweedFS) through `frappe_s3_attachment`. 26 new tests.
+
+### Upgrade notes
+- `bench --site <site> migrate` moves every document's files from its attachments into the DMS storage on the disk, one document at a time (patch `v2_8_0.move_document_files_to_storage`); a document that fails is logged and picked up again the next time one of its files is needed. Then `bench build --app dms` and `bench restart`.
+- For S3: update `frappe_s3_attachment` to 16.3.0, tick *Store DMS Files on S3*, click *Move Stored Files*. Keep `"GMP Document"` in `ignore_s3_upload_for_doctype`; `"Employee"` and `"GMP Word Template"` can be removed (see *Administration › File storage*).
+
 ## [2.7.2] - 2026-10-13
 
 ### Security

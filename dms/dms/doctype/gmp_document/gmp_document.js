@@ -16,6 +16,7 @@ frappe.ui.form.on("GMP Document", {
         toggle_effective_date_controls(frm);
         add_qa_queue_ui(frm);
         render_reference_tree(frm);
+        show_stored_file_name(frm);
     },
 
     set_effective_date(frm) {
@@ -104,6 +105,21 @@ function ask_return_reason(frm) {
         };
     });
 }
+
+
+/**
+ * The source template is kept in the DMS storage and served by document_file(),
+ * so the field holds that endpoint's URL; show just the file name it serves.
+ */
+function show_stored_file_name(frm) {
+    const control = frm.fields_dict.attachment_file;
+    const url = frm.doc.attachment_file || "";
+    if (!control || !control.$value || !url.startsWith(STORED_FILE_ENDPOINT + "?")) return;
+    const file = new URLSearchParams(url.split("?")[1]).get("file");
+    if (file) control.$value.find(".attached-file-link").text(file);
+}
+
+const STORED_FILE_ENDPOINT = "/api/method/dms.dms.doctype.gmp_document.gmp_document.document_file";
 
 
 /**

@@ -10,6 +10,7 @@ on download according to the document's current status.
 
 import hashlib
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -18,13 +19,14 @@ from io import BytesIO
 
 import frappe
 from frappe import _
-from frappe.utils import add_months, add_years, cint, cstr, get_files_path, getdate, now_datetime, today
+from frappe.utils import add_months, add_years, cint, cstr, getdate, now_datetime, today
 from frappe.utils.nestedset import NestedSet
-from frappe.core.doctype.file.utils import get_content_hash
 
 from docx.shared import Mm
 from docxtpl import DocxTemplate, InlineImage
 from jinja2.sandbox import SandboxedEnvironment
+
+from dms.dms import storage
 
 from .font_enforcement import enforce_docx_font, enforce_vsdx_font, font_covers, shape_rtl
 
@@ -577,8 +579,11 @@ class GMPDocument(NestedSet):
         # attachment is inherited iff a File with this url exists AND every File
         # with it is attached to the predecessor. The predecessor's own file is
         # therefore never reused, let alone replaced, by a revision.
-        inherited_attachment = False
-        if self.attachment_file:
+        #
+        # Since 2.8.0 the predecessor's source is a stored file, whose URL no
+        # upload ever produces — so that URL is always inherited.
+        inherited_attachment = bool(storage.parse_file_url(self.attachment_file))
+        if self.attachment_file and not inherited_attachment:
             files = frappe.get_all(
                 "File",
                 filters={"file_url": self.attachment_file},
@@ -1166,6 +1171,8 @@ class GMPDocument(NestedSet):
                 )
             )
         super().on_trash(*args, **kwargs)
+        # Its stored files go with it (removed once the deletion commits).
+        storage.delete_document_files(self.name)
 
     def copy_attachments_from_amended_from(self):
         # GMP change control: a revised document must re-acquire its own
@@ -1206,41 +1213,45 @@ class GMPDocument(NestedSet):
         if not self.attachment_file.lower().endswith(ALLOWED_EXTENSIONS):
             frappe.throw(_("Only .docx, .xlsx, or .vsdx files are allowed for GMP Documents."))
 
-        controlled_url = f"/private/files/{self._source_filename()}"
-        if self.attachment_file == controlled_url:
-            # Already this document's own controlled file (e.g. a re-save with no
+        if self.attachment_file == storage.file_url(self.name, self._source_filename()):
+            # Already this document's own stored source (e.g. a re-save with no
             # new upload) — just keep the integrity hash current.
-            controlled = self._get_file_doc(self.attachment_file)
-            path = controlled.get_full_path()
-            if not os.path.exists(path):
-                frappe.throw(_("Attached file is missing on disk: {0}").format(self.attachment_file))
-            self.file_integrity_hash = _compute_sha256(path)
+            row = storage.get_row(self.name, self._source_filename())
+            if not row:
+                frappe.throw(_("Attached file is missing: {0}").format(self._source_filename()))
+            self.file_integrity_hash = row.sha256
             return
 
+        if storage.parse_file_url(self.attachment_file):
+            # A file stored for another document. A revision never inherits one
+            # (before_insert clears it), so this can only be an attempt to copy a
+            # file the user may not be allowed to download — upload it instead.
+            frappe.throw(
+                _("Upload the file itself: a file stored for another GMP Document cannot be attached.")
+            )
+
         src = self._get_file_doc(self.attachment_file)
-        src_path = src.get_full_path()
-        if not os.path.exists(src_path):
+        try:
+            content = storage.read_frappe_file(src)
+        except FileNotFoundError:
             frappe.throw(_("Attached file is missing on disk: {0}").format(self.attachment_file))
-        with open(src_path, "rb") as fh:
-            content = fh.read()
 
-        # Promote the upload to this document's OWN pristine template. We copy the
-        # bytes into a per-document physical file and own its File record rather
-        # than renaming the uploaded file in place, because Frappe deduplicates
-        # uploads by content hash: identical or derived uploads (e.g. each
-        # version started from the same base file) are pointed at a single shared
-        # physical file, and renaming / overwriting it then bleeds one document's
-        # content into another document's render. Owning an independent file
-        # decouples this document from that sharing. This file is IMMUTABLE — the
-        # render writes its clean deliverable to a separate file so the pristine
-        # tagged template always remains available as the render source.
-        controlled = self._own_private_file(content, self._source_filename())
-        self.attachment_file = controlled.file_url
-        self.file_integrity_hash = _compute_sha256(controlled.get_full_path())
+        # Promote the upload to this document's OWN pristine template, kept in
+        # the DMS storage rather than as a File row: an attachment can be
+        # downloaded by everyone who can read the document, the stored source
+        # only under document_file()'s rules. Copying also decouples the
+        # document from Frappe's upload deduplication, which can point several
+        # uploads at one physical file. The stored source is IMMUTABLE — the
+        # render writes its clean deliverable to a separate file so the
+        # pristine tagged template always remains available as the render
+        # source.
+        self.attachment_file = storage.put(self.name, self._source_filename(), content)
+        self.file_integrity_hash = hashlib.sha256(content).hexdigest()
+        for ext in ALLOWED_EXTENSIONS:  # a re-upload in another format
+            if f"{self.name}{ext}" != self._source_filename():
+                storage.delete(self.name, f"{self.name}{ext}")
 
-        self._purge_superseded_attachments(
-            keep=controlled.name, previous_url=previous_url, also_remove=[src.name]
-        )
+        self._purge_superseded_attachments(previous_url=previous_url, also_remove=[src.name])
         frappe.clear_document_cache(self.doctype, self.name)
 
     def _controlled_ext(self):
@@ -1260,84 +1271,26 @@ class GMPDocument(NestedSet):
         render, so re-renders (cancel, expiry, regenerate) stay idempotent."""
         return f"{self.name}{self._controlled_ext()}"
 
+    def _base_pdf_filename(self):
+        """Filename of the signed base PDF that every download is watermarked
+        from (download_watermarked_pdf)."""
+        return f"{self.name}.pdf"
+
     def _deliverable_filename(self):
         """Filename of the CLEAN rendered deliverable (tags populated, no images)
         stored as a separate file so the pristine source survives. Downloaded by
         managers via download_word_document; regenerated on every render."""
         return f"{self.name}-controlled{self._controlled_ext()}"
 
-    def _own_private_file(self, content, filename):
-        """Persist ``content`` to /private/files/<filename> in a physical file
-        owned solely by this document, with a File record whose ``content_hash``
-        is kept in sync. Returns the File doc.
-
-        Deliberately bypasses Frappe's content-hash deduplication (it writes the
-        file directly and inserts/updates the File row without going through
-        File.save): dedup can otherwise point several documents at one physical
-        file which — combined with an in-place overwrite that left
-        File.content_hash stale — caused one document's PDF to contain another
-        document's content."""
-        fname = filename
-        url = f"/private/files/{fname}"
-        path = get_files_path(fname, is_private=1)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as fh:
-            fh.write(content)
-        chash = get_content_hash(content)
-
-        rows = frappe.get_all(
-            "File",
-            filters={
-                "attached_to_doctype": self.doctype,
-                "attached_to_name": self.name,
-                "file_name": fname,
-            },
-            pluck="name",
-        )
-        if rows:
-            keep = rows[0]
-            for extra in rows[1:]:
-                frappe.delete_doc("File", extra, force=True, ignore_permissions=True)
-            frappe.db.set_value(
-                "File",
-                keep,
-                {
-                    "file_url": url,
-                    "is_private": 1,
-                    "file_size": len(content),
-                    "content_hash": chash,
-                },
-                update_modified=False,
-            )
-            return frappe.get_doc("File", keep)
-
-        f = frappe.new_doc("File")
-        f.name = frappe.generate_hash(length=10)
-        f.update(
-            {
-                "file_name": fname,
-                "file_url": url,
-                "is_private": 1,
-                "attached_to_doctype": self.doctype,
-                "attached_to_name": self.name,
-                "file_size": len(content),
-                "content_hash": chash,
-            }
-        )
-        # db_insert bypasses File.save -> no dedup, no filesystem rewrite; we own
-        # both the physical file (written above) and the row.
-        f.db_insert()
-        return f
-
-    def _purge_superseded_attachments(self, keep, previous_url, also_remove=None):
+    def _purge_superseded_attachments(self, previous_url, also_remove=None):
         """Delete File rows left behind by an attachment change — the original
-        upload, the previous controlled file, and any other source-format file
-        (.docx/.xlsx/.vsdx) attached to this document — keeping only the File we
-        just promoted. The generated base PDF is deliberately excluded (only
-        ALLOWED_EXTENSIONS match), so a re-upload never deletes the signed PDF.
-        Frappe guards the physical delete when another File row references the
-        same path, so a shared (deduplicated) upload never removes another
-        document's bytes."""
+        upload, a previous controlled file of a release before 2.8.0, and any
+        other source-format file (.docx/.xlsx/.vsdx) attached to this document.
+        The promoted source lives in the DMS storage, not in a File row, so
+        nothing here is still needed. Other attachments (a scanned PDF) are
+        left alone. Frappe guards the physical delete when another File row
+        references the same path, so a shared (deduplicated) upload never
+        removes another document's bytes."""
         stale = set(also_remove or [])
         if previous_url:
             stale.update(frappe.get_all("File", filters={"file_url": previous_url}, pluck="name"))
@@ -1351,7 +1304,6 @@ class GMPDocument(NestedSet):
             for row in attached
             if (row.file_name or "").lower().endswith(ALLOWED_EXTENSIONS)
         )
-        stale.discard(keep)
         for name in stale:
             # force bypasses link checks; ignore_permissions because this runs
             # inside the controlled save, not as the end user.
@@ -1458,8 +1410,11 @@ class GMPDocument(NestedSet):
         Critically, this does NOT overwrite ``attachment_file`` / the source
         template — that immutability is what lets cancel, expiry and download-time
         regeneration re-render from a still-tagged template. The clean deliverable
-        lives at ``_deliverable_filename()`` and is served by download_word_document."""
-        self._own_private_file(clean_bytes, self._deliverable_filename())
+        lives at ``_deliverable_filename()`` and is served by download_word_document.
+
+        Both go to the DMS storage (not File rows), so neither can be fetched
+        around the watermark or the managers-only Word download."""
+        storage.put(self.name, self._deliverable_filename(), clean_bytes)
 
         # SHA-256 reflects the deliverable (clean) bytes, not the signed PDF.
         self.db_set(
@@ -1468,11 +1423,7 @@ class GMPDocument(NestedSet):
             update_modified=False,
         )
 
-        # Same deterministic path as the deliverable. save_file() would rename
-        # the file with a hash suffix whenever the plain name is taken on disk,
-        # and then neither the next re-render nor the download lookup — both
-        # keyed by the exact name — would find it.
-        self._own_private_file(pdf_bytes, f"{self.name}.pdf")
+        storage.put(self.name, self._base_pdf_filename(), pdf_bytes)
 
     def _soffice_binary(self):
         soffice = shutil.which("soffice") or shutil.which("libreoffice")
@@ -1734,8 +1685,15 @@ class GMPDocument(NestedSet):
         always read from it."""
         template = frappe.get_doc("GMP Word Template", self.word_template)
         mappings = list(template.field_mappings or [])
-        file_doc = self._get_file_doc(self.attachment_file)
-        return file_doc.get_full_path(), mappings
+        try:
+            source_path = storage.local_path(self.name, self._source_filename())
+        except storage.StoredFileMissing:
+            if not _adopt_legacy_files(self):
+                frappe.throw(
+                    _("The source template of {0} is missing: upload it again.").format(self.name)
+                )
+            source_path = storage.local_path(self.name, self._source_filename())
+        return source_path, mappings
 
     def _build_template_context(self, template_for_images=None, field_mappings=None):
         """Context dict consumed by docxtpl. Every editable GMP Document
@@ -2074,17 +2032,13 @@ class GMPDocument(NestedSet):
 
     def _snapshot_signature(self, fieldname, user):
         """Freeze the signature image applied at a stage onto the document, by
-        COPYING it into a file this document owns.
+        COPYING it into a file this document owns (in the DMS storage).
 
         It must be a copy, never a reference to the Employee's own File.
-        Frappe's global `attach_files_to_document` hook runs on the on_update of
-        every doctype and claims any *unattached* File named by an Attach /
-        Attach Image field — rewriting its `attached_to_doctype` to this
-        document. Pointing these fields at the employee's signature therefore
-        re-parents it here on the first approval, and deleting this document
-        then deletes that employee's signature for every future document too.
-        (`attached_to_field` is set below for the same reason: without it the
-        hook re-inserts a duplicate File row for our own copy on every save.)
+        Frappe's global `attach_files_to_document` hook claims any *unattached*
+        File named by an Attach Image field, so pointing these fields at the
+        employee's signature re-parented it here, and deleting this document
+        then deleted that employee's signature for every future document too.
 
         Copying is also the truthful thing for a controlled record: the bytes
         that were actually applied at this stage stay with the document even
@@ -2097,22 +2051,17 @@ class GMPDocument(NestedSet):
             return
 
         try:
-            with open(signature.path, "rb") as fh:
-                content = fh.read()
-        except OSError:
+            content = storage.read_frappe_file(signature.file)
+        except Exception:
             frappe.log_error(
-                f"Could not read signature {signature.path} for {user}",
+                f"Could not read signature {signature.url} for {user}\n{frappe.get_traceback()}",
                 "GMP Document: signature snapshot failed",
             )
             return
 
-        ext = os.path.splitext(signature.path)[1].lower() or ".png"
-        snapshot = self._own_private_file(content, f"{self.name}-{fieldname}{ext}")
-        if snapshot.get("attached_to_field") != fieldname:
-            frappe.db.set_value(
-                "File", snapshot.name, "attached_to_field", fieldname, update_modified=False
-            )
-        self.db_set(fieldname, snapshot.file_url, update_modified=False)
+        ext = os.path.splitext(signature.file.file_name or "")[1].lower() or ".png"
+        url = storage.put(self.name, f"{self.name}-{fieldname}{ext}", content)
+        self.db_set(fieldname, url, update_modified=False)
 
     def _stamp_ceo_authorization(self):
         """Stamp the CEO authorization block at publication.
@@ -2361,9 +2310,10 @@ def _signature_issue(user_email):
     signature image, or None if the user has a valid one.
 
     Mirrors _resolve_signature_path's resolution (Employee.user_id ->
-    custom_signature_image -> a PNG/JPG/JPEG File on disk) but returns a message
-    instead of logging, so it can drive save-time validation and the client-side
-    pre-check. Used by GMPDocument._validate_signatures and check_signature."""
+    custom_signature_image -> a PNG/JPG/JPEG File, on disk or in the S3 bucket)
+    but returns a message instead of logging, so it can drive save-time
+    validation and the client-side pre-check. Used by
+    GMPDocument._validate_signatures and check_signature."""
     if not user_email:
         return _("no user is selected")
 
@@ -2390,21 +2340,33 @@ def _signature_issue(user_email):
     if not file_name:
         return _("the signature file record is missing")
 
-    physical_path = frappe.get_doc("File", file_name).get_full_path()
-    if not os.path.exists(physical_path):
-        return _("the signature image is missing on disk")
-    if not physical_path.lower().endswith(ALLOWED_SIGNATURE_EXTENSIONS):
+    file_doc = frappe.get_doc("File", file_name)
+    if not (file_doc.file_name or file_doc.file_url or "").lower().endswith(
+        ALLOWED_SIGNATURE_EXTENSIONS
+    ):
         return _("the signature must be a PNG, JPG or JPEG image")
+    # A file in the bucket is not fetched on every save; a local one is checked.
+    if not storage.is_s3_file(file_doc) and not os.path.exists(file_doc.get_full_path()):
+        return _("the signature image is missing on disk")
     return None
 
 
 def _resolve_signature_path(user_email):
-    """The on-disk path of a user's signature image, or None.
+    """A local path holding a user's signature image, or None.
 
     Thin wrapper over _resolve_signature_file for the render paths, which only
-    ever need the path."""
+    ever need a path: the file itself, or a cached copy of one in the bucket."""
     signature = _resolve_signature_file(user_email)
-    return signature.path if signature else None
+    if not signature:
+        return None
+    try:
+        return storage.frappe_file_path(signature.file)
+    except Exception:
+        frappe.log_error(
+            f"Could not read signature {signature.url} for {user_email}\n{frappe.get_traceback()}",
+            "GMP Document signature lookup",
+        )
+        return None
 
 
 def _signature_path_from_url(file_url):
@@ -2414,24 +2376,24 @@ def _signature_path_from_url(file_url):
     image that was in force when a stage was completed, and the render needs
     the file it points at. Returns None (rather than throwing) when the File
     row or the image itself has since gone, so the render degrades the same way
-    a never-uploaded signature does."""
-    if not file_url:
+    a never-uploaded signature does. A snapshot whose bytes no longer match
+    their checksum is refused (StoredFileIntegrityError), never rendered."""
+    stored = storage.parse_file_url(file_url)
+    if not stored or not stored[1].lower().endswith(ALLOWED_SIGNATURE_EXTENSIONS):
         return None
-    file_name = frappe.db.get_value("File", {"file_url": file_url}, "name")
-    if not file_name:
+    try:
+        return storage.local_path(*stored)
+    except storage.StoredFileMissing:
         return None
-    path = frappe.get_doc("File", file_name).get_full_path()
-    if not os.path.exists(path) or not path.lower().endswith(ALLOWED_SIGNATURE_EXTENSIONS):
-        return None
-    return path
 
 
 def _resolve_signature_file(user_email):
-    """Return frappe._dict(url=..., path=...) for a user's signature, or None.
+    """Return frappe._dict(url=..., file=<File>) for a user's signature, or
+    None.
 
     Resolution chain:
         User (user_email) -> Employee.user_id -> Employee.custom_signature_image
-        -> File.file_url -> File.get_full_path()
+        -> File.file_url -> the File (on the local disk or in the S3 bucket)
 
     A user can be linked to more than one Employee (rehire, a prior Left/
     Inactive record, or a duplicate). A bare get_value() returns an arbitrary
@@ -2496,27 +2458,29 @@ def _resolve_signature_file(user_email):
         )
         return None
 
-    physical_path = frappe.get_doc("File", file_name).get_full_path()
-    if not os.path.exists(physical_path):
-        frappe.log_error(
-            title=log_title,
-            message=(
-                f"Employee {employee_name} signature missing on disk: {physical_path}"
-            ),
-        )
-        return None
-
-    if not physical_path.lower().endswith(ALLOWED_SIGNATURE_EXTENSIONS):
+    file_doc = frappe.get_doc("File", file_name)
+    if not (file_doc.file_name or file_doc.file_url or "").lower().endswith(
+        ALLOWED_SIGNATURE_EXTENSIONS
+    ):
         frappe.log_error(
             title=log_title,
             message=(
                 f"Employee {employee_name} signature must be one of "
-                f"{', '.join(ALLOWED_SIGNATURE_EXTENSIONS)} — got '{physical_path}'."
+                f"{', '.join(ALLOWED_SIGNATURE_EXTENSIONS)} — got '{file_doc.file_name}'."
             ),
         )
         return None
 
-    return frappe._dict(url=sig_url, path=physical_path)
+    if not storage.is_s3_file(file_doc) and not os.path.exists(file_doc.get_full_path()):
+        frappe.log_error(
+            title=log_title,
+            message=(
+                f"Employee {employee_name} signature missing on disk: {file_doc.get_full_path()}"
+            ),
+        )
+        return None
+
+    return frappe._dict(url=sig_url, file=file_doc)
 
 
 # ---------------------------------------------------------------------- #
@@ -2840,122 +2804,82 @@ def download_watermarked_pdf(docname, variant=None):
 
 
 def _resolve_base_pdf_path(doc):
-    """Return the on-disk path of the document's base PDF, regenerating it if
-    the File record or the physical file is missing.
-
-    Lookup is by attachment + ``.pdf`` extension (not an exact filename
-    match) so a renamed/re-versioned document still resolves. Regeneration
-    requires the source ``.docx`` to still be present."""
-
-    def _find_pdf_on_disk():
-        # The base PDF by its own name first: any other PDF attached to the
-        # document (a scanned copy, a training record) must never be served as
-        # the controlled copy. The prefix match only covers base PDFs stored by
-        # releases before 2.7.2, which could carry a hash suffix.
-        for file_name in (f"{doc.name}.pdf", ["like", f"{doc.name}%.pdf"]):
-            for f in frappe.get_all(
-                "File",
-                filters={
-                    "attached_to_doctype": doc.doctype,
-                    "attached_to_name": doc.name,
-                    "file_name": file_name,
-                },
-                fields=["name"],
-                order_by="creation desc",
-            ):
-                path = frappe.get_doc("File", f.name).get_full_path()
-                if os.path.exists(path):
-                    return path
-        return None
-
-    path = _find_pdf_on_disk()
-    if path:
-        return path
-
-    # Missing base PDF — regenerate from the controlled .docx attachment.
-    # Regeneration mutates the document (db_set of the integrity hash) and
-    # rewrites File records, so it must not be reachable by a read-only member
-    # downloading a controlled copy. Restrict it to the manager/admin roles.
-    if not _is_unrestricted(frappe.session.user):
-        frappe.throw(
-            _(
-                "The controlled PDF for {0} is temporarily unavailable. "
-                "Please ask a DMS/QA manager to regenerate it."
-            ).format(doc.name)
-        )
-    if not doc.attachment_file:
-        frappe.throw(
-            _(
-                "Base PDF for {0} is unavailable and cannot be regenerated: "
-                "the controlled .docx attachment is missing."
-            ).format(doc.name)
-        )
-    doc._render_and_generate_pdf()
-    _keep_regeneration()
-
-    path = _find_pdf_on_disk()
-    if not path:
-        frappe.throw(_("Base PDF for {0} could not be generated.").format(doc.name))
-    return path
+    """Return a local path holding the document's verified base PDF,
+    regenerating it if it is missing. Regeneration requires the source
+    template to still be present."""
+    return _stored_output_path(
+        doc,
+        doc._base_pdf_filename(),
+        unavailable=_(
+            "The controlled PDF for {0} is temporarily unavailable. "
+            "Please ask a DMS/QA manager to regenerate it."
+        ),
+        no_source=_(
+            "Base PDF for {0} is unavailable and cannot be regenerated: "
+            "the controlled .docx attachment is missing."
+        ),
+        failed=_("Base PDF for {0} could not be generated."),
+    )
 
 
 def _keep_regeneration():
     """Downloads arrive as GET, and Frappe rolls back every GET request. A
-    regeneration's File rows and integrity hash would be discarded while the
-    files it wrote stayed on disk — the stored hash would then no longer match
-    the deliverable, and the next download would regenerate all over again."""
+    regeneration's stored files and integrity hash would be discarded, and the
+    next download would regenerate all over again."""
     frappe.local.flags.commit = True
 
 
 def _resolve_deliverable_path(doc):
-    """Return the on-disk path of the clean rendered deliverable (the downloadable
-    Word/Excel/Visio file), regenerating from the pristine template if the File
-    record or the physical file is missing. Lookup is by the deterministic
-    deliverable filename attached to the document."""
-    fname = doc._deliverable_filename()
+    """Return a local path holding the clean rendered deliverable (the
+    downloadable Word/Excel/Visio file), regenerating it from the pristine
+    template if it is missing."""
+    return _stored_output_path(
+        doc,
+        doc._deliverable_filename(),
+        unavailable=_(
+            "The controlled document file for {0} is temporarily unavailable. "
+            "Please ask a DMS/QA manager to regenerate it."
+        ),
+        no_source=_(
+            "The deliverable for {0} is unavailable and cannot be regenerated: "
+            "the source template is missing."
+        ),
+        failed=_("The deliverable for {0} could not be generated."),
+    )
 
-    def _find_on_disk():
-        for f in frappe.get_all(
-            "File",
-            filters={
-                "attached_to_doctype": doc.doctype,
-                "attached_to_name": doc.name,
-                "file_name": fname,
-            },
-            fields=["name"],
-        ):
-            path = frappe.get_doc("File", f.name).get_full_path()
-            if os.path.exists(path):
-                return path
-        return None
 
-    path = _find_on_disk()
-    if path:
-        return path
+def _stored_output_path(doc, file_name, unavailable, no_source, failed):
+    """A render output's local path; adopts files of a release before 2.8.0,
+    then regenerates a missing output from the source template.
 
-    # Missing deliverable — regenerate from the pristine template. Regeneration
-    # mutates the document and rewrites File records, so restrict it to managers.
+    Regeneration mutates the document (db_set of the integrity hash) and
+    rewrites stored files, so it must not be reachable by a read-only member
+    downloading a controlled copy: it is restricted to the manager/admin
+    roles. A file that fails its integrity check is never regenerated over —
+    the mismatch is the evidence, and is reported instead."""
+    try:
+        return storage.local_path(doc.name, file_name)
+    except storage.StoredFileMissing:
+        pass
+
+    if _adopt_legacy_files(doc):
+        _keep_regeneration()
+        try:
+            return storage.local_path(doc.name, file_name)
+        except storage.StoredFileMissing:
+            pass
+
     if not _is_unrestricted(frappe.session.user):
-        frappe.throw(
-            _(
-                "The controlled document file for {0} is temporarily unavailable. "
-                "Please ask a DMS/QA manager to regenerate it."
-            ).format(doc.name)
-        )
+        frappe.throw(unavailable.format(doc.name))
     if not doc.attachment_file:
-        frappe.throw(
-            _(
-                "The deliverable for {0} is unavailable and cannot be regenerated: "
-                "the source template is missing."
-            ).format(doc.name)
-        )
+        frappe.throw(no_source.format(doc.name))
     doc._render_and_generate_pdf()
     _keep_regeneration()
 
-    path = _find_on_disk()
-    if not path:
-        frappe.throw(_("The deliverable for {0} could not be generated.").format(doc.name))
-    return path
+    try:
+        return storage.local_path(doc.name, file_name)
+    except storage.StoredFileMissing:
+        frappe.throw(failed.format(doc.name))
 
 
 # ---------------------------------------------------------------------- #
@@ -3614,6 +3538,211 @@ def download_word_document(docname):
     frappe.local.response.filename = f"{docname}{doc._controlled_ext()}"
     frappe.local.response.filecontent = content
     frappe.local.response.type = "download"
+
+
+# The Attach Image fields that hold a stage's frozen signature (see
+# GMPDocument._snapshot_signature).
+_SIGNATURE_SNAPSHOT_FIELDS = tuple(
+    spec["signature"] for spec in _STAGE_STAMPS.values() if spec["signature"]
+) + ("ceo_signature",)
+
+
+@frappe.whitelist()
+def document_file(docname, file):
+    """Serve a file the DMS stores for a GMP Document — the URL its source and
+    signature fields hold — under the DMS rules, not Frappe's attachment rule
+    (which lets everyone who can read a document download all its files):
+
+    - a signature image: anyone who can read the document (the form shows it);
+    - the source template: managers, and the people named on the document,
+      who work on it — not every department reader;
+    - the clean deliverable: managers, as download_word_document;
+    - the signed base PDF: nobody — it leaves only through
+      download_watermarked_pdf, with its watermark."""
+    doc = frappe.get_doc("GMP Document", docname)
+    doc.check_permission("read")
+
+    user = frappe.session.user
+    unrestricted = _is_unrestricted(user)
+    signatures = {
+        f"{docname}-{field}{ext}"
+        for field in _SIGNATURE_SNAPSHOT_FIELDS
+        for ext in ALLOWED_SIGNATURE_EXTENSIONS
+    }
+    if file == doc._base_pdf_filename():
+        allowed = False
+    elif file in {f"{docname}-controlled{ext}" for ext in ALLOWED_EXTENSIONS}:
+        allowed = unrestricted
+    elif file in {f"{docname}{ext}" for ext in ALLOWED_EXTENSIONS}:
+        allowed = unrestricted or user in _participants(doc) or _in_qa_queue(doc, user)
+    elif file in signatures:
+        allowed = True
+    else:
+        allowed = unrestricted
+    if not allowed:
+        frappe.throw(
+            _("You are not permitted to download this file of {0}.").format(docname),
+            frappe.PermissionError,
+        )
+
+    try:
+        content = storage.read(docname, file)
+    except storage.StoredFileMissing:
+        frappe.throw(_("{0} is not available.").format(file), frappe.DoesNotExistError)
+
+    frappe.local.response.filename = file
+    frappe.local.response.filecontent = content
+    frappe.local.response.type = "download"
+    if file in signatures:
+        frappe.local.response.display_content_as = "inline"
+
+
+def _participants(doc):
+    return {doc.get(f) for f in _PARTICIPANT_FIELDS if doc.get(f)}
+
+
+def _adopt_legacy_files(doc):
+    """Move the files a GMP Document owned as File rows (releases before
+    2.8.0) into the DMS storage, repoint its fields and remove the File rows.
+
+    Runs for every document in patch v2_8_0, and again whenever a stored file
+    is missing, so a document the patch could not finish is picked up later.
+    Idempotent; returns True when something was adopted.
+
+    Nothing is removed before its copy is stored. The File rows go in the
+    same transaction as the new registry rows, and their bytes are deleted
+    only after the commit — and only for files the document owned: a
+    signature URL that pointed at the Employee's own File (as 2.6.0 wrote it)
+    is copied, never deleted. A file that cannot be read is left as it is and
+    logged."""
+    name = doc.name
+    attached = frappe.get_all(
+        "File",
+        filters={"attached_to_doctype": doc.doctype, "attached_to_name": name, "is_folder": 0},
+        fields=["name", "file_name", "file_url", "attached_to_doctype", "attached_to_name"],
+        order_by="creation desc",
+    )
+    by_file_name = {}
+    for row in attached:
+        by_file_name.setdefault(row.file_name, row)
+
+    adopted = {}  # File name -> File row, removed once copied
+    fields = {}
+
+    def _copy(row, file_name, owned):
+        file_doc = frappe.get_doc("File", row.name)
+        try:
+            content = storage.read_frappe_file(file_doc)
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"GMP Document: {row.file_url} of {name} could not be moved to the DMS storage",
+            )
+            return None
+        url = storage.put(name, file_name, content)
+        if owned:
+            adopted[row.name] = row
+        return url
+
+    def _row_for(url):
+        rows = frappe.get_all(
+            "File",
+            filters={"file_url": url, "is_folder": 0},
+            fields=["name", "file_name", "file_url", "attached_to_doctype", "attached_to_name"],
+        )
+        mine = [r for r in rows if r.attached_to_doctype == doc.doctype and r.attached_to_name == name]
+        return (mine or rows or [None])[0]
+
+    def _is_mine(row):
+        return row.attached_to_doctype == doc.doctype and row.attached_to_name == name
+
+    url = doc.attachment_file
+    if url and not storage.parse_file_url(url) and url.lower().endswith(ALLOWED_EXTENSIONS):
+        row = _row_for(url)
+        if row:
+            ext = os.path.splitext(url)[1].lower()
+            new_url = _copy(row, f"{name}{ext}", owned=_is_mine(row))
+            if new_url:
+                fields["attachment_file"] = new_url
+
+    # A copy of the source under its controlled name that the field did not
+    # point at: dropped when it duplicates the stored source, adopted when no
+    # source is stored, and otherwise left alone — it differs, so it is kept.
+    for ext in ALLOWED_EXTENSIONS:
+        row = by_file_name.get(f"{name}{ext}")
+        if not row or row.name in adopted:
+            continue
+        stored = storage.get_row(name, f"{name}{ext}")
+        if not stored:
+            new_url = _copy(row, f"{name}{ext}", owned=True)
+            if new_url and not storage.parse_file_url(fields.get("attachment_file") or doc.attachment_file):
+                fields["attachment_file"] = new_url
+            continue
+        try:
+            content = storage.read_frappe_file(frappe.get_doc("File", row.name))
+        except Exception:
+            continue
+        if hashlib.sha256(content).hexdigest() == stored.sha256:
+            adopted[row.name] = row
+
+    for ext in ALLOWED_EXTENSIONS:
+        file_name = f"{name}-controlled{ext}"
+        row = by_file_name.get(file_name)
+        if row and not storage.exists(name, file_name):
+            _copy(row, file_name, owned=True)
+
+    # Releases before 2.7.2 could store it with save_file()'s six-character
+    # hash suffix; any other PDF attached here (a scan) is not the base PDF.
+    suffixed = re.compile(re.escape(name) + r"[0-9a-f]{6}\.pdf")
+    base = by_file_name.get(f"{name}.pdf") or next(
+        (r for r in attached if suffixed.fullmatch(r.file_name or "")), None
+    )
+    if base and not storage.exists(name, f"{name}.pdf"):
+        _copy(base, f"{name}.pdf", owned=True)
+
+    for field in _SIGNATURE_SNAPSHOT_FIELDS:
+        url = doc.get(field)
+        if not url or storage.parse_file_url(url):
+            continue
+        row = _row_for(url)
+        if not row:
+            continue
+        ext = os.path.splitext(row.file_name or url)[1].lower() or ".png"
+        owned = _is_mine(row) and (row.file_name or "").startswith(f"{name}-{field}")
+        new_url = _copy(row, f"{name}-{field}{ext}", owned=owned)
+        if new_url:
+            fields[field] = new_url
+
+    if fields:
+        frappe.db.set_value(doc.doctype, name, fields, update_modified=False)
+        doc.update(fields)
+    for row in adopted.values():
+        _forget_legacy_file(row)
+    return bool(fields or adopted)
+
+
+def _forget_legacy_file(row):
+    """Remove a File row whose bytes now live in the DMS storage; its bytes
+    go after the commit, unless another File row still uses them."""
+    file_doc = frappe.get_doc("File", row.name)
+    s3_key = storage.s3_module().get_s3_key(file_doc) if storage.is_s3_file(file_doc) else None
+    path = None if s3_key else file_doc.get_full_path()
+    file_url = row.file_url
+    frappe.db.delete("File", {"name": row.name})
+
+    def _remove_bytes():
+        try:
+            if frappe.db.exists("File", {"file_url": file_url}):
+                return
+            if s3_key:
+                # Honours "Delete file from cloud", like any File deletion.
+                frappe.get_attr("frappe_s3_attachment.controller.S3Operations")().delete_from_s3(s3_key)
+            elif path and os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), f"GMP Document: could not remove {file_url}")
+
+    frappe.db.after_commit.add(_remove_bytes)
 
 
 @frappe.whitelist()

@@ -15,6 +15,7 @@ Integration tests that require LibreOffice and real .docx fixtures
 as `skipUnless` so the unit suite remains hermetic.
 """
 
+import hashlib
 import os
 import shutil
 import tempfile
@@ -26,6 +27,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import cint
 
+from dms.dms import storage
 from dms.dms.doctype.gmp_document.gmp_document import (
     TEMPLATE_FIELDS,
     TEMPLATE_FIELD_KEYS,
@@ -1083,15 +1085,10 @@ class TestGMPDocument(FrappeTestCase):
         self.assertIsNotNone(doc.file_integrity_hash)
         self.assertEqual(len(doc.file_integrity_hash), 64)
 
-        base_pdf = frappe.db.exists(
-            "File",
-            {
-                "attached_to_doctype": "GMP Document",
-                "attached_to_name": doc.name,
-                "file_name": f"{doc.name}.pdf",
-            },
+        self.assertTrue(
+            storage.exists(doc.name, f"{doc.name}.pdf"), "Base PDF should be persisted on submit"
         )
-        self.assertTrue(base_pdf, "Base PDF should be persisted on submit")
+        self.assertTrue(storage.read(doc.name, f"{doc.name}.pdf").startswith(b"%PDF"))
 
     # ------------------------------------------------------------------ #
     #  Issue #3 — amendment naming via the real insert path              #
@@ -1238,16 +1235,7 @@ class TestGMPDocument(FrappeTestCase):
         doc = self._make_submitted_doc("GMP-Test-Regen")
 
         # Delete the persisted base PDF to simulate the Issue #1 failure mode.
-        for pdf in frappe.get_all(
-            "File",
-            filters={
-                "attached_to_doctype": "GMP Document",
-                "attached_to_name": doc.name,
-                "file_name": ["like", "%.pdf"],
-            },
-            pluck="name",
-        ):
-            frappe.delete_doc("File", pdf, ignore_permissions=True, force=True)
+        storage.delete(doc.name, f"{doc.name}.pdf")
 
         # Should regenerate transparently instead of throwing.
         download_watermarked_pdf(doc.name)
@@ -1444,23 +1432,32 @@ class TestGMPDocument(FrappeTestCase):
     #  Downloads                                                         #
     # ------------------------------------------------------------------ #
 
-    def _attach_pdf(self, doc, file_name, label):
+    @staticmethod
+    def _pdf_bytes(label):
         from reportlab.pdfgen import canvas
 
         buf = BytesIO()
         c = canvas.Canvas(buf)
         c.drawString(100, 750, f"{label} {frappe.generate_hash(length=8)}")
         c.save()
+        return buf.getvalue()
+
+    def _attach_pdf(self, doc, file_name, label):
         return frappe.get_doc(
             {
                 "doctype": "File",
                 "file_name": file_name,
                 "is_private": 1,
-                "content": buf.getvalue(),
+                "content": self._pdf_bytes(label),
                 "attached_to_doctype": "GMP Document",
                 "attached_to_name": doc.name,
             }
         ).insert(ignore_permissions=True)
+
+    def _store_base_pdf(self, doc, label="base"):
+        content = self._pdf_bytes(label)
+        storage.put(doc.name, f"{doc.name}.pdf", content)
+        return content
 
     def test_an_attached_pdf_is_never_served_as_the_controlled_copy(self):
         from dms.dms.doctype.gmp_document.gmp_document import _resolve_base_pdf_path
@@ -1468,10 +1465,12 @@ class TestGMPDocument(FrappeTestCase):
         doc = self._build_doc(document_name_en="GMP-Test-BasePdf-Lookup")
         doc.insert(ignore_permissions=True)
         doc = self._force_approved(doc)
-        base = self._attach_pdf(doc, f"{doc.name}.pdf", "base")
+        base = self._store_base_pdf(doc)
         self._attach_pdf(doc, "scanned-copy.pdf", "scan")  # newer
+        self._attach_pdf(doc, f"{doc.name}-scan.pdf", "scan")
 
-        self.assertEqual(_resolve_base_pdf_path(doc), base.get_full_path())
+        with open(_resolve_base_pdf_path(doc), "rb") as fh:
+            self.assertEqual(fh.read(), base)
 
     def test_a_regeneration_inside_a_download_is_committed(self):
         """Downloads are GET requests, which Frappe rolls back."""
@@ -1482,7 +1481,7 @@ class TestGMPDocument(FrappeTestCase):
         doc = self._force_approved(doc)
 
         def render(self_doc):
-            self_doc._own_private_file(b"%PDF-1.4 regenerated", f"{self_doc.name}.pdf")
+            storage.put(self_doc.name, f"{self_doc.name}.pdf", b"%PDF-1.4 regenerated")
 
         frappe.local.flags.commit = False
         try:
@@ -1490,7 +1489,8 @@ class TestGMPDocument(FrappeTestCase):
                 f"{CONTROLLER}.GMPDocument._render_and_generate_pdf", autospec=True, side_effect=render
             ):
                 path = _resolve_base_pdf_path(doc)
-            self.assertTrue(path.endswith(f"{doc.name}.pdf"))
+            with open(path, "rb") as fh:
+                self.assertEqual(fh.read(), b"%PDF-1.4 regenerated")
             self.assertTrue(frappe.local.flags.commit)
         finally:
             frappe.local.flags.commit = False
@@ -1506,7 +1506,7 @@ class TestGMPDocument(FrappeTestCase):
             {"docstatus": 2, "workflow_status": "Obsolete", "is_active": 0},
             update_modified=False,
         )
-        self._attach_pdf(doc, f"{doc.name}.pdf", "base")
+        self._store_base_pdf(doc)
 
         download_watermarked_pdf(doc.name, "plain")
         self.assertIn("OBSOLETE", frappe.local.response.filename)
@@ -1567,3 +1567,122 @@ class TestGMPDocument(FrappeTestCase):
                 self._build_doc(document_name_en="GMP-Test-BadAbbr").insert(ignore_permissions=True)
         finally:
             frappe.db.set_value("Department", TEST_DEPT, "custom_abbr", TEST_DEPT_ABBR)
+
+    # ------------------------------------------------------------------ #
+    #  Stored files                                                      #
+    # ------------------------------------------------------------------ #
+
+    def test_the_source_is_stored_not_attached(self):
+        upload = self._dummy_attachment("GMP-Test-Stored-Source")
+        content = storage.read_frappe_file(upload)
+        doc = self._build_doc(document_name_en="GMP-Test-Stored-Source", attachment_file=upload.file_url)
+        doc.insert(ignore_permissions=True)
+
+        self.assertEqual(storage.parse_file_url(doc.attachment_file), (doc.name, f"{doc.name}.docx"))
+        self.assertEqual(storage.read(doc.name, f"{doc.name}.docx"), content)
+        self.assertEqual(doc.file_integrity_hash, hashlib.sha256(content).hexdigest())
+        # Neither the upload nor a controlled copy remains as an attachment
+        # anyone reading the document could download.
+        self.assertFalse(
+            frappe.get_all(
+                "File", filters={"attached_to_doctype": "GMP Document", "attached_to_name": doc.name}
+            )
+        )
+        self.assertFalse(frappe.db.exists("File", upload.name))
+
+    def test_another_documents_stored_file_cannot_be_attached(self):
+        other = self._build_doc(document_name_en="GMP-Test-Stored-Other")
+        other.insert(ignore_permissions=True)
+
+        doc = self._build_doc(
+            document_name_en="GMP-Test-Stored-Borrow", attachment_file=other.attachment_file
+        )
+        with self.assertRaises(frappe.ValidationError):
+            doc.insert(ignore_permissions=True)
+
+    def test_a_revision_does_not_inherit_the_stored_source(self):
+        from dms.dms.doctype.gmp_document.gmp_document import create_revision
+
+        original = self._build_doc(document_name_en="GMP-Test-Stored-Rev")
+        original.insert(ignore_permissions=True)
+        self._force_approved(original)
+        rev = frappe.get_doc("GMP Document", create_revision(original.name, "Stored source"))
+
+        self.assertFalse(rev.attachment_file)
+        self.assertFalse(storage.exists(rev.name, f"{rev.name}.docx"))
+
+    def test_deleting_a_draft_deletes_its_stored_files(self):
+        doc = self._build_doc(document_name_en="GMP-Test-Stored-Delete")
+        doc.insert(ignore_permissions=True)
+        self.assertTrue(storage.exists(doc.name, f"{doc.name}.docx"))
+
+        frappe.delete_doc("GMP Document", doc.name, ignore_permissions=True, force=True)
+
+        self.assertFalse(frappe.get_all("DMS Stored File", filters={"document": doc.name}))
+
+    def test_files_of_earlier_releases_are_moved_into_storage(self):
+        """Before 2.8.0 a document's files were File rows attached to it."""
+        from dms.dms.doctype.gmp_document.gmp_document import _adopt_legacy_files
+
+        doc = self._build_doc(document_name_en="GMP-Test-Stored-Legacy")
+        doc.insert(ignore_permissions=True)
+        doc = self._force_approved(doc)
+        source = storage.read(doc.name, f"{doc.name}.docx")
+        storage.delete_document_files(doc.name)
+
+        def legacy(file_name, content):
+            return frappe.get_doc(
+                {
+                    "doctype": "File",
+                    "file_name": file_name,
+                    "is_private": 1,
+                    "content": content,
+                    "attached_to_doctype": "GMP Document",
+                    "attached_to_name": doc.name,
+                }
+            ).insert(ignore_permissions=True)
+
+        old_source = legacy(f"{doc.name}.docx", source)
+        legacy(f"{doc.name}-controlled.docx", b"PK clean deliverable")
+        base_pdf = self._pdf_bytes("legacy base")
+        legacy(f"{doc.name}.pdf", base_pdf)
+        old_sig = legacy(f"{doc.name}-supervisor_signature.png", b"\x89PNG snapshot")
+        # As 2.6.0 wrote it: the field pointed at the Employee's own file, which
+        # Frappe then re-parented to the document. Copied, never deleted.
+        employees = legacy(f"employee-sig-{frappe.generate_hash(length=6)}.png", b"\x89PNG employee")
+        scan = legacy(f"{doc.name}-scan.pdf", self._pdf_bytes("a scan"))
+        frappe.db.set_value(
+            "GMP Document",
+            doc.name,
+            {
+                "attachment_file": old_source.file_url,
+                "supervisor_signature": old_sig.file_url,
+                "ceo_signature": employees.file_url,
+            },
+            update_modified=False,
+        )
+        doc.reload()
+        frappe.db.commit()
+        old_path = old_source.get_full_path()
+
+        self.assertTrue(_adopt_legacy_files(doc))
+        frappe.db.commit()
+
+        doc.reload()
+        self.assertEqual(storage.parse_file_url(doc.attachment_file), (doc.name, f"{doc.name}.docx"))
+        self.assertEqual(storage.read(doc.name, f"{doc.name}.docx"), source)
+        self.assertEqual(storage.read(doc.name, f"{doc.name}-controlled.docx"), b"PK clean deliverable")
+        self.assertEqual(storage.read(doc.name, f"{doc.name}.pdf"), base_pdf)
+        self.assertEqual(storage.read(*storage.parse_file_url(doc.supervisor_signature)), b"\x89PNG snapshot")
+        self.assertEqual(storage.read(*storage.parse_file_url(doc.ceo_signature)), b"\x89PNG employee")
+
+        remaining = frappe.get_all(
+            "File",
+            filters={"attached_to_doctype": "GMP Document", "attached_to_name": doc.name},
+            pluck="name",
+        )
+        self.assertCountEqual(remaining, [employees.name, scan.name])
+        self.assertFalse(os.path.exists(old_path), "the old bytes go after the commit")
+
+        # Running it again finds nothing left to move.
+        self.assertFalse(_adopt_legacy_files(doc))

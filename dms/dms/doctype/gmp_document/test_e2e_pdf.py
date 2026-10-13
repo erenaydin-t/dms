@@ -17,13 +17,17 @@ Covered:
         version content, signature insertion)
 """
 
+import os
 import shutil
 import unittest
+
+from io import BytesIO
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.model.workflow import apply_workflow
 
+from dms.dms import storage
 from dms.dms.doctype.gmp_document.gmp_document import (
     download_watermarked_pdf,
     download_word_document,
@@ -371,13 +375,8 @@ class TestE2EPDF(FrappeTestCase):
         return doc
 
     def _base_pdf_path(self, docname):
-        f = frappe.db.get_value(
-            "File",
-            {"attached_to_doctype": "GMP Document", "attached_to_name": docname, "file_name": f"{docname}.pdf"},
-            "name",
-        )
-        self.assertTrue(f, f"base PDF File missing for {docname}")
-        return frappe.get_doc("File", f).get_full_path()
+        self.assertTrue(storage.exists(docname, f"{docname}.pdf"), f"base PDF missing for {docname}")
+        return storage.local_path(docname, f"{docname}.pdf")
 
     def _pdf_text(self, docname):
         from pypdf import PdfReader
@@ -662,3 +661,56 @@ class TestE2EPDF(FrappeTestCase):
         # Empty string means "no signature"; an InlineImage means it resolved.
         self.assertNotEqual(ctx["qa_signature"], "", "qa signature did not fall back to assigned QA approver")
         self.assertNotEqual(ctx["reviewer_signature"], "", "reviewer signature did not fall back to assigned reviewer")
+
+    # ----------------------------- S3 storage -------------------------- #
+
+    @unittest.skipUnless(frappe.conf.get("dms_test_s3"), "no dms_test_s3 entry in site_config.json")
+    def test_s3_storage_end_to_end(self):
+        """Rendered on this server, kept in the bucket: approval stores every
+        file there and nothing on the disk, and the downloads read them back."""
+        from pypdf import PdfReader
+
+        from dms.dms.doctype.gmp_document.test_storage import use_real_bucket
+        from frappe_s3_attachment import storage as s3
+
+        self.addCleanup(use_real_bucket())
+        frappe.db.set_single_value("DMS Settings", "store_files_on_s3", 1)
+        frappe.db.commit()
+
+        def local_storage():
+            frappe.db.set_single_value("DMS Settings", "store_files_on_s3", 0)
+            frappe.db.commit()
+
+        self.addCleanup(local_storage)
+
+        doc = self._create_approved("GMP-E2E-S3", TPL_ALPHA, ["S3_STORED", "{{ my_title }}"])
+        frappe.db.commit()
+
+        rows = frappe.get_all(
+            "DMS Stored File",
+            filters={"document": doc.name},
+            fields=["file_name", "storage", "storage_key"],
+        )
+        self.assertTrue(
+            {f"{doc.name}.docx", f"{doc.name}-controlled.docx", f"{doc.name}.pdf"}
+            <= {r.file_name for r in rows}
+        )
+        for row in rows:
+            self.assertEqual(row.storage, storage.S3, row.file_name)
+            self.assertTrue(s3.object_exists(row.storage_key), row.file_name)
+        local_dir = storage._local_path(f"dms/{doc.name}")
+        self.assertFalse(
+            os.path.isdir(local_dir) and os.listdir(local_dir), "nothing is kept on the disk"
+        )
+
+        frappe.local.response = frappe._dict()
+        download_watermarked_pdf(doc.name)
+        text = "".join(
+            page.extract_text() or ""
+            for page in PdfReader(BytesIO(frappe.local.response.filecontent)).pages
+        )
+        self.assertIn("S3_STORED", text)
+
+        frappe.local.response = frappe._dict()
+        download_word_document(doc.name)
+        self.assertTrue(frappe.local.response.filecontent.startswith(b"PK"))

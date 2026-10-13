@@ -114,6 +114,27 @@ jobs:
             --install-app hrms \
             --install-app dms
 
+      - name: Install frappe_s3_attachment and an S3 test server
+        working-directory: docker
+        run: |
+          # The S3 storage tests (test_storage.TestRealBucket and
+          # test_e2e_pdf.test_s3_storage_end_to_end) run through the real
+          # frappe_s3_attachment app against a real S3-compatible server; they
+          # are skipped wherever site_config.json has no dms_test_s3 entry.
+          printf '%s' '{"identities":[{"name":"ci","credentials":[{"accessKey":"testkey","secretKey":"testsecret"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' > /tmp/s3.json
+          docker run -d --name s3 --network dms_default -v /tmp/s3.json:/etc/s3.json:ro \
+            chrislusf/seaweedfs:3.97 server -s3 -s3.config=/etc/s3.json -dir=/data
+          docker compose exec -T backend bench get-app \
+            https://github.com/erenaydin-t/frappe-attachments-s3 --branch v16.3.0
+          docker compose exec -T backend bench --site test_site install-app frappe_s3_attachment
+          docker compose exec -T backend bench --site test_site migrate
+          docker compose exec -T backend bench --site test_site set-config --parse dms_test_s3 \
+            '{"endpoint_url": "http://s3:8333", "bucket": "dms-test", "key": "testkey", "secret": "testsecret", "region": "us-east-1"}'
+          for i in $(seq 1 60); do
+            docker compose exec -T backend bash -c 'exec 3<>/dev/tcp/s3/8333' 2>/dev/null && break
+            sleep 2
+          done
+
       - name: Run DMS test suite
         working-directory: docker
         run: |
@@ -123,10 +144,11 @@ jobs:
           # the version-mismatched base image (frappe 17-dev + erpnext 16). The
           # per-module runs cover the whole DMS suite (controller, permission/
           # visibility model, reference tree, approval chain and QA queue, font
-          # enforcement, and the LibreOffice DOCX->PDF end-to-end pipeline).
+          # enforcement, the LibreOffice DOCX->PDF end-to-end pipeline, and the
+          # local/S3 file storage).
           # --skip-before-tests skips ERPNext's setup-wizard bootstrap, which
           # the DMS suite does not need. Every test_*.py module must be listed.
-          for m in test_gmp_document test_font_enforcement test_permissions test_workflow_chain test_e2e_pdf; do
+          for m in test_gmp_document test_font_enforcement test_permissions test_workflow_chain test_e2e_pdf test_storage; do
             echo "::group::run-tests $m"
             docker compose exec -T backend bench --site test_site \
               run-tests --module "dms.dms.doctype.gmp_document.$m" --skip-before-tests

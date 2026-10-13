@@ -53,7 +53,7 @@ Publication (`Publish`) triggers, in order:
 
 - The assigned Reviewer and QA Approver **must** have a signature image configured on their Employee record (`Employee → custom_signature_image`, PNG/JPG) — saving the document is blocked otherwise.
 - Rendered PDFs embed the **actual actor's** signature (`reviewed_by` / `approved_by`), falling back to the assigned reviewer/approver when an administrator acted via the escape hatch.
-- Signature files must live on **local disk** (see the S3 note in *Overview*).
+- Signature images are read from the Employee's file — on the disk, or in the S3 bucket when `frappe_s3_attachment` moved it there — and **copied** into the document's own storage when the stage is completed, so the image that was applied stays with the document.
 
 ## Audit trail
 

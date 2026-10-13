@@ -61,15 +61,38 @@ What enforcement covers: the body, `docDefaults`, headers, footers, footnotes, n
 6. **LibreOffice** — `soffice` must be on PATH in the backend/worker containers (used for PDF conversion).
 7. **Schedulers enabled** — daily jobs `activate_effective_documents` (first) and `expire_gmp_documents`.
 
-## S3 / external attachment offloading — required exemption
+## File storage (local disk or S3)
 
-If `frappe_s3_attachment` (or similar) is installed, DMS files **must stay on local disk** (rendering, hashing, watermarking and re-stamping read them across requests). In `site_config.json`:
+Each GMP Document's files — the controlled source, the rendered deliverable, the signed base PDF and the signature snapshots — are kept by the DMS itself, not as attachments, and listed in **DMS Stored File** (document, file, where it is, SHA-256). They are downloaded only through the DMS actions (see *Roles › Files of a document*).
+
+- **Local (default):** `sites/<site>/private/files/dms/<document>/`. Included in `bench backup --with-files`. These files have no File record, so `/private/files/…` never serves them.
+- **S3:** in the bucket of `frappe_s3_attachment`, under `<Folder Name>/dms/<document>/`, private. Documents are still rendered on the server: it fetches what it renders into a temporary cache (`/tmp/dms-cache/<site>`, at most 512 MB, verified on every use), renders, and stores the results in the bucket.
+
+**Integrity.** Every read is checked against the recorded SHA-256. A file changed outside the DMS — on the disk or in the bucket — is refused with *"… does not match its recorded checksum"* and an Error Log entry *DMS: stored file failed its integrity check*; it is never served, rendered or regenerated over. A new version is written next to the old one and the old one is removed only after the transaction commits, so a failed approval or re-render never leaves a half-written file.
+
+### Switching to S3
+
+1. Install or update `frappe_s3_attachment` to **16.3.0** or later and configure **S3 File Attachment** (bucket, key, secret, region; for ArvanCloud also the endpoint URL).
+2. **DMS Settings › File Storage** → tick **Store DMS Files on S3** → Save. From now on new files go to the bucket.
+3. Click **Move Stored Files**. It runs in the background: each file is copied, read back and checked against its SHA-256, and only then removed from the disk. A file that fails stays where it was and goes to the Error Log — click again to retry. The table under the checkbox shows how many files are where, and a comment on DMS Settings records each run.
+
+To go back, untick the box and click **Move Stored Files** again. Files are always read from wherever they are, so the setting can be changed at any time.
+
+If the bucket cannot be reached, approvals, re-renders and downloads stop with a clear message; nothing is half-written. Turn on **bucket versioning** if your provider offers it: the DMS refuses a changed file, versioning lets you get the original back.
+
+### `site_config.json` with `frappe_s3_attachment`
 
 ```json
-"ignore_s3_upload_for_doctype": ["Data Import", "GMP Document", "GMP Word Template", "Employee"]
+"ignore_s3_upload_for_doctype": ["Data Import", "GMP Document"]
 ```
 
-Symptoms of a missing exemption: *"Attached file is missing on disk"* on save, signature-lookup errors, or unrenderable approvals. Files uploaded against the placeholder name of a new unsaved document count as GMP Document files and stay local.
+- Keep **GMP Document**: an upload then stays on the disk until the DMS has stored it, and is removed. Without it the DMS still reads the upload from the bucket, but the bucket keeps a copy whenever *Delete file from cloud* is off.
+- **Employee** no longer needs to be listed with `frappe_s3_attachment` 16.3.0+: the DMS reads signature images from the bucket. (Earlier versions made an Employee's uploaded signature their profile photo.) Signatures already on the disk move with *S3 File Attachment › Migrate Existing Files*, which since 16.3.0 also updates the Employee's link to them and honours this list.
+- **GMP Word Template** holds no files and can be dropped from the list.
+
+### Upgrading to 2.8.0
+
+`migrate` moves every document's files out of its attachments into the DMS storage (on the disk), one document at a time. A document that fails is logged (*DMS 2.8.0: files of … were not moved*) and is picked up again automatically the next time one of its files is needed. Other attachments — a scan added in the sidebar — stay attachments.
 
 ## REST API surface
 

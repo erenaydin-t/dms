@@ -25,11 +25,13 @@ import unittest
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from dms.dms import storage
 from dms.dms.doctype.gmp_document.gmp_document import (
     MAX_REFERENCE_TREE_DEPTH,
     _is_unrestricted,
     _user_departments,
     _visibility_scope,
+    document_file,
     get_dms_tree_children,
     get_document_reference_tree,
     get_permission_query_conditions,
@@ -560,3 +562,53 @@ class TestGMPPermissions(FrappeTestCase):
         self.assertTrue(
             frappe.permissions.has_permission("GMP Document", "amend", user=QA_MGR)
         )
+
+    # ------------------------------------------------------------------ #
+    #  Stored files (document_file)                                      #
+    # ------------------------------------------------------------------ #
+
+    def _fetch(self, user, docname, file):
+        frappe.set_user(user)
+        frappe.local.response = frappe._dict()
+        try:
+            document_file(docname, file)
+            return frappe.local.response.filecontent
+        finally:
+            frappe.set_user("Administrator")
+
+    def test_stored_files_follow_the_dms_rules(self):
+        """Before 2.8.0 these were attachments, and Frappe lets everyone who
+        can read a document download all of them."""
+        doc = self._make_doc("GMP-Perm-Stored", dept=QA_DEPT, active=True)
+        name = doc.name
+        source = f"{name}.docx"
+        deliverable = f"{name}-controlled.docx"
+        base_pdf = f"{name}.pdf"
+        signature = f"{name}-supervisor_signature.png"
+        storage.put(name, deliverable, b"PK clean deliverable")
+        storage.put(name, base_pdf, b"%PDF-1.4 signed, unwatermarked")
+        storage.put(name, signature, b"\x89PNG signature")
+        frappe.db.set_value("GMP Document", name, "prepared_by", MEMBER_PROD, update_modified=False)
+
+        # A department reader sees the approved document and the signatures on
+        # it — not the source, the clean deliverable or the unwatermarked PDF.
+        self.assertEqual(self._fetch(MEMBER_QA, name, signature), b"\x89PNG signature")
+        for file in (source, deliverable, base_pdf):
+            with self.assertRaises(frappe.PermissionError, msg=file):
+                self._fetch(MEMBER_QA, name, file)
+
+        # Its preparer, from another department, works on the source.
+        self.assertEqual(self._fetch(MEMBER_PROD, name, source), storage.read(name, source))
+        with self.assertRaises(frappe.PermissionError):
+            self._fetch(MEMBER_PROD, name, deliverable)
+
+        # A manager gets the source and the deliverable; the signed PDF leaves
+        # only watermarked, through download_watermarked_pdf, for everyone.
+        self.assertEqual(self._fetch(DMS_MGR, name, source), storage.read(name, source))
+        self.assertEqual(self._fetch(DMS_MGR, name, deliverable), b"PK clean deliverable")
+        with self.assertRaises(frappe.PermissionError):
+            self._fetch(DMS_MGR, name, base_pdf)
+
+        # Without read access to the document, nothing.
+        with self.assertRaises(frappe.PermissionError):
+            self._fetch(NO_ROLE, name, signature)

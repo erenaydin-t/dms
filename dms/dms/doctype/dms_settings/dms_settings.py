@@ -5,7 +5,9 @@ Employee reporting chain: the QA Supervisor, the Regulatory Manager (Technical
 Lead), the final QA Approver and the (optional) CEO. Global defaults with
 optional per-department overrides; the three routing actors are resolved in
 GMPDocument._resolve_workflow_actors_on_submit_for_approval() when a draft is
-submitted for approval, the CEO in _stamp_ceo_authorization() at publication."""
+submitted for approval, the CEO in _stamp_ceo_authorization() at publication.
+Also where documents are rendered in (the document font) and where their files
+are stored (local disk or S3, see dms.dms.storage)."""
 
 import os
 import subprocess
@@ -14,6 +16,9 @@ import time
 import frappe
 from frappe import _
 from frappe.model.document import Document
+from frappe.utils import cint
+
+from dms.dms import storage
 
 # Font-file lookups, per process. The answer is a path on THIS container's
 # filesystem, so it must not be shared through Redis with containers that may
@@ -49,6 +54,11 @@ class DMSSettings(Document):
             seen.add(row.department)
 
         self._warn_if_font_not_installed()
+
+        if cint(self.store_files_on_s3):
+            reason = storage.s3_unavailable_reason()
+            if reason:
+                frappe.throw(reason, title=_("S3 Cannot Be Used"))
 
     def _warn_if_font_not_installed(self):
         # A warning, not a block: the font may legitimately be installed after
@@ -125,7 +135,11 @@ def _resolve_font_file_uncached(family, attached):
     if attached:
         name = frappe.db.get_value("File", {"file_url": attached}, "name")
         if name:
-            path = frappe.get_doc("File", name).get_full_path()
+            # On the disk, or a cached copy of a file in the S3 bucket.
+            try:
+                path = storage.frappe_file_path(frappe.get_doc("File", name))
+            except Exception:
+                path = attached
             if os.path.exists(path) and path.lower().endswith(".ttf"):
                 return path
             frappe.log_error(
@@ -227,3 +241,47 @@ def resolve_department_actors(department):
         "qa_approver": pick("qa_approver"),
         "ceo": pick("ceo"),
     }
+
+
+@frappe.whitelist()
+def get_storage_summary():
+    """Where the stored files are, for the DMS Settings form."""
+    frappe.only_for(("System Manager", "DMS Manager"))
+    on_s3 = cint(frappe.db.get_single_value("DMS Settings", "store_files_on_s3"))
+    return {
+        "target": storage.S3 if on_s3 else storage.LOCAL,
+        "summary": storage.storage_summary(),
+        "s3_unavailable": storage.s3_unavailable_reason(),
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+def move_stored_files():
+    """Move every stored file to the storage selected in DMS Settings, in a
+    background job (one at a time, each verified before its old copy goes)."""
+    frappe.only_for(("System Manager", "DMS Manager"))
+    target = storage.target_storage()
+    frappe.enqueue(
+        "dms.dms.doctype.dms_settings.dms_settings.move_stored_files_job",
+        queue="long",
+        timeout=4 * 3600,
+        job_id="dms-move-stored-files",
+        deduplicate=True,
+        target=target,
+        user=frappe.session.user,
+    )
+    return target
+
+
+def move_stored_files_job(target, user=None):
+    result = storage.move_stored_files(target)
+    message = _("Moved {0} stored files to {1}.").format(result["moved"], target)
+    if result["failed"]:
+        message += " " + _(
+            "{0} could not be moved and stayed where they were; see the Error Log, "
+            "then run Move Stored Files again."
+        ).format(result["failed"])
+    frappe.get_doc("DMS Settings").add_comment("Info", message)
+    frappe.db.commit()
+    if user:
+        frappe.publish_realtime("msgprint", message, user=user)

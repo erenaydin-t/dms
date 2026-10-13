@@ -144,3 +144,14 @@ The same chain repeats for every revision; the predecessor stays readable by its
 - **Self-approval** is intentionally allowed at the Frappe level (`allow_self_approval`) because the preparer owns the draft they submit; separation of duties is enforced by the *assignments* (a document's reviewer/QA approver fields), not by record ownership.
 - **Department membership** for Employee visibility comes from the user's **Active** Employee record's department (a Left record from before a transfer or rehire no longer counts); users without one see only documents naming them.
 - The workflow `GMP Document Workflow` must remain **Active**; disabling it breaks every transition for every role.
+- **Files of a document.** The DMS stores them itself (not as attachments) and serves each under its own rule:
+
+  | File | Who can download it |
+  |---|---|
+  | Controlled / Uncontrolled / Plain PDF | everyone who can read the document (always watermarked by status) |
+  | Signature images on the form | everyone who can read the document |
+  | Source (*Attachment* link) | the people named on the document (preparer, approvers, QA reviewers) and the unrestricted roles |
+  | Clean Word / Excel / Visio (*Download Word*) | the unrestricted roles |
+  | Signed base PDF, unwatermarked | nobody — it leaves only watermarked |
+
+  Before 2.8.0 these were attachments, which Frappe lets everyone who can read the document download — department members could take the clean files around the watermark.

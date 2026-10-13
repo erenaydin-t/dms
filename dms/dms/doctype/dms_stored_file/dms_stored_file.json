@@ -1,0 +1,104 @@
+{
+ "actions": [],
+ "autoname": "hash",
+ "creation": "2026-10-14 00:00:00.000000",
+ "description": "A file the DMS stores for a GMP Document (source template, deliverable, signed base PDF, signature snapshots): where it is and its SHA-256. Written only by the DMS; the files themselves are served only through the GMP Document download actions.",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "document",
+  "file_name",
+  "column_break_1",
+  "storage",
+  "file_size",
+  "section_location",
+  "storage_key",
+  "sha256"
+ ],
+ "fields": [
+  {
+   "fieldname": "document",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "GMP Document",
+   "read_only": 1,
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "file_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "File Name",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "storage",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Storage",
+   "options": "Local\nS3",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "file_size",
+   "fieldtype": "Int",
+   "label": "Size (bytes)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_location",
+   "fieldtype": "Section Break"
+  },
+  {
+   "description": "Path under the site's private files folder (Local), or the object key in the bucket (S3).",
+   "fieldname": "storage_key",
+   "fieldtype": "Data",
+   "label": "Location",
+   "length": 512,
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "description": "Checked on every read; a file that no longer matches is refused.",
+   "fieldname": "sha256",
+   "fieldtype": "Data",
+   "label": "SHA-256",
+   "length": 64,
+   "read_only": 1,
+   "reqd": 1
+  }
+ ],
+ "in_create": 1,
+ "links": [],
+ "modified": "2026-10-14 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "DMS",
+ "name": "DMS Stored File",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "read": 1,
+   "report": 1,
+   "role": "System Manager"
+  },
+  {
+   "read": 1,
+   "report": 1,
+   "role": "DMS Manager"
+  }
+ ],
+ "read_only": 1,
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "file_name"
+}
