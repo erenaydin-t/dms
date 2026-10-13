@@ -4,6 +4,19 @@ All notable changes to the **Lyra DMS** (GMP / 21 CFR Part 11 Document Managemen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0] - 2026-10-14
+
+### Added
+- **Approval Progress bar** at the top of every GMP Document form: each stage of the chain with its person — green ✓ with who approved and when, blue ● for the stage the document is waiting on and for how long, grey for the stages still to come — ending in *Approved* (with the effective date), *Obsolete* or *Revision Cancelled*. A return shows in red with its reason, a delegated QA review shows its queue of reviewers, and an approval made on someone's behalf reads "X for Y". It reads right to left in Persian and turns into a vertical list on a phone.
+- **Waiting On** column in the GMP Document list: the person the document waits on now and for how long ("Test Reviewer · 2 d"); click the name to filter by it. Backed by two new fields, *Waiting On* and *Waiting Since*, which the system sets at every step — including the QA reviewer at the head of a delegated queue, which the stage filters could not reach.
+- **My Pending → Everything Waiting on Me** lists every document waiting on you, at any stage.
+
+### Changed
+- 7 new tests (219 in total).
+
+### Upgrade notes
+- `bench --site <site> migrate` adds the fields and fills them for the documents already in the approval chain (patch `v2_9_0.backfill_pending_with`; the waiting time starts at each document's latest workflow event). Then `bench build --app dms` and `bench restart`.
+
 ## [2.8.0] - 2026-10-14
 
 ### Added

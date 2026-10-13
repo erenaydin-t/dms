@@ -7,6 +7,7 @@ frappe.ui.form.on("GMP Document", {
     },
 
     refresh(frm) {
+        render_approval_progress(frm);
         toggle_reason_for_change(frm);
         add_download_pdf_button(frm);
         add_create_revision_button(frm);
@@ -684,6 +685,163 @@ function trigger_browser_download(blob, filename) {
 // -------------------------------------------------------------------- //
 //  Document Reference Tree                                             //
 // -------------------------------------------------------------------- //
+
+// -------------------------------------------------------------------- //
+//  Approval progress bar (top of the form)                             //
+// -------------------------------------------------------------------- //
+// Every stage of the chain with its person: done (green, with who and
+// when), current (blue, with how long it has been waiting) and upcoming
+// (grey). The server works out the stages (get_approval_progress); this
+// only draws them. The bar follows the page direction, so it reads right
+// to left in Persian, and turns into a vertical list on a phone.
+
+function render_approval_progress(frm) {
+    const field = frm.fields_dict.approval_progress_html;
+    if (!field) return;
+    // Clear first: the control is reused when moving between documents.
+    field.$wrapper.empty();
+    if (frm.is_new()) return;
+
+    const docname = frm.doc.name;
+    frappe.call({
+        method: "dms.dms.doctype.gmp_document.gmp_document.get_approval_progress",
+        args: { docname },
+        type: "GET",
+        callback(r) {
+            // The user may have moved on to another document meanwhile.
+            if (!r.message || frm.doc.name !== docname) return;
+            ensure_progress_style();
+            field.$wrapper.html(progress_html(r.message));
+        },
+    });
+}
+
+
+const PROGRESS_ICON = { done: "✓", current: "●", upcoming: "", skipped: "" };
+const QUEUE_ICON = { Approved: "✓", "Awaiting Review": "●", Queued: "○", Skipped: "↷", "Return Requested": "↩" };
+
+
+function progress_html(data) {
+    const esc = frappe.utils.escape_html;
+    // <bdi> keeps "13-10-2026 23:46" in order inside a right-to-left page.
+    const when = (value) => (value ? `<bdi>${esc(frappe.datetime.str_to_user(value))}</bdi>` : "");
+
+    const steps = data.steps.map((step) => {
+        let who = esc(step.user_name || step.user || "—");
+        if (step.on_behalf_of) {
+            who = __("{0} for {1}", [who, esc(step.on_behalf_of_name || step.on_behalf_of)]);
+        }
+        let detail = "";
+        if (step.status === "done") {
+            detail = when(step.at);
+        } else if (step.status === "current" && data.pending && data.pending.since) {
+            detail = __("waiting {0}", [esc(frappe.datetime.prettyDate(data.pending.since, true))]);
+        } else if (step.status === "skipped") {
+            detail = __("not reached");
+        }
+        return `
+            <div class="dms-step ${step.status}">
+                <div class="dms-dot">${PROGRESS_ICON[step.status]}</div>
+                <div class="dms-step-text">
+                    <div class="dms-step-label">${esc(step.label)}</div>
+                    <div class="dms-step-user">${who}</div>
+                    <div class="dms-step-when">${detail}</div>
+                </div>
+            </div>`;
+    });
+
+    const end = {
+        approved: ["done", "✓", __("Approved"), data.effective_date
+            ? __("effective {0}", [when(data.effective_date)]) : ""],
+        pending_effective: ["scheduled", "⏳", __("Approved"), data.effective_date
+            ? __("effective from {0}", [when(data.effective_date)]) : ""],
+        obsolete: ["ended", "✕", __("Obsolete"), ""],
+        cancelled: ["ended", "✕", __("Revision Cancelled"), ""],
+    }[data.end] || ["upcoming", "", __("Approved"), ""];
+    steps.push(`
+        <div class="dms-step ${end[0]}">
+            <div class="dms-dot">${end[1]}</div>
+            <div class="dms-step-text">
+                <div class="dms-step-label">${end[2]}</div>
+                <div class="dms-step-when">${end[3]}</div>
+            </div>
+        </div>`);
+
+    const notes = [];
+    if (data.pending) {
+        const since = data.pending.since;
+        notes.push(`<div class="dms-progress-note waiting">⏳ ${__("Waiting on {0}", [
+            `<b>${esc(data.pending.user_name || data.pending.user)}</b>`,
+        ])}${since ? ` · ${__("since {0}", [`${when(since)} (${esc(frappe.datetime.prettyDate(since))})`])}` : ""}</div>`);
+    }
+    if (data.returned) {
+        notes.push(`<div class="dms-progress-note returned">↩ ${__("Returned by {0} on {1}", [
+            `<b>${esc(data.returned.user_name || data.returned.user || "")}</b>`,
+            when(data.returned.at),
+        ])}: ${esc(data.returned.reason || "")}</div>`);
+    }
+    if (data.qa_queue && data.qa_queue.length) {
+        const rows = data.qa_queue.map((row) => {
+            const icon = QUEUE_ICON[row.status] || "○";
+            const at = row.at ? ` (${when(row.at)})` : "";
+            return `<span class="dms-queue-item">${icon} ${esc(row.user_name || row.user)}${at}</span>`;
+        });
+        notes.push(`<div class="dms-progress-note">${__("QA review queue")}: ${rows.join(" → ")}</div>`);
+    }
+
+    return `
+        <div class="dms-progress">
+            <div class="dms-steps">${steps.join("")}</div>
+            ${notes.join("")}
+        </div>`;
+}
+
+
+function ensure_progress_style() {
+    if (document.getElementById("dms-progress-style")) return;
+    const style = document.createElement("style");
+    style.id = "dms-progress-style";
+    style.textContent = `
+        .dms-progress { padding: 4px 0 8px; }
+        .dms-progress .dms-steps { display: flex; align-items: flex-start; overflow-x: auto; padding-bottom: 6px; }
+        .dms-progress .dms-step { position: relative; flex: 1 0 112px; display: flex; flex-direction: column;
+            align-items: center; text-align: center; padding: 0 4px; }
+        .dms-progress .dms-step + .dms-step::before { content: ""; position: absolute; top: 13px;
+            inset-inline-end: calc(50% + 15px); width: calc(100% - 30px); height: 2px;
+            background: var(--border-color, #d1d8dd); }
+        .dms-progress .dms-step.done::before, .dms-progress .dms-step.current::before,
+        .dms-progress .dms-step.scheduled::before, .dms-progress .dms-step.ended::before {
+            background: var(--green-500, #2e9e5b); }
+        .dms-progress .dms-dot { width: 28px; height: 28px; border-radius: 50%; display: flex;
+            align-items: center; justify-content: center; font-size: 14px; font-weight: 700;
+            border: 2px solid var(--gray-400, #b8c2cc); background: var(--fg-color, #fff); color: #fff; }
+        .dms-progress .done .dms-dot { background: var(--green-500, #2e9e5b); border-color: var(--green-500, #2e9e5b); }
+        .dms-progress .current .dms-dot { border-color: var(--blue-500, #2490ef); color: var(--blue-500, #2490ef);
+            box-shadow: 0 0 0 4px var(--blue-100, #d6eaff); }
+        .dms-progress .scheduled .dms-dot { background: var(--orange-500, #e8790c); border-color: var(--orange-500, #e8790c); }
+        .dms-progress .ended .dms-dot { background: var(--red-500, #e24c4c); border-color: var(--red-500, #e24c4c); }
+        .dms-progress .skipped .dms-dot { border-style: dashed; }
+        .dms-progress .dms-step-label { margin-top: 6px; font-size: 12px; font-weight: 600; color: var(--text-color); }
+        .dms-progress .upcoming .dms-step-label, .dms-progress .skipped .dms-step-label { color: var(--text-muted); }
+        .dms-progress .dms-step-user { font-size: 12px; color: var(--text-color); }
+        .dms-progress .upcoming .dms-step-user, .dms-progress .skipped .dms-step-user { color: var(--text-muted); }
+        .dms-progress .dms-step-when { font-size: 11px; color: var(--text-muted); }
+        .dms-progress .current .dms-step-when { color: var(--blue-500, #2490ef); font-weight: 600; }
+        .dms-progress .dms-progress-note { margin-top: 6px; font-size: 12px; color: var(--text-color); }
+        .dms-progress .dms-progress-note.waiting { color: var(--blue-600, #1c75c8); }
+        .dms-progress .dms-progress-note.returned { color: var(--red-600, #c93232); }
+        .dms-progress .dms-queue-item { white-space: nowrap; }
+        @media (max-width: 640px) {
+            .dms-progress .dms-steps { flex-direction: column; overflow: visible; }
+            .dms-progress .dms-step { flex: none; flex-direction: row; align-items: flex-start; text-align: start;
+                gap: 10px; padding: 0 0 12px; }
+            .dms-progress .dms-step + .dms-step::before { display: none; }
+            .dms-progress .dms-dot { flex: none; }
+            .dms-progress .dms-step-label { margin-top: 0; }
+        }`;
+    document.head.appendChild(style);
+}
+
 
 function render_reference_tree(frm) {
     if (!frm.fields_dict.references_tree_html) return;

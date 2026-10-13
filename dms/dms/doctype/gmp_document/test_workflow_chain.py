@@ -37,6 +37,7 @@ from dms.dms.doctype.gmp_document.gmp_document import (
     complete_qa_review,
     create_revision,
     delegate_qa_review,
+    get_approval_progress,
     get_my_pending_count,
     has_permission,
     set_return_reason,
@@ -1131,6 +1132,100 @@ class TestWorkflowChain(FrappeTestCase):
         with self.assertRaises(frappe.PermissionError):
             self._as(PREPARER, get_my_pending_count, SUPERVISOR)
         self.assertIn("total", self._as(PREPARER, get_my_pending_count))
+
+    # ------------------------------------------------------------------ #
+    #  Who it waits on, and the progress bar                              #
+    # ------------------------------------------------------------------ #
+
+    def test_waiting_on_follows_the_chain(self):
+        doc = self._make_draft("GMP-Chain-Waiting")
+        self.assertEqual(doc.pending_with, PREPARER)
+        self.assertEqual(doc.pending_with_name, frappe.db.get_value("User", PREPARER, "full_name"))
+        self.assertTrue(doc.pending_since)
+
+        since = {}
+        for action, user, waiting_on in (
+            ("Submit for Approval", PREPARER, SUPERVISOR),
+            ("Approve (Supervisor)", SUPERVISOR, MANAGER),
+            ("Approve as Reviewer", MANAGER, QA_SUP),
+            ("Approve (QA Supervisor)", QA_SUP, REG_MGR),
+            ("Validate (Regulatory)", REG_MGR, MANAGER),
+            ("Approve (Manager)", MANAGER, QA_APPR),
+        ):
+            doc = self._act(doc, action, user)
+            self.assertEqual(doc.pending_with, waiting_on, action)
+            since[action] = doc.pending_since
+        # The reviewer holds the Manager stage too, and its clock starts anew.
+        self.assertGreater(since["Validate (Regulatory)"], since["Approve (Supervisor)"])
+
+    def test_waiting_on_follows_the_qa_queue(self):
+        doc = self._make_delegation_ready("GMP-Chain-Waiting-Queue")
+        delegate_qa_review(doc.name, [QA_R1, QA_R2])
+        doc.reload()
+        self.assertEqual(doc.pending_with, QA_R1)
+
+        complete_qa_review(doc.name, "Approve")
+        doc.reload()
+        self.assertEqual(doc.pending_with, QA_R2)
+
+        complete_qa_review(doc.name, "Approve")
+        doc.reload()
+        self.assertEqual(doc.workflow_status, WF_PENDING_REGULATORY)
+        self.assertEqual(doc.pending_with, REG_MGR)
+
+    def test_a_return_hands_the_document_back(self):
+        doc = self._act(self._make_draft("GMP-Chain-Waiting-Return"), "Submit for Approval", PREPARER)
+        self._as(SUPERVISOR, set_return_reason, doc.name, "Fix section 3")
+        doc = self._act(doc, "Return to Preparer", SUPERVISOR)
+        self.assertEqual(doc.pending_with, PREPARER)
+
+        progress = self._as(PREPARER, get_approval_progress, doc.name)
+        self.assertEqual(progress["returned"]["user"], SUPERVISOR)
+        self.assertEqual(progress["returned"]["reason"], "Fix section 3")
+        self.assertEqual([s["status"] for s in progress["steps"][:2]], ["current", "upcoming"])
+
+    def test_progress_marks_done_current_and_upcoming(self):
+        doc = self._make_draft("GMP-Chain-Progress")
+        doc = self._act(doc, "Submit for Approval", PREPARER)
+        doc = self._act(doc, "Approve (Supervisor)", SUPERVISOR)
+
+        progress = get_approval_progress(doc.name)
+        self.assertEqual(
+            [s["status"] for s in progress["steps"]],
+            ["done", "done", "current", "upcoming", "upcoming", "upcoming", "upcoming"],
+        )
+        supervisor = progress["steps"][1]
+        self.assertEqual(supervisor["user"], SUPERVISOR)
+        self.assertTrue(supervisor["at"])
+        self.assertEqual(progress["pending"]["user"], MANAGER)
+        self.assertIsNone(progress["end"])
+
+        progress = get_approval_progress(self._force_effective(doc).name)
+        self.assertEqual({s["status"] for s in progress["steps"]}, {"done"})
+        self.assertEqual(progress["end"], "approved")
+        self.assertIsNone(progress["pending"])
+
+    def test_progress_needs_read_access(self):
+        doc = self._make_draft("GMP-Chain-Progress-Denied")
+        with self.assertRaises(frappe.PermissionError):
+            self._as(QA_R3, get_approval_progress, doc.name)
+
+    def test_a_save_cannot_forge_who_it_waits_on(self):
+        doc = self._make_draft("GMP-Chain-Waiting-Forge")
+        doc.pending_with = QA_APPR
+        doc.save(ignore_permissions=True)
+        doc.reload()
+        self.assertEqual(doc.pending_with, PREPARER)
+
+    def test_upgrade_fills_waiting_on_for_documents_in_progress(self):
+        from dms.patches.v2_9_0 import backfill_pending_with
+
+        doc = self._act(self._make_draft("GMP-Chain-Waiting-Patch"), "Submit for Approval", PREPARER)
+        doc.db_set({"pending_with": None, "pending_with_name": None, "pending_since": None}, update_modified=False)
+        backfill_pending_with.execute()
+        doc.reload()
+        self.assertEqual(doc.pending_with, SUPERVISOR)
+        self.assertTrue(doc.pending_since)
 
 
 if __name__ == "__main__":

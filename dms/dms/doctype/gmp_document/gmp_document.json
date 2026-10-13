@@ -7,6 +7,8 @@
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
+  "section_progress",
+  "approval_progress_html",
   "section_identification",
   "document_name_fa",
   "document_name_en",
@@ -22,6 +24,9 @@
   "requires_training",
   "section_workflow",
   "workflow_status",
+  "pending_with",
+  "pending_with_name",
+  "pending_since",
   "prepared_by",
   "supervisor",
   "column_break_wf_1",
@@ -106,6 +111,17 @@
   "amended_from"
  ],
  "fields": [
+  {
+   "fieldname": "section_progress",
+   "fieldtype": "Section Break",
+   "label": "Approval Progress",
+   "depends_on": "eval:!doc.__islocal"
+  },
+  {
+   "fieldname": "approval_progress_html",
+   "fieldtype": "HTML",
+   "label": "Approval Progress"
+  },
   {
    "fieldname": "section_identification",
    "fieldtype": "Section Break",
@@ -300,6 +316,34 @@
    "read_only": 1,
    "in_list_view": 1,
    "in_standard_filter": 1
+  },
+  {
+   "fieldname": "pending_with",
+   "fieldtype": "Link",
+   "label": "Waiting On",
+   "options": "User",
+   "read_only": 1,
+   "no_copy": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "search_index": 1,
+   "ignore_user_permissions": 1,
+   "description": "The person the document is waiting on right now. Set by the system at every step."
+  },
+  {
+   "fieldname": "pending_with_name",
+   "fieldtype": "Data",
+   "label": "Waiting On (Name)",
+   "read_only": 1,
+   "no_copy": 1,
+   "hidden": 1
+  },
+  {
+   "fieldname": "pending_since",
+   "fieldtype": "Datetime",
+   "label": "Waiting Since",
+   "read_only": 1,
+   "no_copy": 1
   },
   {
    "fieldname": "prepared_by",
@@ -818,7 +862,7 @@
  "is_submittable": 1,
  "is_tree": 1,
  "links": [],
- "modified": "2026-10-13 12:00:00.000000",
+ "modified": "2026-10-14 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "DMS",
  "name": "GMP Document",

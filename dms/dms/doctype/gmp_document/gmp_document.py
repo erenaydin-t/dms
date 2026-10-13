@@ -388,7 +388,26 @@ _SYSTEM_OWNED_FIELDS = _APPROVAL_RECORD_FIELDS + (
     "file_integrity_hash",
     "render_font_family",
     "render_preserve_symbol_fonts",
+    "pending_with",
+    "pending_with_name",
+    "pending_since",
 )
+
+# The approval chain in display order: each stage and the workflow states in
+# which the document waits on it. Drives both "who is it waiting on" (the
+# stage's actor, from _STAGE_STAMPS) and the progress bar on the form. The
+# delegated QA review sits inside the QA Supervisor stage, whose queue is
+# shown as sub-steps.
+_PROGRESS_STAGES = (
+    ("preparer", (WF_DRAFT, WF_REVISION)),
+    ("supervisor", (WF_PENDING_SUPERVISOR,)),
+    ("reviewer", (WF_UNDER_REVIEW,)),
+    ("qa_supervisor", (WF_PENDING_QA_SUPERVISOR, WF_QA_IN_PROGRESS)),
+    ("regulatory", (WF_PENDING_REGULATORY,)),
+    ("manager", (WF_PENDING_MANAGER,)),
+    ("qa_approver", (WF_PENDING_FINAL_QA,)),
+)
+_STAGE_OF_STATE = {state: stage for stage, states in _PROGRESS_STAGES for state in states}
 
 
 def _acts_on_behalf(user):
@@ -985,6 +1004,8 @@ class GMPDocument(NestedSet):
         # used to live in the (now removed) custom transition endpoints is
         # driven here by detecting a change in workflow_status.
         self._apply_workflow_side_effects()
+        before = self.get_doc_before_save()
+        self._refresh_pending(moved=not before or before.workflow_status != self.workflow_status)
 
     def on_submit(self):
         if not self.word_template:
@@ -2103,6 +2124,126 @@ class GMPDocument(NestedSet):
         )
 
     # ------------------------------------------------------------------ #
+    #  Who the document waits on, and the progress bar                    #
+    # ------------------------------------------------------------------ #
+
+    def _pending_actor(self):
+        """The user the document is waiting on right now, or None once it has
+        left the approval chain (approved, obsolete, cancelled revision). In
+        the delegated QA review it is the reviewer at the head of the queue."""
+        if self.docstatus != 0:
+            return None
+        if self.workflow_status == WF_QA_IN_PROGRESS:
+            head = self._qa_queue_head()
+            if head:
+                return head.reviewer
+        stage = _STAGE_OF_STATE.get(self.workflow_status)
+        return self.get(_STAGE_STAMPS[stage]["actor"]) if stage else None
+
+    def _refresh_pending(self, moved=False):
+        """Keep pending_with / pending_since in step with the workflow, for the
+        list's "Waiting On" column and filter. ``moved`` means the document
+        just changed hands, which restarts the clock even when the same person
+        holds the next stage (the reviewer acts again as Manager)."""
+        who = self._pending_actor()
+        if who == self.pending_with and not moved:
+            return
+        self.db_set(
+            {
+                "pending_with": who,
+                "pending_with_name": _full_names([who]).get(who) if who else None,
+                "pending_since": now_datetime() if who else None,
+            },
+            update_modified=False,
+        )
+
+    def _approval_progress(self):
+        """The approval chain as the form's progress bar draws it: every stage
+        with its person and status (done / current / upcoming / skipped), the
+        QA review queue, the latest return and how the chain ended."""
+        state = self.workflow_status
+        if self.docstatus == 2 or state == WF_OBSOLETE:
+            end = "obsolete"
+        elif state == WF_REVISION_CANCELLED:
+            end = "cancelled"
+        elif self.docstatus == 1:
+            end = "pending_effective" if _is_pending_effective(self) else "approved"
+        else:
+            end = None
+        current = _STAGE_OF_STATE.get(state) if self.docstatus == 0 else None
+        stage_keys = [stage for stage, _states in _PROGRESS_STAGES]
+        current_index = stage_keys.index(current) if current else None
+
+        steps = []
+        for index, stage in enumerate(stage_keys):
+            spec = _STAGE_STAMPS[stage]
+            assigned = self.get(spec["actor"])
+            at = self.get(spec["on"])
+            if self.docstatus == 1 or end == "obsolete":
+                status = "done"
+            elif current_index is None:
+                # A cancelled revision: only the stages it actually reached.
+                status = "done" if at else "skipped"
+            elif index < current_index:
+                status = "done"
+            else:
+                status = "current" if index == current_index else "upcoming"
+            done = status == "done"
+            acted_by = (self.get(spec["by"]) if spec["by"] else assigned) if done and at else None
+            steps.append(
+                {
+                    "stage": stage,
+                    "label": _(spec["label"]),
+                    "status": status,
+                    "user": acted_by or assigned,
+                    "on_behalf_of": (self.get(spec["on_behalf"]) if spec["on_behalf"] else None) if done else None,
+                    # A stamp left from an earlier pass (before a return) is
+                    # not this pass's completion.
+                    "at": at if done else None,
+                }
+            )
+
+        queue = [
+            {"user": row.reviewer, "status": row.status, "at": row.completed_on, "comments": row.comments}
+            for row in self._current_round_rows()
+            if row.status != QA_SUPERSEDED
+        ]
+        returned = None
+        if self.last_revision_request and self.docstatus == 0:
+            returned = {
+                "user": self.last_revision_by,
+                "at": self.last_revision_on,
+                "reason": self.last_revision_request,
+            }
+
+        names = _full_names(
+            [s["user"] for s in steps]
+            + [s["on_behalf_of"] for s in steps]
+            + [q["user"] for q in queue]
+            + [self.pending_with, returned and returned["user"]]
+        )
+        for item in steps + queue + ([returned] if returned else []):
+            item["user_name"] = names.get(item["user"]) if item["user"] else None
+        for step in steps:
+            step["on_behalf_of_name"] = names.get(step["on_behalf_of"]) if step["on_behalf_of"] else None
+
+        return {
+            "state": state,
+            "steps": steps,
+            "qa_queue": queue,
+            "returned": returned,
+            "pending": {
+                "user": self.pending_with,
+                "user_name": names.get(self.pending_with),
+                "since": self.pending_since,
+            }
+            if self.pending_with and self.docstatus == 0
+            else None,
+            "end": end,
+            "effective_date": self.effective_date,
+        }
+
+    # ------------------------------------------------------------------ #
     #  Sequential QA review queue engine                                 #
     # ------------------------------------------------------------------ #
     # The queue lives in the qa_reviews child table; row order within the
@@ -2121,6 +2262,7 @@ class GMPDocument(NestedSet):
         manual transition for these edges)."""
         self.db_set("workflow_status", next_state, update_modified=False)
         self.add_comment("Workflow", comment)
+        self._refresh_pending(moved=True)
 
     def _current_qa_round(self):
         return max((cint(r.round) for r in self.qa_reviews), default=0)
@@ -2169,6 +2311,7 @@ class GMPDocument(NestedSet):
                     "Workflow",
                     _("QA review task handed to {0}").format(row.reviewer),
                 )
+                self._refresh_pending(moved=True)
                 return row
         return None
 
@@ -2938,6 +3081,26 @@ def get_my_pending_count(user=None):
     })
     counts["total"] = sum(counts.values())
     return counts
+
+
+@frappe.whitelist()
+def get_approval_progress(docname):
+    """The approval chain of one document — who did what and when, and who it
+    is waiting on now — for the progress bar at the top of its form."""
+    doc = frappe.get_doc("GMP Document", docname)
+    doc.check_permission("read")
+    return doc._approval_progress()
+
+
+def _full_names(users):
+    """``{user: full name}`` for the given users, in one query."""
+    users = list({u for u in users if u})
+    if not users:
+        return {}
+    return {
+        row.name: row.full_name or row.name
+        for row in frappe.get_all("User", filters={"name": ["in", users]}, fields=["name", "full_name"])
+    }
 
 
 def _create_todo(doc, allocated_to, description):

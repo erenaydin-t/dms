@@ -15,7 +15,23 @@ frappe.listview_settings['GMP Document'] = {
         'qa_supervisor',
         'regulatory_manager',
         'effective_date',
+        'pending_with',
+        'pending_with_name',
+        'pending_since',
     ],
+
+    formatters: {
+        // "Test Reviewer · 2 d": who the document waits on, and for how long.
+        // Clicking the name filters the list to that person's documents.
+        pending_with(value, df, doc) {
+            if (!value) return '';
+            const name = frappe.utils.escape_html(doc.pending_with_name || value);
+            const age = doc.pending_since
+                ? ` <span class="text-muted">· ${frappe.utils.escape_html(frappe.datetime.prettyDate(doc.pending_since, true))}</span>`
+                : '';
+            return `<span class="filterable" data-filter="pending_with,=,${frappe.utils.escape_html(value)}">${name}</span>${age}`;
+        },
+    },
 
     get_indicator: function (doc) {
         // Approved + active = green Controlled Copy
@@ -63,9 +79,20 @@ frappe.listview_settings['GMP Document'] = {
 
         const me = frappe.session.user;
 
+        // Everything waiting on me, at any stage — including the delegated QA
+        // review queue, whose current reviewer is kept in pending_with too.
+        listview.page.add_inner_button(
+            __('Everything Waiting on Me'),
+            () => {
+                listview.filter_area.clear();
+                listview.filter_area.add('GMP Document', 'pending_with', '=', me);
+                listview.refresh();
+            },
+            __('My Pending')
+        );
+
         // One entry per stage that waits on a named person — the same stages
-        // get_my_pending_count() counts. (The delegated QA review queue lives
-        // in a child table, so it is reached from the document, not here.)
+        // get_my_pending_count() counts.
         const stages = [
             [__('Awaiting My Supervisor Approval'), 'Pending Supervisor Approval', 'supervisor'],
             [__('Awaiting My Review'), 'Under Review', 'reviewer'],

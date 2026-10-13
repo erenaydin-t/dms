@@ -11,6 +11,8 @@
 7. Each approver in turn gets a ToDo and acts from **Actions** — supervisor, reviewer, QA supervisor (who may delegate to a queue of QA reviewers), regulatory manager, then the reviewer again as manager. Any of them can *Return* the document a step back or to you; the form asks them for the reason, which you see on the document.
 8. The QA Approver → **Actions → Publish**. The document is submitted, rendered, signed, stamped and becomes the **effective version** (green *Controlled* badge).
 
+**Where is the document now?** The **Approval Progress** bar at the top of the form shows every stage with its person: green ✓ with who approved and when, blue ● for the stage it is waiting on (and for how long), grey for the stages still to come. A return shows in red with its reason; a delegated QA review shows its queue of reviewers. In the **GMP Document** list, the **Waiting On** column shows the same person and the time waited, and **My Pending → Everything Waiting on Me** lists every document waiting on you, at any stage.
+
 ## 2. Download PDFs
 
 On any approved document → **Get PDF** menu:

@@ -59,4 +59,5 @@ Publication (`Publish`) triggers, in order:
 
 - Every transition writes a Workflow comment (who, when, what).
 - ToDos hand off automatically from each actor to the next.
+- **Waiting On** / **Waiting Since** name the person the document waits on now and since when — the QA reviewer at the head of a delegated queue included. The system sets them at every step; the list shows them as a column and filters on them, and the form draws the whole chain as the **Approval Progress** bar.
 - Obsoleted and cancelled-revision records are retained permanently; deletion of a cancelled revision is blocked server-side.
